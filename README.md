@@ -3,6 +3,11 @@
 <!-- Demo screenshot / GIF goes here -->
 <!-- ![stepper demo](docs/assets/demo.gif) -->
 
+> [!WARNING]
+> **🚧 Work in progress.** stepper is under active development and not yet stable —
+> expect rough edges, breaking changes, and early/experimental releases. Not ready
+> for production use yet.
+
 <!-- release:start -->
 **Latest release:** [v0.1.0](https://github.com/Stepper-agent/stepper/releases/latest)
 <!-- release:end -->

@@ -3,6 +3,11 @@
 <!-- 데모 스크린샷 / GIF 자리 -->
 <!-- ![stepper 데모](docs/assets/demo.gif) -->
 
+> [!WARNING]
+> **🚧 제작 중 (WIP).** stepper는 아직 활발히 개발 중이며 안정 버전이 아닙니다 —
+> 거친 부분·호환성 깨짐·초기/실험적 릴리스가 있을 수 있습니다. 아직 프로덕션 사용은
+> 권장하지 않습니다.
+
 <!-- release:start -->
 **Latest release:** [v0.1.0](https://github.com/Stepper-agent/stepper/releases/latest)
 <!-- release:end -->
