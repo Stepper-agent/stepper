@@ -1,0 +1,30 @@
+[package]
+name = "stepper-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+stepper-provider = { path = "../stepper-provider" }
+stepper-permission = { path = "../stepper-permission" }
+stepper-tools = { path = "../stepper-tools" }
+stepper-config = { path = "../stepper-config" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "process", "io-util", "time", "sync"] }
+tokio-util = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { workspace = true, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time", "io-util"] }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rmcp = { workspace = true, features = ["client", "server", "macros"] }

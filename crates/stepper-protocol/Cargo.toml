@@ -1,0 +1,18 @@
+[package]
+name = "stepper-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# INVARIANT: this crate is the ONLY thing stepper-tui depends on (besides the
+# ratatui stack). It must stay free of any async runtime, http client, or clap.
+# `tokio` is pulled with the `sync` feature ONLY (channels/oneshot, no runtime).
+[dependencies]
+serde = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

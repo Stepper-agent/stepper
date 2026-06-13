@@ -1,0 +1,55 @@
+name: Run stepper
+
+# Manually triggered: builds + installs stepper, then runs it headless (`-p`)
+# with the arguments you supply below. Provider API keys come from repo secrets
+# (Settings → Secrets and variables → Actions), named `STEPPER_<PROVIDER>_API_KEY`.
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Prompt to run (passed to `stepper -p <prompt>`)"
+        required: true
+        type: string
+      model:
+        description: "Model ref, e.g. anthropic/claude-sonnet-4 or ollama-cloud/qwen3-coder"
+        required: false
+        default: "anthropic/claude-sonnet-4"
+        type: string
+      mode:
+        description: "Permission mode"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - plan
+          - accept-edits
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  run:
+    name: build · install · run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build & install stepper
+        run: ./scripts/install.sh
+
+      - name: Run stepper
+        env:
+          # Provide whichever providers you use as repo secrets. Empty secrets
+          # are simply ignored (the key just resolves to None).
+          STEPPER_ANTHROPIC_API_KEY: ${{ secrets.STEPPER_ANTHROPIC_API_KEY }}
+          STEPPER_OPENAI_API_KEY: ${{ secrets.STEPPER_OPENAI_API_KEY }}
+          STEPPER_OLLAMA_CLOUD_API_KEY: ${{ secrets.STEPPER_OLLAMA_CLOUD_API_KEY }}
+        # `stepper` followed by the arguments. Add more flags here as needed
+        # (e.g. --cwd, --resume <id>).
+        run: |
+          stepper -p "${{ inputs.prompt }}" \
+            --model "${{ inputs.model }}" \
+            --mode "${{ inputs.mode }}"

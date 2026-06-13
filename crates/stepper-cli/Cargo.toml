@@ -1,0 +1,31 @@
+[package]
+name = "stepper-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "stepper"
+path = "src/main.rs"
+
+[dependencies]
+stepper-protocol = { path = "../stepper-protocol" }
+stepper-tui = { path = "../stepper-tui" }
+stepper-providers = { path = "../stepper-providers" }
+stepper-core = { path = "../stepper-core" }
+stepper-config = { path = "../stepper-config" }
+stepper-permission = { path = "../stepper-permission" }
+stepper-tools = { path = "../stepper-tools" }
+stepper-mcp = { path = "../stepper-mcp" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-std"] }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }

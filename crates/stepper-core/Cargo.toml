@@ -1,0 +1,35 @@
+[package]
+name = "stepper-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+stepper-protocol = { path = "../stepper-protocol" }
+stepper-provider = { path = "../stepper-provider" }
+stepper-providers = { path = "../stepper-providers" }
+stepper-config = { path = "../stepper-config" }
+stepper-permission = { path = "../stepper-permission" }
+stepper-tools = { path = "../stepper-tools" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "process"] }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+ignore = { workspace = true }
+shell-words = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tempfile = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+tokio-util = { workspace = true }

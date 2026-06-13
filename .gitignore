@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+
+# stepper runtime state written into a project's working dir — never commit any
+# of it (setting.json can hold an apiKey literal, codex-auth.json holds tokens).
+.stepper/
+
+# secrets
+.env
+
+# internal development docs — kept local for handoff/development, not committed
+# (candid notes). USAGE.md is user-facing and bundled into release archives by
+# release.yml, so it stays tracked.
+docs/

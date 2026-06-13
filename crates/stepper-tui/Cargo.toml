@@ -1,0 +1,26 @@
+[package]
+name = "stepper-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# INVARIANT: depends ONLY on stepper-protocol (+ the ratatui stack). Never on
+# stepper-core / providers / config / reqwest.
+[dependencies]
+stepper-protocol = { path = "../stepper-protocol" }
+uuid = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-std"] }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+smallvec = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+ratatui-textarea = { workspace = true }
+tui-markdown = { workspace = true }
+similar = { workspace = true }
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }

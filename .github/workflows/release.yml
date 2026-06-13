@@ -1,0 +1,159 @@
+name: Release
+
+# Pushing to `prod` builds installable binaries for every target and publishes
+# them to a GitHub Release tagged with the workspace version (`v<version>`).
+# Bump `version` in the root Cargo.toml to cut a new release. Re-pushing the same
+# version updates that release's assets AND force-moves the `v<version>` tag to the
+# new prod commit, so the tag, the source tarball, and the binaries stay in sync.
+on:
+  push:
+    branches: [prod]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the release + upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Gate the release on a green build/clippy/test, and surface the version.
+  prepare:
+    name: verify · version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build · clippy · test
+        run: |
+          cargo build --workspace --locked --all-targets
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
+      - name: Read workspace version
+        id: version
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "stepper version: $v"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin stepper --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          dist="stepper-${{ needs.prepare.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "$dist"
+          cp "target/${{ matrix.target }}/release/stepper" "$dist/"
+          cp LICENSE "$dist/"
+          tar -czf "$dist.tar.gz" "$dist"
+          echo "ASSET=$dist.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dist = "stepper-${{ needs.prepare.outputs.version }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/stepper.exe" $dist
+          Copy-Item LICENSE $dist
+          Compress-Archive -Path "$dist/*" -DestinationPath "$dist.zip"
+          "ASSET=$dist.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stepper-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Point the version tag at this commit
+        run: |
+          tag="v${{ needs.prepare.outputs.version }}"
+          git tag -f "$tag"
+          git push -f origin "$tag"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Version-less copies for static hosting (e.g. a Vercel install-files/
+      # folder the curl|bash installer downloads from). `stepper-<target>.<ext>`
+      # always points at the latest release.
+      - name: Add version-less asset copies
+        run: |
+          cd dist
+          v="${{ needs.prepare.outputs.version }}"
+          for f in stepper-"$v"-*.tar.gz stepper-"$v"-*.zip; do
+            [ -e "$f" ] || continue
+            cp "$f" "${f/stepper-$v-/stepper-}"
+          done
+          ls -1
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          name: stepper v${{ needs.prepare.outputs.version }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+      # Pull the just-released version straight into the README (no deploy step):
+      # rewrite the marked block and commit it back. `[skip ci]` keeps this push
+      # from re-triggering the release.
+      - name: Sync README to the released version
+        run: |
+          v="${{ needs.prepare.outputs.version }}"
+          repo="${{ github.repository }}"
+          for f in README.md README_KO.md; do
+            [ -e "$f" ] || continue
+            perl -0pi -e "s{<!-- release:start -->.*?<!-- release:end -->}{<!-- release:start -->\n**Latest release:** [v$v](https://github.com/$repo/releases/latest)\n<!-- release:end -->}s" "$f"
+          done
+          if git diff --quiet -- README.md README_KO.md; then
+            echo "README already at v$v"
+            exit 0
+          fi
+          git config user.name "Hyunseok Byun"
+          git config user.email "gumyoincirno@gmail.com"
+          git add README.md README_KO.md
+          git commit -m "docs: sync README to v$v [skip ci]"
+          git push origin HEAD:prod

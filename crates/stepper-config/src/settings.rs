@@ -1,0 +1,172 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+/// The provider `kind` values the resolver actually understands. `kind` stays a
+/// `String` in serde (so an unknown kind still parses and can be reported with
+/// context), but the JSON Schema and value-level validation constrain it here.
+pub const PROVIDER_KINDS: [&str; 4] = ["openai-compat", "anthropic", "openai-responses", "codex"];
+
+fn provider_kind_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": PROVIDER_KINDS,
+    })
+}
+
+/// The parsed `.stepper/setting.json`. `serde(default)` everywhere + no
+/// `deny_unknown_fields` keeps it forward-compatible: unknown keys are ignored
+/// rather than failing the load.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsFile {
+    #[serde(default)]
+    pub step: Vec<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub default_model: Option<String>,
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderConfig>,
+    #[serde(default)]
+    pub orchestrator: Option<OrchestratorConfig>,
+    #[serde(default)]
+    pub layers: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub permissions: Permissions,
+    #[serde(default)]
+    pub approvals: Vec<ApprovalRule>,
+    #[serde(default)]
+    pub mcp_servers: BTreeMap<String, McpServerConfig>,
+    #[serde(default)]
+    pub hooks: BTreeMap<String, Vec<HookEntry>>,
+    #[serde(default)]
+    pub compaction: Option<CompactionConfig>,
+    #[serde(default)]
+    pub dispatch: Option<DispatchConfig>,
+    /// Name of an output style from `.stepper/output-styles/*.md` (the style's
+    /// body swaps into the system prompt — consumed by the orchestrator).
+    #[serde(default)]
+    pub output_style: Option<String>,
+}
+
+/// Context-compaction tuning. `provider` names a (typically cheap) model used to
+/// summarize folded-away history; without it, compaction uses a heuristic marker.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionConfig {
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+/// Fan-out tuning. `enabled` exposes the model-callable `dispatch` tool.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderConfig {
+    /// `openai-compat` | `anthropic` | `openai-responses` | `codex`.
+    #[schemars(schema_with = "provider_kind_schema")]
+    pub kind: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Literal key, a `{env:VAR}` template, or null (localhost / oauth).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// e.g. `codex-oauth` for the ChatGPT-OAuth path.
+    #[serde(default)]
+    pub auth: Option<String>,
+    #[serde(default)]
+    pub default_model: Option<String>,
+    /// Override the context window (tokens) for this provider's models — used by
+    /// the ctx% footer when a model is not in the built-in registry. `/v1/models`
+    /// auto-probe is provider-specific and left as a follow-up.
+    #[serde(default)]
+    pub context_window: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestratorConfig {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Permissions {
+    #[serde(default)]
+    pub default_mode: Option<String>,
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub ask: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+    #[serde(default)]
+    pub additional_directories: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalRule {
+    pub rule: String,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub granted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerConfig {
+    /// `stdio` | `http`.
+    #[serde(default, rename = "type")]
+    pub transport: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub always_load: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HookEntry {
+    #[serde(default)]
+    pub matcher: Option<String>,
+    pub command: String,
+}
+
+/// Deep-merge `over` (project) onto `base` (user): objects merge key-by-key,
+/// everything else (arrays, scalars) is replaced wholesale — so project `step`
+/// and `approvals` arrays override rather than concatenate.
+pub fn deep_merge(base: &mut Value, over: Value) {
+    match (base, over) {
+        (Value::Object(b), Value::Object(o)) => {
+            for (k, v) in o {
+                match b.get_mut(&k) {
+                    Some(bv) => deep_merge(bv, v),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (b, o) => *b = o,
+    }
+}

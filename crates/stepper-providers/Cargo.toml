@@ -1,0 +1,41 @@
+[package]
+name = "stepper-providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+stepper-provider = { path = "../stepper-provider" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+async-stream = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tokio-util = { workspace = true }
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+secrecy = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+getrandom = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+tiny_http = { workspace = true }
+open = { workspace = true }
+tracing = { workspace = true }
+keyring = { workspace = true }
+
+[dev-dependencies]
+stepper-provider = { path = "../stepper-provider" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+wiremock = { workspace = true }
+tempfile = { workspace = true }

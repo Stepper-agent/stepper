@@ -1,0 +1,446 @@
+//! Built-in slash commands (`/help`, `/clear`, `/compact`, `/context`, `/cost`,
+//! `/model`, `/permissions`, `/resume`, `/rewind`). These are handled inside the
+//! core action loop *before* user-authored `.stepper/commands` files, mirroring
+//! Claude Code's built-in command surface. They emit their own events (a
+//! `Notice`, `ModelChanged`, `ContextBreakdown`, `PermissionsSnapshot`,
+//! `CheckpointList`, `SessionList`, or `CompactionStarted`/`Done`) and never run
+//! an agent turn.
+
+use crate::compaction::{estimate_tokens, Compactor};
+use crate::orchestrator::Orchestrator;
+use crate::session::{SessionRecord, SessionStore, TurnRecord};
+use std::path::Path;
+use stepper_permission::PermissionMode;
+use stepper_protocol::{
+    AppEvent, ApprovalRuleView, CheckpointView, ContextBreakdownView, EventTx, ModelView,
+    NoticeLevel, PermissionRuleView, PermissionsSnapshotView, SessionView,
+};
+use stepper_provider::Usage;
+
+/// Names of the built-in commands, for the `/` palette (merged with the user's).
+pub fn names() -> Vec<String> {
+    [
+        "help",
+        "clear",
+        "compact",
+        "context",
+        "cost",
+        "model",
+        "permissions",
+        "resume",
+        "rewind",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Session-level usage accounting for `/cost`, accumulated by `spawn_core` from
+/// each completed turn's `TurnOutput` (cancelled/failed turns are not counted).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionCost {
+    pub usage: Usage,
+    pub cost_usd: f64,
+    pub turn_usage: Usage,
+    pub turn_cost_usd: f64,
+}
+
+impl SessionCost {
+    pub fn record_turn(&mut self, usage: Usage, cost_usd: f64) {
+        self.usage.add(&usage);
+        self.cost_usd += cost_usd;
+        self.turn_usage = usage;
+        self.turn_cost_usd = cost_usd;
+    }
+}
+
+/// Handle a built-in command. Returns `true` if `name` was a built-in (already
+/// handled), `false` to fall through to user-command expansion.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle(
+    name: &str,
+    args: &str,
+    orchestrator: &mut Orchestrator,
+    session: &mut SessionRecord,
+    turn_id: &mut u64,
+    store: &SessionStore,
+    cost: &SessionCost,
+    tx: &EventTx,
+) -> bool {
+    match name {
+        "help" => {
+            notice(tx, NoticeLevel::Info, help_text()).await;
+            true
+        }
+        "clear" => {
+            session.turns.clear();
+            orchestrator.resume_seed.clear();
+            *turn_id = 0;
+            let _ = store.save(session);
+            notice(
+                tx,
+                NoticeLevel::Info,
+                "conversation cleared (session reset)".into(),
+            )
+            .await;
+            true
+        }
+        "compact" => {
+            handle_compact(args, orchestrator, session, turn_id, store, tx).await;
+            true
+        }
+        "context" => {
+            handle_context(orchestrator, session, tx).await;
+            true
+        }
+        "cost" => {
+            notice(tx, NoticeLevel::Info, cost_text(cost)).await;
+            true
+        }
+        "model" => {
+            handle_model(args.trim(), orchestrator, tx).await;
+            true
+        }
+        "permissions" => {
+            handle_permissions(orchestrator, tx).await;
+            true
+        }
+        "resume" => {
+            handle_resume(store, tx).await;
+            true
+        }
+        "rewind" => {
+            handle_rewind(&orchestrator.project_root, tx).await;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn help_text() -> String {
+    "commands: /help · /clear (reset conversation) · /compact [instructions] (compact the conversation now) · /context (window breakdown) · /cost (session usage & USD) · /model [provider/model] (show or switch) · /permissions (rules & approvals) · /resume (pick a session) · /rewind (pick a checkpoint, also Esc-Esc) · plus any .stepper/commands/*.md".into()
+}
+
+fn fmt_usage(u: &Usage) -> String {
+    format!(
+        "{} in · {} out · {} cache-read · {} cache-write",
+        u.input, u.output, u.cache_read, u.cache_write
+    )
+}
+
+fn cost_text(cost: &SessionCost) -> String {
+    format!(
+        "cost: session {} · ${:.4} | last turn {} · ${:.4}",
+        fmt_usage(&cost.usage),
+        cost.cost_usd,
+        fmt_usage(&cost.turn_usage),
+        cost.turn_cost_usd
+    )
+}
+
+/// `/compact [instructions]`: fold the persisted conversation now (same
+/// cut-point rules as auto-compaction: the recent tail is kept and a tool call
+/// is never split from its results), summarize the folded prefix — steered by
+/// the optional instructions — and reseed/persist the compacted history. The
+/// freed figure is the honest before/after estimate delta.
+async fn handle_compact(
+    args: &str,
+    orchestrator: &mut Orchestrator,
+    session: &mut SessionRecord,
+    turn_id: &mut u64,
+    store: &SessionStore,
+    tx: &EventTx,
+) {
+    let mut messages = session.seed_messages();
+    if messages.is_empty() {
+        notice(tx, NoticeLevel::Warn, "nothing to compact (no conversation yet)".into()).await;
+        return;
+    }
+    let context_window = orchestrator
+        .steps
+        .first()
+        .map(|s| orchestrator.resolver.model_info(&s.model_ref).context_window)
+        .unwrap_or(0);
+    let compactor = Compactor::new(context_window.max(1));
+    // u64::MAX forces the fold regardless of the soft threshold; `plan` still
+    // refuses when the history fits the keep-recent tail or has no safe cut.
+    let Some(cut) = compactor.plan(&messages, u64::MAX) else {
+        notice(
+            tx,
+            NoticeLevel::Info,
+            "nothing to compact (conversation already fits the recent tail)".into(),
+        )
+        .await;
+        return;
+    };
+    let _ = tx.send(AppEvent::CompactionStarted).await;
+    let before = estimate_tokens(&messages);
+    let dropped: Vec<stepper_provider::Message> = messages.drain(0..cut).collect();
+    let trimmed = args.trim();
+    let instructions = (!trimmed.is_empty()).then_some(trimmed);
+    let summarizer = orchestrator
+        .compaction_model
+        .as_ref()
+        .and_then(|m| orchestrator.resolver.resolve(m).ok());
+    let summary = match summarizer {
+        Some(p) => crate::compaction::summarize_with_model(p.as_ref(), &dropped, instructions)
+            .await
+            .unwrap_or_else(|| crate::compaction::heuristic_summary(&dropped)),
+        None => crate::compaction::heuristic_summary(&dropped),
+    };
+    messages.insert(0, crate::compaction::marker(&summary));
+    let freed_tokens = before.saturating_sub(estimate_tokens(&messages));
+
+    // The compacted history replaces the persisted turns as one synthetic turn,
+    // and reseeds the live conversation for the next turn.
+    session.turns = vec![TurnRecord {
+        user: "/compact".into(),
+        summaries: vec![("compact".into(), summary)],
+        messages: messages.clone(),
+    }];
+    *turn_id = session.turns.len() as u64;
+    let _ = store.save(session);
+    orchestrator.resume_seed = messages;
+    let _ = tx.send(AppEvent::CompactionDone { freed_tokens }).await;
+}
+
+async fn handle_model(arg: &str, orchestrator: &mut Orchestrator, tx: &EventTx) {
+    if arg.is_empty() {
+        let current = orchestrator
+            .steps
+            .first()
+            .map(|s| s.model_ref.clone())
+            .unwrap_or_else(|| "<none>".into());
+        notice(tx, NoticeLevel::Info, format!("current model: {current}")).await;
+        return;
+    }
+    // Validate by resolving before committing the switch.
+    match orchestrator.resolver.resolve(arg) {
+        Ok(provider) => {
+            let view = ModelView {
+                provider: provider.provider().to_string(),
+                model: provider.model().to_string(),
+            };
+            // Switch only the primary (first) layer — overwriting every step would
+            // flatten an intentional per-layer model pipeline. This matches the
+            // no-arg display and /context, which both read steps.first().
+            if let Some(step) = orchestrator.steps.first_mut() {
+                step.model_ref = arg.to_string();
+            }
+            let _ = tx.send(AppEvent::ModelChanged(view)).await;
+            notice(
+                tx,
+                NoticeLevel::Info,
+                format!("primary model switched to {arg}"),
+            )
+            .await;
+        }
+        Err(e) => {
+            notice(
+                tx,
+                NoticeLevel::Warn,
+                format!("cannot switch to '{arg}': {e}"),
+            )
+            .await;
+        }
+    }
+}
+
+/// chars/4, the same estimator the compactor uses for free text.
+fn estimate_str(s: &str) -> u64 {
+    (s.len() / 4) as u64
+}
+
+/// `/context`: estimate where the primary layer's window goes. Categories are
+/// computed from the same inputs `run_turn` assembles — base context (memory),
+/// the layer system prompt (with its skills advertisement split out), the
+/// layer-filtered tool specs (built-in vs MCP), and the persisted conversation.
+async fn handle_context(orchestrator: &Orchestrator, session: &SessionRecord, tx: &EventTx) {
+    let Some(step) = orchestrator.steps.first() else {
+        notice(tx, NoticeLevel::Warn, "no model configured".into()).await;
+        return;
+    };
+    let info = orchestrator.resolver.model_info(&step.model_ref);
+    let ads = crate::skills::advertise(&step.skills);
+    let skills = estimate_str(&ads);
+    let system_prompt = estimate_str(&step.system_prompt).saturating_sub(skills);
+    let memory = estimate_str(&orchestrator.base_context);
+    let registry = orchestrator
+        .base_tools
+        .filtered(&step.tool_allow, &step.tool_deny)
+        .filter_mcp(&step.mcp_allow, &orchestrator.always_load_mcp);
+    let (mut tools, mut mcp_tools) = (0u64, 0u64);
+    for spec in registry.specs() {
+        let size = (spec.name.len()
+            + spec.description.len()
+            + spec.input_schema.to_string().len()) as u64
+            / 4;
+        if spec.name.starts_with("mcp__") {
+            mcp_tools += size;
+        } else {
+            tools += size;
+        }
+    }
+    let messages = estimate_tokens(&session.seed_messages());
+    let used = system_prompt + tools + mcp_tools + skills + memory + messages;
+    let breakdown = ContextBreakdownView {
+        system_prompt,
+        tools,
+        mcp_tools,
+        skills,
+        memory,
+        messages,
+        free: info.context_window.saturating_sub(used),
+        context_limit: info.context_window,
+    };
+    let _ = tx.send(AppEvent::ContextBreakdown(breakdown)).await;
+}
+
+/// The default rules `stepper init` scaffolds into a project `setting.json` —
+/// shown with source `scaffold` so a user can tell them from hand-written rules.
+const SCAFFOLD_RULES: &[(&str, &str)] = &[
+    ("allow", "Read(/**)"),
+    ("allow", "Bash(cargo *)"),
+    ("ask", "Bash(git push:*)"),
+    ("deny", "Read(//etc/**)"),
+    ("deny", "Bash(rm -rf *)"),
+];
+
+fn mode_label(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Auto => "auto",
+        PermissionMode::Plan => "plan",
+        PermissionMode::AcceptEdits => "accept-edits",
+        PermissionMode::Default => "default",
+        PermissionMode::DontAsk => "dont-ask",
+        PermissionMode::Bypass => "bypass",
+    }
+}
+
+/// `/permissions`: a read-only snapshot of the rules and persisted approvals as
+/// they stand in the settings files right now (user + project scopes read
+/// separately so each rule names its source).
+async fn handle_permissions(orchestrator: &Orchestrator, tx: &EventTx) {
+    let mut rules = Vec::new();
+    let mut approvals = Vec::new();
+    let user_dir = orchestrator.home.as_ref().map(|h| h.join(".stepper"));
+    let project_dir = orchestrator.project_root.join(".stepper");
+    for (dir, scope) in [(user_dir, "user"), (Some(project_dir), "project")] {
+        let Some(settings) = dir.and_then(|d| read_settings(&d)) else {
+            continue;
+        };
+        let lists = [
+            ("allow", &settings.permissions.allow),
+            ("ask", &settings.permissions.ask),
+            ("deny", &settings.permissions.deny),
+        ];
+        for (verdict, list) in lists {
+            for rule in list {
+                let scaffolded = scope == "project"
+                    && SCAFFOLD_RULES.contains(&(verdict, rule.as_str()));
+                rules.push(PermissionRuleView {
+                    verdict: verdict.into(),
+                    rule: rule.clone(),
+                    source: if scaffolded { "scaffold".into() } else { scope.into() },
+                });
+            }
+        }
+        for approval in &settings.approvals {
+            approvals.push(ApprovalRuleView {
+                rule: approval.rule.clone(),
+                scope: approval.scope.clone(),
+                granted_at: approval.granted_at.clone(),
+            });
+        }
+    }
+    let snapshot = PermissionsSnapshotView {
+        mode: mode_label(orchestrator.mode).into(),
+        rules,
+        approvals,
+    };
+    let _ = tx.send(AppEvent::PermissionsSnapshot(snapshot)).await;
+}
+
+fn read_settings(dir: &Path) -> Option<stepper_config::SettingsFile> {
+    let raw = std::fs::read_to_string(dir.join("setting.json")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// `/rewind` (and the TUI's Esc-Esc): list the `turn-N` working-tree
+/// checkpoints, newest first; the TUI picker sends the selection back as
+/// `Action::Rewind`.
+async fn handle_rewind(project_root: &Path, tx: &EventTx) {
+    let dir = project_root.join(".stepper").join("checkpoints");
+    let mut turns: Vec<u64> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix("turn-"))
+                .and_then(|n| n.parse().ok())
+        })
+        .collect();
+    if turns.is_empty() {
+        notice(tx, NoticeLevel::Warn, "no checkpoints to rewind to yet".into()).await;
+        return;
+    }
+    turns.sort_unstable_by(|a, b| b.cmp(a));
+    let checkpoints = turns
+        .into_iter()
+        .map(|turn| CheckpointView {
+            id: format!("turn-{turn}"),
+            turn,
+        })
+        .collect();
+    let _ = tx.send(AppEvent::CheckpointList(checkpoints)).await;
+}
+
+/// How many sessions the `/resume` picker lists.
+const RESUME_PICKER_LIMIT: usize = 20;
+
+/// `/resume`: list recent sessions (newest first); the TUI picker sends the
+/// selection back as `Action::Resume`.
+async fn handle_resume(store: &SessionStore, tx: &EventTx) {
+    let recent = store.list_recent(RESUME_PICKER_LIMIT);
+    if recent.is_empty() {
+        notice(tx, NoticeLevel::Warn, "no saved sessions to resume".into()).await;
+        return;
+    }
+    let now = std::time::SystemTime::now();
+    let sessions = recent
+        .into_iter()
+        .map(|(record, modified)| SessionView {
+            digest: record
+                .turns
+                .first()
+                .and_then(|t| t.user.lines().next())
+                .unwrap_or("(empty)")
+                .to_string(),
+            turns: record.turns.len(),
+            age: age_label(now, modified),
+            id: record.id,
+            name: record.name,
+        })
+        .collect();
+    let _ = tx.send(AppEvent::SessionList(sessions)).await;
+}
+
+fn age_label(now: std::time::SystemTime, modified: std::time::SystemTime) -> String {
+    let secs = now
+        .duration_since(modified)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match secs {
+        0..60 => "just now".into(),
+        60..3600 => format!("{}m ago", secs / 60),
+        3600..86_400 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+async fn notice(tx: &EventTx, level: NoticeLevel, text: String) {
+    let _ = tx.send(AppEvent::Notice { level, text }).await;
+}

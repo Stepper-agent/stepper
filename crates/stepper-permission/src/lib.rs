@@ -1,0 +1,502 @@
+//! `stepper-permission` — the pure `deny > ask > allow` decision engine.
+//!
+//! `evaluate` is a pure function: rule matching with path anchors
+//! (`/`·`//`·`~/`, symlink-resolved), compound-bash gating (most-restrictive
+//! wins), and mode defaults. Persisting an `always-allow` is the caller's job
+//! (it is the only IO, handled in config/core).
+
+pub mod bash;
+pub mod path;
+pub mod request;
+pub mod rule;
+
+pub use request::{Decision, PermissionMode, PermissionRequest};
+pub use rule::{MatchTarget, Rule};
+
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+
+/// Rule-list parsing failures that must stop startup: an unparseable DENY spec
+/// silently dropping would fail open (the user believes the protection exists).
+#[derive(Debug, Error)]
+pub enum RuleSetError {
+    #[error("malformed deny rule(s): {}", specs.join(", "))]
+    MalformedDeny { specs: Vec<String> },
+}
+
+/// The active rules, split by verdict. Persisted `approvals` are folded into
+/// `allow`.
+#[derive(Debug, Clone, Default)]
+pub struct RuleSet {
+    pub allow: Vec<Rule>,
+    pub ask: Vec<Rule>,
+    pub deny: Vec<Rule>,
+}
+
+impl RuleSet {
+    pub fn from_lists(allow: &[String], ask: &[String], deny: &[String]) -> Self {
+        RuleSet {
+            allow: rule::parse_all(allow),
+            ask: rule::parse_all(ask),
+            deny: rule::parse_all(deny),
+        }
+    }
+
+    /// Like `from_lists`, but malformed specs are surfaced instead of silently
+    /// dropped: a malformed deny is a hard error (fail closed), malformed
+    /// allow/ask specs come back as warnings for the caller to report.
+    pub fn from_lists_checked(
+        allow: &[String],
+        ask: &[String],
+        deny: &[String],
+    ) -> Result<(RuleSet, Vec<String>), RuleSetError> {
+        let (deny_rules, malformed_deny) = rule::parse_all_checked(deny);
+        if !malformed_deny.is_empty() {
+            return Err(RuleSetError::MalformedDeny {
+                specs: malformed_deny,
+            });
+        }
+        let (allow_rules, mut dropped) = rule::parse_all_checked(allow);
+        let (ask_rules, dropped_ask) = rule::parse_all_checked(ask);
+        dropped.extend(dropped_ask);
+        Ok((
+            RuleSet {
+                allow: allow_rules,
+                ask: ask_rules,
+                deny: deny_rules,
+            },
+            dropped,
+        ))
+    }
+
+    /// Fold persisted always-allow approvals in as additional allow rules.
+    pub fn with_approvals(mut self, approvals: &[String]) -> Self {
+        self.allow.extend(rule::parse_all(approvals));
+        self
+    }
+
+    /// A new rule set = these rules plus a layer's overrides. Since `evaluate`
+    /// resolves `deny > ask > allow`, a layer can only tighten (add ask/deny) —
+    /// it cannot relax a base `deny`.
+    pub fn extended(&self, allow: &[String], ask: &[String], deny: &[String]) -> RuleSet {
+        let mut r = self.clone();
+        r.allow.extend(rule::parse_all(allow));
+        r.ask.extend(rule::parse_all(ask));
+        r.deny.extend(rule::parse_all(deny));
+        r
+    }
+}
+
+/// Evaluate a request. Explicit `deny` always wins; otherwise `ask` over
+/// `allow`; otherwise the mode default. A compound bash command is decomposed
+/// (operators, substitutions, redirection targets) and gated per-component with
+/// the most restrictive verdict returned; an undecomposable command is denied
+/// (fail closed). `DontAsk` turns the final `Ask` into `Deny`, `Bypass` turns it
+/// into `Allow` — an explicit `deny` rule wins in every mode.
+pub fn evaluate(
+    request: &PermissionRequest,
+    rules: &RuleSet,
+    project_root: &Path,
+    home: Option<&Path>,
+    mode: PermissionMode,
+) -> Decision {
+    let decision = evaluate_inner(request, rules, project_root, home, mode);
+    match (mode, decision) {
+        (PermissionMode::DontAsk, Decision::Ask) => Decision::Deny,
+        (PermissionMode::Bypass, Decision::Ask) => Decision::Allow,
+        (_, decision) => decision,
+    }
+}
+
+fn evaluate_inner(
+    request: &PermissionRequest,
+    rules: &RuleSet,
+    project_root: &Path,
+    home: Option<&Path>,
+    mode: PermissionMode,
+) -> Decision {
+    match request {
+        PermissionRequest::Bash(command) => {
+            let Some(mut atoms) = bash::decompose(command) else {
+                // Not fully analyzable (unbalanced quote/paren, dangling
+                // redirection) — a deny rule could be hiding inside, fail closed.
+                return Decision::Deny;
+            };
+            if atoms.is_empty() {
+                atoms.push(bash::BashAtom {
+                    command: command.clone(),
+                    reads: Vec::new(),
+                    writes: Vec::new(),
+                    escalate: false,
+                });
+            }
+            atoms
+                .iter()
+                .map(|atom| {
+                    let decision = decide(
+                        "Bash",
+                        &MatchTarget::Command(&atom.command),
+                        rules,
+                        project_root,
+                        home,
+                        || mode_default_bash(mode),
+                    );
+                    // A command rule must not auto-allow a redirection whose
+                    // target could not be analyzed — escalate Allow to Ask.
+                    let decision = if decision == Decision::Allow && atom.escalate {
+                        Decision::Ask
+                    } else {
+                        decision
+                    };
+                    // Analyzed redirection targets are gated as their own
+                    // Read/Write path requests, so path deny rules see them.
+                    atom.reads
+                        .iter()
+                        .map(|p| PermissionRequest::Read(PathBuf::from(p)))
+                        .chain(
+                            atom.writes
+                                .iter()
+                                .map(|p| PermissionRequest::Write(PathBuf::from(p))),
+                        )
+                        .fold(decision, |acc, target| {
+                            acc.restrict(evaluate_inner(
+                                &target,
+                                rules,
+                                project_root,
+                                home,
+                                mode,
+                            ))
+                        })
+                })
+                .fold(Decision::Allow, Decision::restrict)
+        }
+        PermissionRequest::Read(p)
+        | PermissionRequest::Write(p)
+        | PermissionRequest::Edit(p) => {
+            let in_project = path::is_in_project(p, project_root);
+            let decision = decide(
+                request.tool(),
+                &MatchTarget::Path(p),
+                rules,
+                project_root,
+                home,
+                || mode_default_path(request, mode, in_project),
+            );
+            // The `.stepper/` config dir (commands, hooks, settings) gates the
+            // agent's own security — a write/edit there must be explicitly
+            // confirmed, never silently auto-allowed by mode or a broad rule. An
+            // explicit `deny` still wins (it was checked first inside `decide`).
+            if decision == Decision::Allow
+                && !request.is_read_only()
+                && path::is_protected(p, project_root)
+            {
+                Decision::Ask
+            } else {
+                decision
+            }
+        }
+        PermissionRequest::WebFetch(url) => decide(
+            "WebFetch",
+            &MatchTarget::Text(url),
+            rules,
+            project_root,
+            home,
+            || mode_default_other(mode),
+        ),
+        PermissionRequest::Mcp { server, tool } => decide(
+            "Mcp",
+            &MatchTarget::Mcp { server, tool },
+            rules,
+            project_root,
+            home,
+            || mode_default_other(mode),
+        ),
+        PermissionRequest::Other { tool, arg } => decide(
+            tool,
+            &MatchTarget::Text(arg),
+            rules,
+            project_root,
+            home,
+            || mode_default_other(mode),
+        ),
+    }
+}
+
+fn decide(
+    tool: &str,
+    target: &MatchTarget,
+    rules: &RuleSet,
+    project_root: &Path,
+    home: Option<&Path>,
+    default: impl Fn() -> Decision,
+) -> Decision {
+    if rules.deny.iter().any(|r| r.matches(tool, target, project_root, home)) {
+        return Decision::Deny;
+    }
+    if rules.ask.iter().any(|r| r.matches(tool, target, project_root, home)) {
+        return Decision::Ask;
+    }
+    if rules.allow.iter().any(|r| r.matches(tool, target, project_root, home)) {
+        return Decision::Allow;
+    }
+    default()
+}
+
+fn mode_default_bash(mode: PermissionMode) -> Decision {
+    // Shell is never auto-allowed by mode alone — only an explicit allow rule
+    // does that.
+    let _ = mode;
+    Decision::Ask
+}
+
+fn mode_default_path(
+    request: &PermissionRequest,
+    mode: PermissionMode,
+    in_project: bool,
+) -> Decision {
+    let read_only = request.is_read_only();
+    match mode {
+        PermissionMode::Plan => {
+            if read_only {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            }
+        }
+        PermissionMode::Auto => {
+            // In-project read or write is auto-approved; anything outside asks.
+            if in_project {
+                Decision::Allow
+            } else {
+                Decision::Ask
+            }
+        }
+        PermissionMode::AcceptEdits => {
+            // In-project reads and edits are auto-approved; anything outside the
+            // project (read or write) still asks.
+            if in_project {
+                Decision::Allow
+            } else {
+                Decision::Ask
+            }
+        }
+        // `default` allows read-only without a prompt and asks for everything
+        // else; `dont-ask`/`bypass` share that base and the top-level transform
+        // turns the Ask into Deny/Allow respectively.
+        PermissionMode::Default | PermissionMode::DontAsk | PermissionMode::Bypass => {
+            if read_only {
+                Decision::Allow
+            } else {
+                Decision::Ask
+            }
+        }
+    }
+}
+
+fn mode_default_other(mode: PermissionMode) -> Decision {
+    let _ = mode;
+    Decision::Ask
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn root() -> PathBuf {
+        PathBuf::from("/project")
+    }
+
+    #[test]
+    fn deny_beats_allow_and_ask() {
+        let rules = RuleSet::from_lists(
+            &["Bash(rm *)".into()],
+            &[],
+            &["Bash(rm -rf *)".into()],
+        );
+        // Both allow(rm *) and deny(rm -rf *) match; deny wins.
+        let d = evaluate(
+            &PermissionRequest::Bash("rm -rf /tmp/x".into()),
+            &rules,
+            &root(),
+            None,
+            PermissionMode::Auto,
+        );
+        assert_eq!(d, Decision::Deny);
+    }
+
+    #[test]
+    fn compound_bash_takes_most_restrictive() {
+        let rules = RuleSet::from_lists(
+            &["Bash(cargo *)".into()],
+            &[],
+            &["Bash(rm *)".into()],
+        );
+        // "cargo build" allowed, "rm -rf /" denied -> whole compound denied.
+        let d = evaluate(
+            &PermissionRequest::Bash("cargo build && rm -rf /".into()),
+            &rules,
+            &root(),
+            None,
+            PermissionMode::Auto,
+        );
+        assert_eq!(d, Decision::Deny);
+    }
+
+    #[test]
+    fn ask_beats_allow() {
+        let rules = RuleSet::from_lists(
+            &["Bash(git *)".into()],
+            &["Bash(git push:*)".into()],
+            &[],
+        );
+        let d = evaluate(
+            &PermissionRequest::Bash("git push origin main".into()),
+            &rules,
+            &root(),
+            None,
+            PermissionMode::Auto,
+        );
+        assert_eq!(d, Decision::Ask);
+    }
+
+    #[test]
+    fn plan_mode_denies_writes_allows_reads() {
+        let rules = RuleSet::default();
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Write("/project/src/a.rs".into()),
+                &rules,
+                &root(),
+                None,
+                PermissionMode::Plan,
+            ),
+            Decision::Deny
+        );
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Read("/project/src/a.rs".into()),
+                &rules,
+                &root(),
+                None,
+                PermissionMode::Plan,
+            ),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn accept_edits_allows_in_project_asks_outside() {
+        let rules = RuleSet::default();
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Edit("/project/src/a.rs".into()),
+                &rules,
+                &root(),
+                None,
+                PermissionMode::AcceptEdits,
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Edit("/etc/hosts".into()),
+                &rules,
+                &root(),
+                None,
+                PermissionMode::AcceptEdits,
+            ),
+            Decision::Ask
+        );
+    }
+
+    #[test]
+    fn redirection_and_substitution_escalate_allow_to_ask() {
+        let rules = RuleSet::from_lists(&["Bash(echo *)".into()], &[], &[]);
+        // plain allowed command stays allowed
+        assert_eq!(
+            evaluate(&PermissionRequest::Bash("echo hi".into()), &rules, &root(), None, PermissionMode::Auto),
+            Decision::Allow
+        );
+        // redirection to an arbitrary target must not auto-allow
+        assert_eq!(
+            evaluate(&PermissionRequest::Bash("echo x > /etc/passwd".into()), &rules, &root(), None, PermissionMode::Auto),
+            Decision::Ask
+        );
+        // command substitution must not auto-allow
+        assert_eq!(
+            evaluate(&PermissionRequest::Bash("echo $(rm -rf /)".into()), &rules, &root(), None, PermissionMode::Auto),
+            Decision::Ask
+        );
+        // but a quoted '>' is not a redirection
+        assert_eq!(
+            evaluate(&PermissionRequest::Bash("echo 'a > b'".into()), &rules, &root(), None, PermissionMode::Auto),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn writes_into_dot_stepper_escalate_to_ask_even_in_accept_edits() {
+        let rules = RuleSet::default();
+        // An in-project edit normally auto-allows in accept-edits…
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Edit("/project/src/a.rs".into()),
+                &rules,
+                &root(),
+                None,
+                PermissionMode::AcceptEdits,
+            ),
+            Decision::Allow
+        );
+        // …but a write/edit under `.stepper/` (commands/hooks/settings) must ask.
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Write("/project/.stepper/commands/x.md".into()),
+                &rules,
+                &root(),
+                None,
+                PermissionMode::AcceptEdits,
+            ),
+            Decision::Ask
+        );
+        // even a broad allow rule cannot silently auto-approve a `.stepper/` write.
+        let broad = RuleSet::from_lists(&["Write(/**)".into()], &[], &[]);
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Write("/project/.stepper/setting.json".into()),
+                &broad,
+                &root(),
+                None,
+                PermissionMode::Auto,
+            ),
+            Decision::Ask
+        );
+        // reading `.stepper/` is fine (only writes/edits are gated).
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Read("/project/.stepper/setting.json".into()),
+                &rules,
+                &root(),
+                None,
+                PermissionMode::AcceptEdits,
+            ),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn explicit_deny_overrides_accept_edits() {
+        let rules = RuleSet::from_lists(&[], &[], &["Write(//etc/**)".into()]);
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Write("/etc/passwd".into()),
+                &rules,
+                &root(),
+                None,
+                PermissionMode::AcceptEdits,
+            ),
+            Decision::Deny
+        );
+    }
+}
