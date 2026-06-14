@@ -1,12 +1,12 @@
 use ratatui::style::Style;
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{TextArea, WrapMode};
 use smallvec::SmallVec;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use stepper_protocol::{
     Action, AppEvent, ApprovalRequest, CheckpointView, ContextBreakdownView, LayerStatus,
-    LayerView, Mode, ModelView, PermissionsSnapshotView, SessionView, TodoItemView, UsageView,
-    WorkerView,
+    LayerView, Mode, ModelChoiceView, ModelView, PermissionsSnapshotView, SessionView,
+    TodoItemView, UsageView, WorkerView,
 };
 
 use crate::TuiInit;
@@ -63,8 +63,17 @@ pub enum Overlay {
     Context(ContextBreakdownView),
     /// `/permissions` — the read-only rules/approvals snapshot (any-key dismiss).
     Permissions(PermissionsSnapshotView),
-    /// The generic list picker (rewind checkpoints / resume sessions).
+    /// The generic list picker (rewind checkpoints / resume sessions / models).
     Picker(ListPicker),
+    /// API-key entry for a provider (`/login`, or a keyless model switch). Keys
+    /// are typed in masked; Enter sends `Action::SetApiKey`, Esc cancels.
+    ApiKey(ApiKeyOverlay),
+}
+
+/// The masked API-key entry overlay state.
+pub struct ApiKeyOverlay {
+    pub provider: String,
+    pub input: String,
 }
 
 /// What a list-picker selection turns into.
@@ -72,6 +81,7 @@ pub enum Overlay {
 pub enum PickerKind {
     Rewind,
     Resume,
+    Model,
 }
 
 /// The generic list-picker overlay shared by `/rewind` (checkpoints) and
@@ -95,6 +105,7 @@ impl ListPicker {
         match self.kind {
             PickerKind::Rewind => " rewind ",
             PickerKind::Resume => " resume ",
+            PickerKind::Model => " models ",
         }
     }
 
@@ -114,6 +125,12 @@ impl ListPicker {
             },
             PickerKind::Resume => Action::Resume {
                 session_id: item.id.clone(),
+            },
+            // Reuse the existing `/model <ref>` switch path (validate + emit
+            // ModelChanged); the item id is the `provider/model-id` ref.
+            PickerKind::Model => Action::SlashCommand {
+                name: "model".into(),
+                args: item.id.clone(),
             },
         })
     }
@@ -176,6 +193,10 @@ pub struct AppState {
     /// one at a time (without this, a later request would clobber the prior one's
     /// overlay → its worker auto-denied).
     pub pending_approvals: VecDeque<ApprovalRequest>,
+    /// API-key prompts (provider names) that arrived while another overlay was on
+    /// screen — surfaced one at a time on `overlay_close`, after approvals, so a
+    /// prompt racing an approval (e.g. the auto `/login` on launch) is never lost.
+    pub pending_prompts: VecDeque<String>,
     pub picker: Option<FilePicker>,
     pub queue: VecDeque<Queued>,
     pub notice: Option<String>,
@@ -191,17 +212,24 @@ pub struct AppState {
     pub should_quit: bool,
 }
 
+/// A blank input textarea configured the way every fresh prompt needs it:
+/// no emulated cursor (the event loop draws the real one for correct CJK / wide
+/// alignment) and soft word-wrapping so long input flows onto extra visual rows
+/// instead of overflowing the box (the input area grows to fit — see
+/// `render::input_height`).
+pub(crate) fn fresh_textarea() -> TextArea<'static> {
+    let mut textarea = TextArea::default();
+    textarea.set_cursor_style(Style::default());
+    textarea.set_wrap_mode(WrapMode::WordOrGlyph);
+    textarea
+}
+
 impl AppState {
     pub fn new(init: TuiInit) -> Self {
-        let mut textarea = TextArea::default();
-        // Disable the emulated (reversed-cell) cursor; the event loop places the
-        // real terminal cursor at the display column instead, so CJK / wide
-        // characters align correctly (the reversed-wide-cell cursor mis-renders).
-        textarea.set_cursor_style(Style::default());
         Self {
             live: StreamBuf::default(),
             tool_lines: Vec::new(),
-            textarea,
+            textarea: fresh_textarea(),
             mode: init.mode,
             model: init.model,
             usage: UsageView::default(),
@@ -210,6 +238,7 @@ impl AppState {
             todos: Vec::new(),
             overlay: None,
             pending_approvals: VecDeque::new(),
+            pending_prompts: VecDeque::new(),
             picker: None,
             queue: VecDeque::new(),
             notice: None,
@@ -270,8 +299,7 @@ impl AppState {
             return;
         }
         let idx = self.palette_selected.min(matches.len() - 1);
-        self.textarea = TextArea::default();
-        self.textarea.set_cursor_style(Style::default());
+        self.textarea = fresh_textarea();
         self.textarea.insert_str(format!("/{} ", matches[idx]));
         self.palette_selected = 0;
     }
@@ -336,14 +364,62 @@ impl AppState {
     pub fn overlay_captures_keys(&self) -> bool {
         matches!(
             self.overlay,
-            Some(Overlay::Context(_) | Overlay::Permissions(_) | Overlay::Picker(_))
+            Some(
+                Overlay::Context(_)
+                    | Overlay::Permissions(_)
+                    | Overlay::Picker(_)
+                    | Overlay::ApiKey(_)
+            )
         )
+    }
+
+    /// Type into the API-key overlay (a printable char).
+    pub fn api_key_push(&mut self, c: char) {
+        if let Some(Overlay::ApiKey(o)) = &mut self.overlay {
+            // Cap length: real provider keys are well under this, and the cap
+            // stops an accidental huge paste from thrashing the per-tick masked
+            // re-render.
+            if o.input.len() < 8192 {
+                o.input.push(c);
+            }
+        }
+    }
+
+    /// Backspace in the API-key overlay.
+    pub fn api_key_backspace(&mut self) {
+        if let Some(Overlay::ApiKey(o)) = &mut self.overlay {
+            o.input.pop();
+        }
+    }
+
+    /// Submit the API-key overlay: send `SetApiKey` for a non-empty key and close.
+    /// An empty key just cancels (closes without sending).
+    pub fn api_key_submit(&mut self) -> Effects {
+        let mut effects = Effects::new();
+        if let Some(Overlay::ApiKey(o)) = &self.overlay {
+            let key = o.input.trim().to_string();
+            if !key.is_empty() {
+                effects.push(Effect::Send(Action::SetApiKey {
+                    provider: o.provider.clone(),
+                    key,
+                }));
+            }
+            self.overlay_close();
+        }
+        effects
     }
 
     /// Close the current non-approval overlay; a queued approval (one that
     /// arrived while it was open) surfaces immediately so it is never stranded.
     pub fn overlay_close(&mut self) {
         self.overlay = self.pending_approvals.pop_front().map(Overlay::Approval);
+        // A queued approval wins (its oneshot is time-sensitive); otherwise
+        // surface a queued api-key prompt so it is never stranded.
+        if self.overlay.is_none()
+            && let Some(provider) = self.pending_prompts.pop_front()
+        {
+            self.overlay = Some(Overlay::ApiKey(ApiKeyOverlay { provider, input: String::new() }));
+        }
     }
 
     pub fn overlay_picker_move(&mut self, delta: i32) {
@@ -507,6 +583,30 @@ impl AppState {
                     selected: 0,
                 }));
             }
+            AppEvent::ModelList(models) => {
+                let items = models
+                    .into_iter()
+                    .map(|m: ModelChoiceView| ListPickerItem {
+                        label: m.label,
+                        id: m.model_ref,
+                    })
+                    .collect();
+                self.open_overlay(Overlay::Picker(ListPicker {
+                    kind: PickerKind::Model,
+                    items,
+                    selected: 0,
+                }));
+            }
+            AppEvent::ApiKeyPrompt { provider } => {
+                // Never clobber a live overlay (esp. an approval's oneshot) and
+                // never drop the prompt — queue it if something is on screen.
+                if self.overlay.is_none() {
+                    self.overlay =
+                        Some(Overlay::ApiKey(ApiKeyOverlay { provider, input: String::new() }));
+                } else {
+                    self.pending_prompts.push_back(provider);
+                }
+            }
             AppEvent::SessionResumed { id, name, turns } => {
                 self.live.clear();
                 self.tool_lines.clear();
@@ -580,7 +680,10 @@ impl AppState {
                 }
             }
             Action::Quit => self.should_quit = true,
-            other @ (Action::SlashCommand { .. } | Action::Rewind { .. } | Action::Resume { .. }) => {
+            other @ (Action::SlashCommand { .. }
+            | Action::Rewind { .. }
+            | Action::Resume { .. }
+            | Action::SetApiKey { .. }) => {
                 effects.push(Effect::Send(other));
             }
             Action::ScrollUp(_) | Action::ScrollDown(_) | Action::Redraw => {}
@@ -596,7 +699,7 @@ impl AppState {
         if text_empty {
             return;
         }
-        self.textarea = TextArea::default();
+        self.textarea = fresh_textarea();
         if self.turn_active {
             self.queue.push_back(item);
         } else {
@@ -1265,6 +1368,102 @@ mod tests {
             _ => panic!("expected a Resume send"),
         }
         assert!(s.overlay.is_none());
+    }
+
+    #[test]
+    fn model_list_opens_picker_and_select_routes_through_model_switch() {
+        let mut s = test_state();
+        s.apply_event(AppEvent::ModelList(vec![
+            ModelChoiceView {
+                model_ref: "anthropic/claude-opus-4-8".into(),
+                label: "anthropic/claude-opus-4-8  ·  1M  ·  $5.00/$25.00".into(),
+            },
+            ModelChoiceView {
+                model_ref: "openai/gpt-5".into(),
+                label: "openai/gpt-5".into(),
+            },
+        ]));
+        match &s.overlay {
+            Some(Overlay::Picker(p)) => {
+                assert_eq!(p.kind, PickerKind::Model);
+                assert_eq!(p.items.len(), 2);
+                assert!(p.items[0].label.contains("claude-opus-4-8"));
+            }
+            _ => panic!("expected the models picker overlay"),
+        }
+        s.overlay_picker_move(1);
+        let effects = s.overlay_picker_select();
+        match effects.as_slice() {
+            // Selection reuses the /model switch path, carrying the chosen ref.
+            [Effect::Send(Action::SlashCommand { name, args })] => {
+                assert_eq!(name, "model");
+                assert_eq!(args, "openai/gpt-5");
+            }
+            _ => panic!("expected a /model SlashCommand send"),
+        }
+        assert!(s.overlay.is_none(), "selection closes the picker");
+    }
+
+    #[test]
+    fn api_key_prompt_opens_overlay_and_submit_sends_set_api_key() {
+        let mut s = test_state();
+        s.apply_event(AppEvent::ApiKeyPrompt { provider: "anthropic".into() });
+        match &s.overlay {
+            Some(Overlay::ApiKey(o)) => {
+                assert_eq!(o.provider, "anthropic");
+                assert!(o.input.is_empty());
+            }
+            _ => panic!("expected the api-key overlay"),
+        }
+        s.api_key_push('s');
+        s.api_key_push('k');
+        s.api_key_push('x');
+        s.api_key_backspace();
+        let effects = s.api_key_submit();
+        match effects.as_slice() {
+            [Effect::Send(Action::SetApiKey { provider, key })] => {
+                assert_eq!(provider, "anthropic");
+                assert_eq!(key, "sk");
+            }
+            _ => panic!("expected a SetApiKey send"),
+        }
+        assert!(s.overlay.is_none(), "submit closes the overlay");
+    }
+
+    #[test]
+    fn api_key_empty_submit_cancels_without_sending() {
+        let mut s = test_state();
+        s.apply_event(AppEvent::ApiKeyPrompt { provider: "openai".into() });
+        let effects = s.api_key_submit();
+        assert!(effects.is_empty(), "an empty key sends nothing");
+        assert!(s.overlay.is_none(), "and still closes");
+    }
+
+    #[test]
+    fn api_key_prompt_queues_behind_an_approval_and_surfaces_on_close() {
+        use stepper_protocol::{ApprovalKind, ApprovalRequest};
+        use tokio::sync::oneshot;
+        use uuid::Uuid;
+        let mut s = test_state();
+        let (reply, _rx) = oneshot::channel();
+        s.overlay = Some(Overlay::Approval(ApprovalRequest {
+            id: Uuid::new_v4(),
+            kind: ApprovalKind::Command { cmd: "ls".into(), outside_project: false },
+            reply,
+        }));
+        // Arrives while the approval is on screen — must queue, not clobber or drop.
+        s.apply_event(AppEvent::ApiKeyPrompt { provider: "anthropic".into() });
+        assert!(
+            matches!(s.overlay, Some(Overlay::Approval(_))),
+            "the approval (and its oneshot) stays on screen"
+        );
+        assert_eq!(s.pending_prompts.len(), 1, "the prompt is queued, not lost");
+        // Closing the approval surfaces the queued key prompt.
+        s.overlay_close();
+        match &s.overlay {
+            Some(Overlay::ApiKey(o)) => assert_eq!(o.provider, "anthropic"),
+            _ => panic!("the queued api-key prompt must surface after the approval closes"),
+        }
     }
 
     #[test]

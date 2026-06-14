@@ -265,6 +265,24 @@ pub fn spawn_core(
                         }
                     }
                 }
+                Action::SetApiKey { provider, key } => {
+                    // Persist to the OS keyring; the next provider resolve picks it
+                    // up via the explicit>env>keyring precedence (no restart).
+                    let (level, text) = match stepper_providers::store_key_in_keyring(&provider, &key)
+                    {
+                        Ok(()) => (
+                            NoticeLevel::Info,
+                            format!("saved API key for '{provider}' — pick the model again"),
+                        ),
+                        Err(e) => (
+                            NoticeLevel::Warn,
+                            format!(
+                                "failed to save the API key for '{provider}' to the OS keyring ({e}) — it will not persist and will be requested again"
+                            ),
+                        ),
+                    };
+                    let _ = tx.send(AppEvent::Notice { level, text }).await;
+                }
                 Action::RunShell(command) => {
                     turn_id += 1;
                     let _ = tx.send(AppEvent::TurnStarted { turn_id }).await;

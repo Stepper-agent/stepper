@@ -42,6 +42,7 @@ pub fn lower_event(event: &Event, state: &AppState) -> Lowered {
     };
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     // An open approval overlay captures keys first (y / a / n).
     if let Some(Overlay::Approval(req)) = &state.overlay {
@@ -64,7 +65,11 @@ pub fn lower_event(event: &Event, state: &AppState) -> Lowered {
         KeyCode::BackTab => Lowered::Action(Action::CycleMode),
         KeyCode::Tab if shift => Lowered::Action(Action::CycleMode),
         KeyCode::Esc => Lowered::Action(Action::Interrupt),
-        KeyCode::Enter if shift => Lowered::Action(Action::InsertNewline),
+        // Shift+Enter inserts a newline when the terminal can disambiguate it
+        // (Kitty keyboard protocol, enabled in terminal.rs). Alt+Enter and Ctrl+J
+        // are universal fallbacks for terminals that can't (e.g. Apple Terminal).
+        KeyCode::Enter if shift || alt => Lowered::Action(Action::InsertNewline),
+        KeyCode::Char('j') if ctrl => Lowered::Action(Action::InsertNewline),
         KeyCode::Enter => submit_action(&state.input_text()),
         // Backspace on an empty input removes the most recently queued message.
         KeyCode::Backspace if state.input_text().is_empty() && !state.queue.is_empty() => {
@@ -176,6 +181,20 @@ mod tests {
         match lower_event(&key_mod(KeyCode::Enter, KeyModifiers::SHIFT), &s) {
             Lowered::Action(Action::InsertNewline) => {}
             _ => panic!("expected InsertNewline"),
+        }
+    }
+
+    #[test]
+    fn alt_enter_and_ctrl_j_insert_newline_as_shift_enter_fallbacks() {
+        let mut s = state();
+        type_text(&mut s, "line one");
+        match lower_event(&key_mod(KeyCode::Enter, KeyModifiers::ALT), &s) {
+            Lowered::Action(Action::InsertNewline) => {}
+            _ => panic!("expected InsertNewline for Alt+Enter"),
+        }
+        match lower_event(&key_mod(KeyCode::Char('j'), KeyModifiers::CONTROL), &s) {
+            Lowered::Action(Action::InsertNewline) => {}
+            _ => panic!("expected InsertNewline for Ctrl+J"),
         }
     }
 

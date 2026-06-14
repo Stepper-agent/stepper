@@ -18,8 +18,8 @@ pub use event::AppEvent;
 pub use mode::Mode;
 pub use view::{
     ApprovalRuleView, CheckpointView, ContextBreakdownView, DiffView, LayerStatus, LayerView,
-    ModelView, NoticeLevel, PermissionRuleView, PermissionsSnapshotView, SessionView,
-    TodoItemView, TodoStatus, ToolCallView, UsageView, WorkerView,
+    ModelChoiceView, ModelView, NoticeLevel, PermissionRuleView, PermissionsSnapshotView,
+    SessionView, TodoItemView, TodoStatus, ToolCallView, UsageView, WorkerView,
 };
 
 /// Channel aliases wired by the CLI between the TUI and core.

@@ -229,9 +229,20 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
     );
     // The orchestrator's mode is the resolved one (flag > setting.json > default).
     let resolved_mode = perm_to_mode(orchestrator.mode);
+    // First-run / keyless start: if the active model's provider needs an API key
+    // and none is resolvable (env / keyring / config), open the key overlay right
+    // away by replaying a `/login <provider>` once the session is up.
+    let model_ref = effective_model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let key_prompt = needs_api_key(&*orchestrator.resolver, &model_ref)
+        .then(|| provider_of(&model_ref).to_string());
     let (action_tx, action_rx) = tokio::sync::mpsc::channel(64);
     let cancel = CancellationToken::new();
     let event_rx = spawn_core(orchestrator, session, action_rx, cancel.clone());
+    if let Some(provider) = key_prompt {
+        let _ = action_tx
+            .send(Action::SlashCommand { name: "login".into(), args: provider })
+            .await;
+    }
 
     let mut commands = stepper_core::builtin_command_names();
     commands.extend(
@@ -398,6 +409,24 @@ fn resume_or_fresh(
     session
 }
 
+/// The provider segment of a `provider/model-id` ref (or the whole string).
+fn provider_of(model_ref: &str) -> &str {
+    model_ref.split('/').next().unwrap_or(model_ref)
+}
+
+/// Whether the active model can't be built for lack of a key. A test-resolve that
+/// fails with an auth error means the provider needs a key and none is reachable
+/// (env / keyring / config); any other outcome (ok, or a non-auth error) does not
+/// open the key overlay.
+fn needs_api_key(resolver: &dyn stepper_core::ProviderResolver, model_ref: &str) -> bool {
+    matches!(
+        resolver.resolve(model_ref),
+        Err(stepper_core::CoreError::Provider(
+            stepper_providers::ProviderError::Auth(_)
+        ))
+    )
+}
+
 fn split_model(model: Option<&str>) -> (String, String) {
     match model.unwrap_or(DEFAULT_MODEL).split_once('/') {
         Some((p, m)) => (p.to_string(), m.to_string()),
@@ -408,6 +437,50 @@ fn split_model(model: Option<&str>) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakeResolver {
+        auth_err: bool,
+    }
+    impl stepper_core::ProviderResolver for FakeResolver {
+        fn resolve(
+            &self,
+            _model_ref: &str,
+        ) -> Result<Box<dyn stepper_providers::LlmProvider>, stepper_core::CoreError> {
+            if self.auth_err {
+                Err(stepper_core::CoreError::Provider(
+                    stepper_providers::ProviderError::Auth("no key".into()),
+                ))
+            } else {
+                Err(stepper_core::CoreError::NoModel("x".into()))
+            }
+        }
+        fn model_info(&self, _model_ref: &str) -> stepper_core::ModelInfo {
+            stepper_core::ModelInfo {
+                context_window: 0,
+                max_output_tokens: 0,
+                input_per_mtok: 0.0,
+                output_per_mtok: 0.0,
+                cache_read_per_mtok: 0.0,
+                cache_write_per_mtok: 0.0,
+                estimated: true,
+            }
+        }
+    }
+
+    #[test]
+    fn provider_of_takes_the_segment_before_the_slash() {
+        assert_eq!(provider_of("anthropic/claude-opus-4-8"), "anthropic");
+        assert_eq!(provider_of("noslash"), "noslash");
+    }
+
+    #[test]
+    fn needs_api_key_only_on_an_auth_error() {
+        assert!(needs_api_key(&FakeResolver { auth_err: true }, "anthropic/x"));
+        assert!(
+            !needs_api_key(&FakeResolver { auth_err: false }, "anthropic/x"),
+            "a non-auth error must not pop the key overlay"
+        );
+    }
 
     #[test]
     fn scaffold_default_matches_plain_init_and_parses() {

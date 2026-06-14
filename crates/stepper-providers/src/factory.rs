@@ -98,6 +98,15 @@ impl ProviderFactory {
         self.auth_client.clone()
     }
 
+    /// The streaming client for plain HTTPS GETs that need to FOLLOW redirects —
+    /// model discovery (models.dev catalog + provider list endpoints). The auth
+    /// `client()` must not be used there: its `redirect: none` policy turns a 3xx
+    /// (CDN/host canonicalization) into a non-success response. Callers set their
+    /// own per-request `.timeout(...)`.
+    pub fn http_client(&self) -> reqwest::Client {
+        self.client.clone()
+    }
+
     pub fn build(&self, spec: ProviderSpec) -> Result<Box<dyn LlmProvider>, ProviderError> {
         let client = self.client.clone();
         match spec.kind {
@@ -107,6 +116,17 @@ impl ProviderFactory {
                     .unwrap_or_else(|| "https://api.openai.com/v1".into());
                 let auth = match resolve_key(&spec.name, spec.api_key.as_deref()) {
                     Some(key) => AuthSource::ApiKey(key),
+                    // Known commercial endpoints require a key — fail closed so a
+                    // keyless start surfaces the api-key prompt instead of firing
+                    // an unauthorized request (a bare 401). Self-hosted / localhost
+                    // openai-compat servers (oMLX, vLLM) stay keyless.
+                    None if requires_api_key(&base) => {
+                        return Err(ProviderError::Auth(format!(
+                            "provider '{}' requires an API key (set it with /login, STEPPER_{}_API_KEY, or the OS keyring)",
+                            spec.name,
+                            spec.name.to_ascii_uppercase().replace('-', "_"),
+                        )))
+                    }
                     None => AuthSource::None,
                 };
                 Ok(Box::new(OpenAiCompatAdapter::new(
@@ -160,5 +180,49 @@ impl ProviderFactory {
                 )))
             }
         }
+    }
+}
+
+/// Known commercial OpenAI-compatible hosts that require an API key, so a keyless
+/// build fails closed instead of sending an unauthorized request. Self-hosted and
+/// localhost servers (oMLX, vLLM, a local Ollama) are intentionally excluded and
+/// stay keyless.
+fn requires_api_key(base_url: &str) -> bool {
+    const KEYED_HOSTS: &[&str] = &["ollama.com", "api.openai.com"];
+    KEYED_HOSTS.iter().any(|host| base_url.contains(host))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requires_api_key_for_commercial_hosts_only() {
+        assert!(requires_api_key("https://ollama.com/v1"));
+        assert!(requires_api_key("https://api.openai.com/v1"));
+        assert!(!requires_api_key("http://localhost:8000/v1"));
+        assert!(!requires_api_key("http://127.0.0.1:11434/v1"));
+        assert!(!requires_api_key("https://my-self-hosted-vllm.internal/v1"));
+    }
+
+    #[test]
+    fn openai_compat_fails_closed_without_a_key_for_commercial_host() {
+        let factory = ProviderFactory::new().unwrap();
+        let spec = ProviderSpec::new(ProviderKind::OpenAiCompat, "ollama-cloud", "qwen3-coder")
+            .with_base_url("https://ollama.com/v1")
+            .with_api_key("none");
+        assert!(
+            matches!(factory.build(spec), Err(ProviderError::Auth(_))),
+            "keyless ollama.com must fail closed so the key prompt fires"
+        );
+    }
+
+    #[test]
+    fn openai_compat_stays_keyless_for_localhost() {
+        let factory = ProviderFactory::new().unwrap();
+        let spec = ProviderSpec::new(ProviderKind::OpenAiCompat, "omlx", "deepseek")
+            .with_base_url("http://localhost:8000/v1")
+            .with_api_key("none");
+        assert!(factory.build(spec).is_ok(), "local servers stay keyless");
     }
 }

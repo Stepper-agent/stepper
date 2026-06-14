@@ -600,3 +600,27 @@ async fn resume_lists_sessions_and_action_resume_reseeds_the_conversation() {
     let warn = next_notice(&mut events).await;
     assert!(warn.contains("no session 'missing'"), "got: {warn}");
 }
+
+#[tokio::test]
+async fn login_emits_an_api_key_prompt_for_the_named_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let orch = orchestrator(dir.path().to_path_buf());
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orch,
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+
+    // `provider/model` is accepted; only the provider segment is used.
+    action_tx.send(slash("login", "anthropic/claude-x")).await.unwrap();
+    let provider = loop {
+        match events.recv().await.expect("event stream stays open") {
+            AppEvent::ApiKeyPrompt { provider } => break provider,
+            AppEvent::TurnStarted { .. } => panic!("/login must not start a turn"),
+            _ => {}
+        }
+    };
+    assert_eq!(provider, "anthropic");
+}

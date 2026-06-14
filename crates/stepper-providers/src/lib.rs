@@ -8,6 +8,7 @@ pub mod auth;
 pub mod codex;
 mod error;
 pub mod factory;
+pub mod models;
 pub mod openai_compat;
 pub mod responses;
 pub mod sse;
@@ -19,6 +20,7 @@ pub use auth::{
 };
 pub use codex::{CodexTokenStore, CODEX_BASE_URL};
 pub use factory::{ProviderFactory, ProviderKind, ProviderSpec};
+pub use models::{list_models, Catalog, CatalogMeta, ModelEntry};
 pub use openai_compat::OpenAiCompatAdapter;
 pub use responses::OpenAiResponsesAdapter;
 

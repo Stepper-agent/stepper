@@ -35,6 +35,12 @@ pub enum Action {
     Resume {
         session_id: String,
     },
+    /// Store an API key for `provider` (entered in the TUI key overlay). Core
+    /// writes it to the OS keyring; the next provider resolve picks it up.
+    SetApiKey {
+        provider: String,
+        key: String,
+    },
     Quit,
     Redraw,
 }

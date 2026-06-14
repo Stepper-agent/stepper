@@ -199,6 +199,33 @@ fn handle_terminal_event(state: &mut AppState, action_tx: &ActionTx, ev: Event) 
 fn handle_overlay_key(state: &mut AppState, action_tx: &ActionTx, ev: &Event) {
     use crate::input::{lower_picker_nav, PickerNav};
     use crate::state::Overlay;
+    // The API-key overlay is a masked text field: type chars, Enter saves, Esc
+    // cancels.
+    if matches!(state.overlay, Some(Overlay::ApiKey(_))) {
+        if let Event::Key(k) = ev {
+            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+            match k.code {
+                KeyCode::Enter => {
+                    for eff in state.api_key_submit() {
+                        if let Effect::Send(action) = eff {
+                            let _ = action_tx.try_send(action);
+                        }
+                    }
+                }
+                // Esc and Ctrl+C both cancel (Ctrl+C must not be typed into the
+                // key as a literal 'c').
+                KeyCode::Esc => state.overlay_close(),
+                KeyCode::Char('c') if ctrl => state.overlay_close(),
+                KeyCode::Backspace => state.api_key_backspace(),
+                // Only insert printable chars typed without ctrl/alt.
+                KeyCode::Char(c) if !ctrl && !k.modifiers.contains(KeyModifiers::ALT) => {
+                    state.api_key_push(c)
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
     if matches!(state.overlay, Some(Overlay::Picker(_))) {
         match lower_picker_nav(ev) {
             Some(PickerNav::Up) => state.overlay_picker_move(-1),
@@ -328,4 +355,46 @@ fn input_width(state: &AppState) -> usize {
         .map(UnicodeWidthStr::width)
         .max()
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{ApiKeyOverlay, Overlay};
+    use crossterm::event::KeyEvent;
+    use stepper_protocol::{Action, Mode, ModelView};
+
+    fn state_with_api_key_overlay() -> AppState {
+        let mut s = AppState::new(crate::TuiInit {
+            inline_height: 10,
+            model: ModelView { provider: "p".into(), model: "m".into() },
+            mode: Mode::Auto,
+            cwd: PathBuf::from("/tmp"),
+            commands: vec![],
+        });
+        s.overlay = Some(Overlay::ApiKey(ApiKeyOverlay {
+            provider: "anthropic".into(),
+            input: String::new(),
+        }));
+        s
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, mods))
+    }
+
+    #[test]
+    fn api_key_overlay_types_plain_chars_but_ctrl_c_cancels() {
+        let mut s = state_with_api_key_overlay();
+        let (tx, _rx) = mpsc::channel::<Action>(8);
+        // A plain char is typed into the (masked) key.
+        handle_overlay_key(&mut s, &tx, &key(KeyCode::Char('k'), KeyModifiers::NONE));
+        match &s.overlay {
+            Some(Overlay::ApiKey(o)) => assert_eq!(o.input, "k"),
+            _ => panic!("char should type into the api-key overlay"),
+        }
+        // Ctrl+C cancels the overlay instead of appending a literal 'c'.
+        handle_overlay_key(&mut s, &tx, &key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(s.overlay.is_none(), "Ctrl+C must cancel, not type 'c'");
+    }
 }

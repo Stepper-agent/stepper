@@ -8,7 +8,7 @@ use stepper_protocol::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::state::{AppState, FilePicker, ListPicker, Overlay};
+use crate::state::{ApiKeyOverlay, AppState, FilePicker, ListPicker, Overlay};
 use crate::theme::Theme;
 
 pub fn draw(terminal: &mut DefaultTerminal, state: &AppState, theme: &Theme) -> anyhow::Result<()> {
@@ -24,14 +24,27 @@ fn ui(frame: &mut Frame, state: &AppState, theme: &Theme) {
     } else {
         state.workers.len().min(6) as u16 + 2
     };
+    // Grow the input box to fit soft-wrapped content instead of overflowing it.
+    // The status line (1) is always kept, and the input is allowed to shrink
+    // toward 1 row when workers+queue+input would otherwise overbook the small
+    // fixed-height inline viewport and collapse the live area to 0 (render_live
+    // also guards height==0). On a normal screen a one-line prompt still gets the
+    // usual 3-row box.
+    let total = frame.area();
+    let content_rows = input_display_rows(&state.input_text(), total.width.saturating_sub(2));
+    let max_input_h = total
+        .height
+        .saturating_sub(worker_h + queue_h + 1 + 1)
+        .max(1);
+    let input_h = (content_rows + 2).clamp(1, max_input_h);
     let rows = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(worker_h),
         Constraint::Length(queue_h),
-        Constraint::Length(3),
+        Constraint::Length(input_h),
         Constraint::Length(1),
     ])
-    .split(frame.area());
+    .split(total);
 
     if let Some(picker) = &state.picker {
         render_picker(frame, rows[0], picker, theme);
@@ -43,6 +56,7 @@ fn ui(frame: &mut Frame, state: &AppState, theme: &Theme) {
                 render_permissions(frame, rows[0], snapshot, theme)
             }
             Overlay::Picker(picker) => render_list_picker(frame, rows[0], picker, theme),
+            Overlay::ApiKey(o) => render_api_key(frame, rows[0], o, theme),
         }
     } else if state.palette_active() {
         render_palette(frame, rows[0], state, theme);
@@ -185,8 +199,9 @@ fn render_palette(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     ))];
     let rows = (inner.height as usize).saturating_sub(1);
     let selected = state.palette_selected.min(matches.len().saturating_sub(1));
-    for (row, name) in matches.iter().take(rows).enumerate() {
-        let style = if row == selected {
+    let offset = scroll_offset(selected, matches.len(), rows);
+    for (i, name) in matches.iter().enumerate().skip(offset).take(rows) {
+        let style = if i == selected {
             Style::default().fg(theme.accent).add_modifier(Modifier::REVERSED)
         } else {
             Style::default().fg(theme.muted)
@@ -211,8 +226,9 @@ fn render_list_picker(frame: &mut Frame, area: Rect, picker: &ListPicker, theme:
         Style::default().fg(theme.muted),
     ))];
     let rows = (inner.height as usize).saturating_sub(1);
-    for (row, item) in picker.items.iter().take(rows).enumerate() {
-        let style = if row == picker.selected {
+    let offset = scroll_offset(picker.selected, picker.items.len(), rows);
+    for (i, item) in picker.items.iter().enumerate().skip(offset).take(rows) {
+        let style = if i == picker.selected {
             Style::default().fg(theme.accent).add_modifier(Modifier::REVERSED)
         } else {
             Style::default().fg(theme.muted)
@@ -222,6 +238,30 @@ fn render_list_picker(frame: &mut Frame, area: Rect, picker: &ListPicker, theme:
             style,
         )));
     }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// The masked API-key entry overlay: a hint line and the typed key shown as
+/// bullets (never the real characters), titled with the provider.
+fn render_api_key(frame: &mut Frame, area: Rect, o: &ApiKeyOverlay, theme: &Theme) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .title(Span::styled(
+            format!(" api key · {} ", o.provider),
+            Style::default().fg(theme.muted),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let masked = "•".repeat(o.input.chars().count());
+    let lines = vec![
+        Line::from(Span::styled(
+            "   Enter save · Esc cancel · stored in your OS keyring",
+            Style::default().fg(theme.muted),
+        )),
+        Line::from(Span::styled(format!("  {masked}"), Style::default().fg(theme.accent))),
+    ];
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
@@ -358,6 +398,12 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn render_live(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    // A busy screen (many workers + queue + a tall input) can squeeze the live
+    // area to zero rows; rendering into a 0-row rect is a no-op, mirror the
+    // render_workers/render_queue guards.
+    if area.height == 0 {
+        return;
+    }
     let mut lines: Vec<Line> = Vec::new();
     for tl in &state.tool_lines {
         lines.push(Line::from(Span::styled(
@@ -382,6 +428,52 @@ fn render_live(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             .scroll((scroll, 0)),
         area,
     );
+}
+
+/// How many visual rows the input text needs at `width` columns once
+/// soft-wrapped (WordOrGlyph), so the input box can grow to fit instead of
+/// overflowing. Each logical line takes at least one row. Mirrors
+/// ratatui-textarea's wrapping closely enough for sizing — any small mismatch is
+/// absorbed by the textarea's own vertical scroll.
+fn input_display_rows(text: &str, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    let rows: usize = text.split('\n').map(|line| wrapped_rows_for_line(line, width)).sum();
+    rows.clamp(1, u16::MAX as usize) as u16
+}
+
+fn wrapped_rows_for_line(line: &str, width: usize) -> usize {
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    // Word chunks keep their trailing whitespace; a chunk wider than the row (a
+    // long word, or unspaced CJK) is glyph-wrapped across however many rows it
+    // needs. Splitting on any whitespace (not just space) keeps tabs from being
+    // mismeasured.
+    for chunk in line.split_inclusive(char::is_whitespace) {
+        let w = UnicodeWidthStr::width(chunk);
+        if w > width {
+            if col > 0 {
+                rows += 1;
+            }
+            let extra = (w - 1) / width;
+            rows += extra;
+            col = w - extra * width;
+        } else if col + w > width {
+            rows += 1;
+            col = w;
+        } else {
+            col += w;
+        }
+    }
+    rows
+}
+
+/// First visible index for a scrolling list so `selected` stays inside a
+/// `window`-row viewport (lists longer than the window scroll to follow it).
+fn scroll_offset(selected: usize, len: usize, window: usize) -> usize {
+    if window == 0 || len <= window {
+        return 0;
+    }
+    selected.saturating_sub(window - 1).min(len - window)
 }
 
 fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -765,6 +857,34 @@ mod tests {
     }
 
     #[test]
+    fn input_rows_count_logical_and_wrapped_lines() {
+        // Short text fits one row; explicit newlines add rows.
+        assert_eq!(input_display_rows("hi", 20), 1);
+        assert_eq!(input_display_rows("a\nb\nc", 20), 3);
+        // A line wider than the box wraps onto extra rows (word-aware).
+        assert_eq!(input_display_rows("aaaa bbbb cccc", 10), 2);
+        // A single word wider than the whole row glyph-wraps.
+        assert_eq!(input_display_rows("aaaaaaaaaaaa", 5), 3);
+        // Unspaced wide (CJK) text wraps by display columns, not char count.
+        assert_eq!(input_display_rows("가나다라마", 6), 2);
+        // Empty input still occupies one row.
+        assert_eq!(input_display_rows("", 10), 1);
+    }
+
+    #[test]
+    fn scroll_offset_keeps_selection_in_view() {
+        // Fits entirely → no scroll.
+        assert_eq!(scroll_offset(0, 5, 7), 0);
+        assert_eq!(scroll_offset(4, 5, 7), 0);
+        // 9 items, 7-row window: selecting below the fold scrolls just enough.
+        assert_eq!(scroll_offset(6, 9, 7), 0, "still visible without scrolling");
+        assert_eq!(scroll_offset(7, 9, 7), 1, "scrolls one row to reveal index 7");
+        assert_eq!(scroll_offset(8, 9, 7), 2, "clamped to the last full window");
+        // Degenerate window.
+        assert_eq!(scroll_offset(3, 9, 0), 0);
+    }
+
+    #[test]
     fn list_picker_overlay_renders_title_hint_and_rows() {
         use crate::state::{ListPicker, ListPickerItem, PickerKind};
         let mut s = base_state();
@@ -890,5 +1010,48 @@ mod tests {
         assert!(out.contains("edit_file: a.rs"), "running worker's last tool: {out}");
         assert!(out.contains("1.2k tok"), "worker token count: {out}");
         assert!(out.contains('✓'), "done worker glyph: {out}");
+    }
+
+    #[test]
+    fn live_area_survives_max_workers_queue_and_tall_input() {
+        // The overbooked-layout path: 6 workers (8 rows) + 3 queued + a wrapping
+        // input on a 14-row viewport would push the live area to 0. The input is
+        // allowed to shrink and render_live guards height==0, so this must render
+        // (no panic) and keep the status line (model name) visible.
+        use stepper_protocol::WorkerView;
+        let mut s = base_state();
+        s.turn_active = true;
+        for i in 0..6 {
+            s.workers.push(WorkerView {
+                index: i,
+                total: 6,
+                label: format!("w{i}"),
+                provider: "omlx".into(),
+                model: "qwen3".into(),
+                tokens: 0,
+                last_tool: None,
+                status: LayerStatus::Running,
+            });
+        }
+        for _ in 0..3 {
+            s.queue.push_back(Queued::Chat("queued message".into()));
+        }
+        s.textarea.insert_str("a very long line of text ".repeat(8));
+        s.live.assistant.push_str("streamed assistant output");
+        let out = render_to_string(&s, 40, 14);
+        assert!(out.contains("qwen3"), "status line stays visible under overbooking: {out}");
+    }
+
+    #[test]
+    fn palette_scrolls_selection_into_view() {
+        // A long command list on a short viewport must scroll so the selected
+        // entry (past the fold) is visible and early entries scroll off.
+        let mut s = base_state();
+        s.commands = (0..20).map(|i| format!("cmd{i:02}")).collect();
+        s.textarea.insert_str("/cmd");
+        s.palette_selected = 18;
+        let out = render_to_string(&s, 40, 8);
+        assert!(out.contains("cmd18"), "selected item scrolled into view: {out}");
+        assert!(!out.contains("cmd00"), "early items scrolled off the top: {out}");
     }
 }

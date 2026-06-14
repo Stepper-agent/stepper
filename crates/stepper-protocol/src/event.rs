@@ -1,7 +1,7 @@
 use crate::approval::ApprovalRequest;
 use crate::view::{
-    CheckpointView, ContextBreakdownView, DiffView, LayerStatus, ModelView, NoticeLevel,
-    PermissionsSnapshotView, SessionView, TodoItemView, ToolCallView, UsageView,
+    CheckpointView, ContextBreakdownView, DiffView, LayerStatus, ModelChoiceView, ModelView,
+    NoticeLevel, PermissionsSnapshotView, SessionView, TodoItemView, ToolCallView, UsageView,
 };
 
 /// Everything core tells the TUI. The single item type of the core->TUI mpsc
@@ -84,6 +84,16 @@ pub enum AppEvent {
     /// `/resume` — recent sessions, newest first; the TUI opens a picker whose
     /// selection comes back as `Action::Resume`.
     SessionList(Vec<SessionView>),
+    /// `/models` — selectable models (live list merged with the catalog); the TUI
+    /// opens a picker whose selection comes back as `Action::SlashCommand`
+    /// `/model <ref>` (reusing the existing switch path).
+    ModelList(Vec<ModelChoiceView>),
+    /// Ask the TUI to open the API-key entry overlay for `provider` (from
+    /// `/login`, or when a model switch failed for lack of a key). The entered
+    /// key comes back as `Action::SetApiKey`.
+    ApiKeyPrompt {
+        provider: String,
+    },
     /// An in-session `Action::Resume` succeeded: the TUI clears its live state
     /// and shows the resumed session.
     SessionResumed {

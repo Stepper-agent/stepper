@@ -166,3 +166,12 @@ pub struct SessionView {
     /// Human-readable age of the session file ("3m ago").
     pub age: String,
 }
+
+/// One `/models` candidate: a model the picker can switch to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelChoiceView {
+    /// `provider/model-id` — what selecting this row switches to.
+    pub model_ref: String,
+    /// Rendered row (display name + context/price hint).
+    pub label: String,
+}

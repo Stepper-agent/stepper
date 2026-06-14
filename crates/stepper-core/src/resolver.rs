@@ -2,7 +2,9 @@ use crate::error::CoreError;
 use crate::model::{ModelInfo, ModelRegistry};
 use crate::ports::ProviderResolver;
 use stepper_config::Config;
+use stepper_protocol::ModelChoiceView;
 use stepper_provider::LlmProvider;
+use stepper_providers::models::ModelEntry;
 use stepper_providers::{CodexTokenStore, ProviderFactory, ProviderKind, ProviderSpec};
 
 /// `ProviderResolver` driven by `setting.json` `providers`. Maps the config
@@ -31,6 +33,7 @@ impl ConfigProviderResolver {
     }
 }
 
+#[async_trait::async_trait]
 impl ProviderResolver for ConfigProviderResolver {
     fn resolve(&self, model_ref: &str) -> Result<Box<dyn LlmProvider>, CoreError> {
         let rp = self.config.resolve_provider(model_ref)?;
@@ -68,6 +71,90 @@ impl ProviderResolver for ConfigProviderResolver {
             }
             Err(_) => self.registry.lookup("", model_ref),
         }
+    }
+
+    /// Discover selectable models across every configured provider: fetch the
+    /// models.dev catalog once, then list each provider's live endpoint merged
+    /// with that catalog. Codex (OAuth) and unknown-kind providers are skipped.
+    /// Best-effort — an unreachable endpoint falls back to the catalog list, and
+    /// a failed catalog still returns whatever the live endpoints reported.
+    async fn list_models(&self) -> Vec<ModelChoiceView> {
+        // The redirect-following client — the auth client's `redirect: none`
+        // would turn a CDN/host 3xx into a failed catalog fetch.
+        let client = self.factory.http_client();
+        let catalog = match stepper_providers::models::fetch_catalog(&client).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!("models.dev catalog fetch failed: {e}");
+                None
+            }
+        };
+
+        let mut names: Vec<&String> = self.config.settings.providers.keys().collect();
+        names.sort();
+
+        let mut out = Vec::new();
+        for name in names {
+            let Ok(rp) = self.config.resolve_provider(&format!("{name}/_")) else {
+                continue;
+            };
+            let Ok(kind) = parse_kind(&rp.name, &rp.kind, rp.auth.as_deref()) else {
+                continue;
+            };
+            if kind == ProviderKind::Codex {
+                continue;
+            }
+            let base = rp
+                .base_url
+                .clone()
+                .unwrap_or_else(|| default_base_url(kind).to_string());
+            let entries = stepper_providers::models::list_models(
+                &client,
+                &rp.name,
+                kind,
+                &base,
+                rp.api_key.as_deref(),
+                catalog.as_ref(),
+            )
+            .await;
+            out.extend(entries.iter().map(|e| ModelChoiceView {
+                label: model_label(e),
+                model_ref: e.model_ref.clone(),
+            }));
+        }
+        out
+    }
+}
+
+/// The base URL the factory would default to for a provider that didn't set one
+/// (kept in sync with `ProviderFactory::build`). Codex is never passed here.
+fn default_base_url(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Anthropic => "https://api.anthropic.com",
+        _ => "https://api.openai.com/v1",
+    }
+}
+
+/// `provider/model-id · 200k · $5.00/$25.00` — ref plus whatever catalog metadata
+/// is known (context window, input/output price per Mtok).
+fn model_label(e: &ModelEntry) -> String {
+    let mut s = e.model_ref.clone();
+    if let Some(ctx) = e.context_window {
+        s.push_str(&format!("  ·  {}", human_tokens(ctx)));
+    }
+    if let (Some(input), Some(output)) = (e.input_per_mtok, e.output_per_mtok) {
+        s.push_str(&format!("  ·  ${input:.2}/${output:.2}"));
+    }
+    s
+}
+
+fn human_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
     }
 }
 

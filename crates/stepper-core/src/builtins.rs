@@ -7,6 +7,7 @@
 //! an agent turn.
 
 use crate::compaction::{estimate_tokens, Compactor};
+use crate::error::CoreError;
 use crate::orchestrator::Orchestrator;
 use crate::session::{SessionRecord, SessionStore, TurnRecord};
 use std::path::Path;
@@ -25,7 +26,9 @@ pub fn names() -> Vec<String> {
         "compact",
         "context",
         "cost",
+        "login",
         "model",
+        "models",
         "permissions",
         "resume",
         "rewind",
@@ -97,8 +100,16 @@ pub async fn handle(
             notice(tx, NoticeLevel::Info, cost_text(cost)).await;
             true
         }
+        "login" => {
+            handle_login(args.trim(), orchestrator, tx).await;
+            true
+        }
         "model" => {
             handle_model(args.trim(), orchestrator, tx).await;
+            true
+        }
+        "models" => {
+            handle_models(orchestrator, tx).await;
             true
         }
         "permissions" => {
@@ -118,7 +129,7 @@ pub async fn handle(
 }
 
 fn help_text() -> String {
-    "commands: /help · /clear (reset conversation) · /compact [instructions] (compact the conversation now) · /context (window breakdown) · /cost (session usage & USD) · /model [provider/model] (show or switch) · /permissions (rules & approvals) · /resume (pick a session) · /rewind (pick a checkpoint, also Esc-Esc) · plus any .stepper/commands/*.md".into()
+    "commands: /help · /clear (reset conversation) · /compact [instructions] (compact the conversation now) · /context (window breakdown) · /cost (session usage & USD) · /login [provider] (set an API key) · /model [provider/model] (show or switch) · /models (pick from fetched models) · /permissions (rules & approvals) · /resume (pick a session) · /rewind (pick a checkpoint, also Esc-Esc) · plus any .stepper/commands/*.md".into()
 }
 
 fn fmt_usage(u: &Usage) -> String {
@@ -242,8 +253,55 @@ async fn handle_model(arg: &str, orchestrator: &mut Orchestrator, tx: &EventTx) 
                 format!("cannot switch to '{arg}': {e}"),
             )
             .await;
+            // No key for this provider → offer to set one right away.
+            if matches!(e, CoreError::Provider(stepper_provider::ProviderError::Auth(_)))
+                && let Some(provider) = arg.split('/').next().filter(|p| !p.is_empty())
+            {
+                let _ = tx
+                    .send(AppEvent::ApiKeyPrompt { provider: provider.to_string() })
+                    .await;
+            }
         }
     }
+}
+
+/// `/login [provider]`: open the TUI's API-key entry overlay for `provider`
+/// (defaulting to the current primary model's provider). `provider/model` is
+/// accepted too — only the provider segment is used.
+async fn handle_login(arg: &str, orchestrator: &Orchestrator, tx: &EventTx) {
+    let provider = if arg.is_empty() {
+        orchestrator
+            .steps
+            .first()
+            .and_then(|s| s.model_ref.split('/').next())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        arg.split('/').next().unwrap_or(arg).trim().to_string()
+    };
+    if provider.is_empty() {
+        notice(tx, NoticeLevel::Warn, "usage: /login <provider>".into()).await;
+        return;
+    }
+    let _ = tx.send(AppEvent::ApiKeyPrompt { provider }).await;
+}
+
+/// `/models`: fetch the selectable models (each configured provider's live list
+/// merged with the models.dev catalog) and hand them to the TUI as a picker. The
+/// picker's selection comes back as `/model <ref>`, reusing `handle_model`.
+async fn handle_models(orchestrator: &Orchestrator, tx: &EventTx) {
+    notice(tx, NoticeLevel::Info, "fetching models…".into()).await;
+    let models = orchestrator.resolver.list_models().await;
+    if models.is_empty() {
+        notice(
+            tx,
+            NoticeLevel::Warn,
+            "no models found (check provider keys / connectivity, or use /model provider/id)".into(),
+        )
+        .await;
+        return;
+    }
+    let _ = tx.send(AppEvent::ModelList(models)).await;
 }
 
 /// chars/4, the same estimator the compactor uses for free text.
