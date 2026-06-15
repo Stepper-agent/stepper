@@ -201,6 +201,11 @@ pub struct Orchestrator {
     /// Expose the model-callable `dispatch` tool (parallel sub-agents). Off by
     /// default so the tool set the model sees is unchanged unless opted in.
     pub dispatch_enabled: bool,
+    /// Max concurrent dispatched sub-agents (`dispatch.concurrency`, default 8).
+    pub dispatch_concurrency: usize,
+    /// Per-subtask ReAct step cap (`dispatch.stepCap`); `None` inherits the
+    /// calling layer's `step_cap` so a delegated subtask isn't starved.
+    pub dispatch_step_cap: Option<usize>,
     /// Safety caps (`--max-turns` / `--max-budget-usd`); `SessionLimits::default()`
     /// disables both.
     pub limits: SessionLimits,
@@ -377,11 +382,11 @@ impl Orchestrator {
                     approver: approver.clone(),
                     cancel: cancel.clone(),
                     compaction_provider: compaction_provider.clone(),
-                    concurrency: 8,
-                    // Inherit the calling layer's step budget so a delegated
-                    // subtask isn't starved at a hardcoded 16 while the main loop
-                    // gets the full cap.
-                    step_cap: step.step_cap,
+                    concurrency: self.dispatch_concurrency.max(1),
+                    // Config `dispatch.stepCap` overrides; otherwise inherit the
+                    // calling layer's step budget so a delegated subtask isn't
+                    // starved relative to the main loop.
+                    step_cap: self.dispatch_step_cap.unwrap_or(step.step_cap),
                 });
                 tools.register(Arc::new(crate::dispatch::DispatchTool::new(dispatcher)));
             }

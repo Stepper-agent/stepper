@@ -339,6 +339,7 @@ async fn openai_error_envelope_message_and_code_extracted() {
             status,
             code,
             message,
+            ..
         } => {
             assert_eq!(status, 400);
             assert_eq!(message, "invalid model");
@@ -375,6 +376,7 @@ async fn anthropic_error_envelope_message_and_type_extracted() {
             status,
             code,
             message,
+            ..
         } => {
             assert_eq!(status, 529);
             assert_eq!(message, "Overloaded");
@@ -408,10 +410,43 @@ async fn non_json_error_body_falls_back_to_raw_message() {
             status,
             code,
             message,
+            ..
         } => {
             assert_eq!(status, 502);
             assert_eq!(code, None);
             assert_eq!(message, "upstream is down");
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_429_carries_retry_after_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "7")
+                .set_body_string("{\"error\":{\"message\":\"slow down\"}}"),
+        )
+        .mount(&server)
+        .await;
+
+    let adapter = OpenAiCompatAdapter::new(
+        reqwest::Client::new(),
+        "openai",
+        format!("{}/v1", server.uri()),
+        "m",
+        AuthSource::None,
+    );
+    let err = adapter_stream_result(&adapter, req())
+        .await
+        .err()
+        .expect("error");
+    match err {
+        ProviderError::Api { status, retry_after, .. } => {
+            assert_eq!(status, 429);
+            assert_eq!(retry_after, Some(std::time::Duration::from_secs(7)));
         }
         other => panic!("expected Api error, got {other:?}"),
     }

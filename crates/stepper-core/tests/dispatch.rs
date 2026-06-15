@@ -467,7 +467,8 @@ async fn dispatched_subagents_cannot_use_a_tool_the_calling_layer_denied() {
         always_load_mcp: Vec::new(),
         compaction_model: None,
         dispatch_enabled: true,
-        limits: stepper_core::SessionLimits::default(),
+        dispatch_concurrency: 8,
+        dispatch_step_cap: None,        limits: stepper_core::SessionLimits::default(),
         fallback_model: None,
         resume_seed: Vec::new(),
     };
@@ -528,7 +529,8 @@ async fn enabling_dispatch_lets_the_model_fan_out_subagents() {
         always_load_mcp: Vec::new(),
         compaction_model: None,
         dispatch_enabled: true,
-        limits: stepper_core::SessionLimits::default(),
+        dispatch_concurrency: 8,
+        dispatch_step_cap: None,        limits: stepper_core::SessionLimits::default(),
         fallback_model: None,
         resume_seed: Vec::new(),
     };

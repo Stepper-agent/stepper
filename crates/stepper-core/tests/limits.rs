@@ -145,7 +145,8 @@ fn orchestrator(
         always_load_mcp: Vec::new(),
         compaction_model: None,
         dispatch_enabled: false,
-        limits,
+        dispatch_concurrency: 8,
+        dispatch_step_cap: None,        limits,
         fallback_model: None,
         resume_seed: Vec::new(),
     }

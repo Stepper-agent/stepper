@@ -137,6 +137,19 @@ fn map_messages(req: &ChatRequest) -> Vec<Value> {
             }
         }
     }
+    // A second breakpoint on the last block of the last message caches the
+    // accumulated conversation tail; without it the history that grows by a
+    // tool_result every ReAct step is re-billed at full input price each step.
+    if req.cache
+        && let Some(last_block) = out
+            .last_mut()
+            .and_then(|m| m.get_mut("content"))
+            .and_then(|c| c.as_array_mut())
+            .and_then(|blocks| blocks.last_mut())
+            .and_then(|b| b.as_object_mut())
+    {
+        last_block.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+    }
     out
 }
 
@@ -324,6 +337,7 @@ pub fn parse_event(event: &str, data: &str) -> Result<Vec<WireDelta>, ProviderEr
                     .and_then(Value::as_str)
                     .map(String::from),
                 message,
+                retry_after: None,
             })
         }
         _ => Ok(Vec::new()),

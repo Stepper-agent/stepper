@@ -82,6 +82,13 @@ pub async fn build_orchestrator_with_fallback(
         .as_ref()
         .map(|d| d.enabled)
         .unwrap_or(false);
+    let dispatch_concurrency = config
+        .settings
+        .dispatch
+        .as_ref()
+        .and_then(|d| d.concurrency)
+        .unwrap_or(8);
+    let dispatch_step_cap = config.settings.dispatch.as_ref().and_then(|d| d.step_cap);
 
     let mcp = McpManager::connect(&config.settings.mcp_servers).await;
     let mut base_tools = stepper_tools::ToolRegistry::builtins();
@@ -91,7 +98,10 @@ pub async fn build_orchestrator_with_fallback(
 
     let factory = ProviderFactory::new()?;
     let codex_store = CodexTokenStore::load(CodexTokenStore::default_path(), factory.client()).ok();
-    let base_context = load_base_context(&config);
+    // The selected `outputStyle` body is folded into the base context so it
+    // reaches every layer's system prompt (via `compose_system`) and is counted
+    // honestly by `/context` (as part of `base_context`).
+    let base_context = with_output_style(&config, load_base_context(&config));
     let project_root = config.project_root.clone().unwrap_or_else(|| cwd.clone());
 
     let approvals: Vec<String> = config
@@ -125,11 +135,27 @@ pub async fn build_orchestrator_with_fallback(
         always_load_mcp,
         compaction_model,
         dispatch_enabled,
+        dispatch_concurrency,
+        dispatch_step_cap,
         limits,
         fallback_model: fallback_model.map(str::to_string),
         resume_seed: Vec::new(),
     };
     Ok((orchestrator, mcp))
+}
+
+/// Append the active `outputStyle` body (if any) to the base context. An unset
+/// or unknown style name leaves the base context unchanged (`validate_values`
+/// surfaces a name that resolves to nothing).
+fn with_output_style(config: &Config, base: String) -> String {
+    let Some(name) = config.settings.output_style.as_deref() else {
+        return base;
+    };
+    match config.output_styles().into_iter().find(|s| s.name == name) {
+        Some(style) if base.is_empty() => style.body,
+        Some(style) => format!("{base}\n\n{}", style.body),
+        None => base,
+    }
 }
 
 /// Parse the permission rule lists, failing startup on a malformed DENY spec
@@ -286,5 +312,43 @@ mod tests {
         let rules = checked_rules(&perms, &["Bash(git status)".into()]).unwrap();
         assert_eq!(rules.allow.len(), 2);
         assert_eq!(rules.deny.len(), 1);
+    }
+
+    fn config_with_style(project: &std::path::Path, output_style: Option<&str>) -> Config {
+        Config {
+            settings: stepper_config::SettingsFile {
+                output_style: output_style.map(str::to_string),
+                ..Default::default()
+            },
+            project_dir: Some(project.to_path_buf()),
+            project_root: project.parent().map(std::path::Path::to_path_buf),
+            user_dir: None,
+        }
+    }
+
+    #[test]
+    fn with_output_style_appends_selected_body_and_ignores_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join(".stepper");
+        let styles = project.join("output-styles");
+        std::fs::create_dir_all(&styles).unwrap();
+        std::fs::write(styles.join("terse.md"), "Answer in one line.\n").unwrap();
+
+        // selected style → its body is appended after the base context.
+        let cfg = config_with_style(&project, Some("terse"));
+        let out = with_output_style(&cfg, "BASE".into());
+        assert_eq!(out, "BASE\n\nAnswer in one line.");
+
+        // empty base → the body stands alone (no leading separator).
+        let out = with_output_style(&cfg, String::new());
+        assert_eq!(out, "Answer in one line.");
+
+        // unknown style name → base unchanged (validate_values reports it).
+        let cfg = config_with_style(&project, Some("missing"));
+        assert_eq!(with_output_style(&cfg, "BASE".into()), "BASE");
+
+        // no style selected → base unchanged.
+        let cfg = config_with_style(&project, None);
+        assert_eq!(with_output_style(&cfg, "BASE".into()), "BASE");
     }
 }

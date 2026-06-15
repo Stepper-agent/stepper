@@ -47,11 +47,18 @@ pub async fn into_frames(
 ) -> Result<BoxStream<'static, Result<SseFrame, ProviderError>>, ProviderError> {
     let status = resp.status();
     if !status.is_success() {
+        // Capture rate-limit headers before the body consumes the response, so a
+        // 429 can wait the server-specified delay instead of guessing.
+        let retry_after = error::parse_retry_after(resp.headers());
         let body = resp
             .text()
             .await
             .unwrap_or_else(|e| format!("[error body could not be decoded: {e}]"));
-        return Err(error::api_error_from_body(status.as_u16(), &body));
+        let mut err = error::api_error_from_body(status.as_u16(), &body);
+        if let ProviderError::Api { retry_after: slot, .. } = &mut err {
+            *slot = retry_after;
+        }
+        return Err(err);
     }
 
     let events = resp.bytes_stream().eventsource();

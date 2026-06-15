@@ -88,12 +88,18 @@ pub struct CompactionConfig {
     pub provider: Option<String>,
 }
 
-/// Fan-out tuning. `enabled` exposes the model-callable `dispatch` tool.
+/// Fan-out tuning. `enabled` exposes the model-callable `dispatch` tool;
+/// `concurrency`/`stepCap` bound the dispatched sub-agents (defaults: 8, and the
+/// calling layer's step cap).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DispatchConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_cap: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -197,5 +203,29 @@ pub fn deep_merge(base: &mut Value, over: Value) {
             }
         }
         (b, o) => *b = o,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_config_parses_optional_caps() {
+        let s: SettingsFile =
+            serde_json::from_str(r#"{"dispatch":{"enabled":true,"concurrency":4,"stepCap":120}}"#)
+                .unwrap();
+        let d = s.dispatch.unwrap();
+        assert!(d.enabled);
+        assert_eq!(d.concurrency, Some(4));
+        assert_eq!(d.step_cap, Some(120));
+    }
+
+    #[test]
+    fn dispatch_caps_default_to_none() {
+        let s: SettingsFile = serde_json::from_str(r#"{"dispatch":{"enabled":true}}"#).unwrap();
+        let d = s.dispatch.unwrap();
+        assert_eq!(d.concurrency, None);
+        assert_eq!(d.step_cap, None);
     }
 }

@@ -100,9 +100,20 @@ fn anthropic_marks_cache_breakpoints_when_caching_requested() {
     let plain = wire::anthropic::build_request_body(&convo(), "m", true);
     assert_eq!(plain["system"], "you are helpful");
     assert!(plain["tools"][0].get("cache_control").is_none());
+    let plain_msgs = plain["messages"].as_array().unwrap();
+    assert!(plain_msgs
+        .last()
+        .unwrap()["content"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .get("cache_control")
+        .is_none());
 
     // cache on: system becomes a content-block array with an ephemeral breakpoint,
-    // and the last tool carries one too (caching system + tools as the prefix).
+    // the last tool carries one too (caching system + tools as the prefix), and a
+    // second breakpoint lands on the last block of the last message (the tail).
     let mut req = convo();
     req.cache = true;
     let body = wire::anthropic::build_request_body(&req, "m", true);
@@ -114,6 +125,18 @@ fn anthropic_marks_cache_breakpoints_when_caching_requested() {
         tools.last().unwrap()["cache_control"]["type"],
         "ephemeral",
         "the last tool carries the prefix cache breakpoint"
+    );
+    let messages = body["messages"].as_array().unwrap();
+    let last_block = messages
+        .last()
+        .unwrap()["content"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap();
+    assert_eq!(
+        last_block["cache_control"]["type"], "ephemeral",
+        "the conversation tail carries the second cache breakpoint"
     );
 }
 

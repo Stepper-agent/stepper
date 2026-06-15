@@ -99,6 +99,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             status,
             code,
             message,
+            ..
         } => {
             assert_eq!(status, 0, "in-band frame has no HTTP status");
             assert_eq!(code.as_deref(), Some("overloaded_error"));
@@ -133,6 +134,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n";
             status,
             code,
             message,
+            ..
         } => {
             assert_eq!(status, 0);
             assert_eq!(code.as_deref(), Some("api_error"));
@@ -172,6 +174,7 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_e
             status,
             code,
             message,
+            ..
         } => {
             assert_eq!(status, 0);
             assert_eq!(code, None, "responses in-band frames carry no code");

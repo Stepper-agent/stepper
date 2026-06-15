@@ -87,13 +87,19 @@ fn message_chars(message: &Message) -> usize {
             ContentBlock::Image { data, .. } => data.len(),
             ContentBlock::Thinking { text, .. } => text.len(),
             ContentBlock::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
-            ContentBlock::ToolResult { content, .. } => content
-                .iter()
-                .map(|c| match c {
-                    ToolContent::Text { text } => text.len(),
-                    ToolContent::Json { json } => json.to_string().len(),
-                })
-                .sum(),
+            ContentBlock::ToolResult { content, .. } => tool_result_chars(content),
+        })
+        .sum()
+}
+
+/// Char count of a tool result's content blocks (text + JSON payloads). Shared
+/// with the agent loop's per-turn tool-output budget.
+pub(crate) fn tool_result_chars(content: &[ToolContent]) -> usize {
+    content
+        .iter()
+        .map(|c| match c {
+            ToolContent::Text { text } => text.len(),
+            ToolContent::Json { json } => json.to_string().len(),
         })
         .sum()
 }

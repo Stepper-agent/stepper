@@ -65,17 +65,78 @@ impl ToolCx {
                 "{} denied by permission policy",
                 request.tool()
             ))),
-            Decision::Ask => match self.approver.request(approval).await {
-                Decision::Allow => Ok(()),
-                _ => Err(ToolError::Denied(format!(
-                    "{} was not approved",
-                    request.tool()
-                ))),
-            },
+            // A parked approval must be interruptible: Esc / the per-turn
+            // timeout fire `cancel`, and selecting on it drops the approver
+            // future (unwinding its `rx.await`) so the tool can return instead
+            // of hanging until the user also answers the overlay.
+            Decision::Ask => {
+                let decision = tokio::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => return Err(ToolError::Denied(format!(
+                        "{} interrupted before approval",
+                        request.tool()
+                    ))),
+                    d = self.approver.request(approval) => d,
+                };
+                match decision {
+                    Decision::Allow => Ok(()),
+                    _ => Err(ToolError::Denied(format!(
+                        "{} was not approved",
+                        request.tool()
+                    ))),
+                }
+            }
         }
     }
 
     pub fn is_in_project(&self, path: &Path) -> bool {
         stepper_permission::path::is_in_project(path, &self.project_root)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    /// An approver that never answers — stands in for a user staring at an
+    /// overlay while the turn is cancelled out from under them.
+    struct NeverApprover;
+    #[async_trait]
+    impl Approver for NeverApprover {
+        async fn request(&self, _approval: Approval) -> Decision {
+            std::future::pending::<()>().await;
+            Decision::Allow
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_unwinds_when_cancelled_during_approval() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let cx = ToolCx {
+            cwd: PathBuf::from("/project"),
+            project_root: PathBuf::from("/project"),
+            home: None,
+            mode: PermissionMode::Default,
+            rules: Arc::new(RuleSet::from_lists(&[], &[], &[])),
+            approver: Arc::new(NeverApprover),
+            cancel,
+        };
+        // WebFetch in Default mode evaluates to Ask, so gate parks on the
+        // approver; the already-fired cancel must resolve it promptly as Denied.
+        let res = cx
+            .gate(
+                PermissionRequest::WebFetch("http://example.com".into()),
+                Approval::Command {
+                    command: "web_fetch http://example.com".into(),
+                    outside_project: true,
+                },
+            )
+            .await;
+        match res {
+            Err(ToolError::Denied(msg)) => assert!(msg.contains("interrupted"), "got {msg}"),
+            other => panic!("expected interrupted denial, got {other:?}"),
+        }
     }
 }

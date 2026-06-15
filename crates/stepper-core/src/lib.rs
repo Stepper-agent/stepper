@@ -219,6 +219,18 @@ pub fn spawn_core(
                     )
                     .await
                     {
+                        // /clear begins a fresh session, so its checkpoints are
+                        // no longer reachable — drop the store too.
+                        if name == "clear"
+                            && let Err(e) = snapshotter.clear()
+                        {
+                            let _ = tx
+                                .send(AppEvent::Notice {
+                                    level: NoticeLevel::Warn,
+                                    text: format!("checkpoint clear failed: {e}"),
+                                })
+                                .await;
+                        }
                         continue;
                     }
                     let project_root = orchestrator.project_root.clone();
@@ -473,6 +485,16 @@ async fn checkpoint_turn(
             .send(AppEvent::Notice {
                 level: NoticeLevel::Warn,
                 text: format!("checkpoint failed (rewind unavailable): {e}"),
+            })
+            .await;
+    }
+    // Bound the store: every turn full-copies the tree, so cap retained
+    // snapshots. A prune failure must not fail the turn.
+    if let Err(e) = snapshotter.prune(checkpoint::RETAIN) {
+        let _ = tx
+            .send(AppEvent::Notice {
+                level: NoticeLevel::Warn,
+                text: format!("checkpoint prune failed: {e}"),
             })
             .await;
     }

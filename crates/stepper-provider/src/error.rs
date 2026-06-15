@@ -13,6 +13,10 @@ pub enum ProviderError {
         status: u16,
         code: Option<String>,
         message: String,
+        /// Server-specified wait before retrying (from `Retry-After` /
+        /// `x-ratelimit-reset`), when present on a 429/5xx. `None` falls back to
+        /// the client's exponential backoff.
+        retry_after: Option<std::time::Duration>,
     },
 
     #[error("failed to decode provider payload: {0}")]

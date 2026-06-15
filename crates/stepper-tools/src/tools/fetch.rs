@@ -4,7 +4,7 @@ use crate::Tool;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use stepper_permission::PermissionRequest;
 use stepper_provider::{ToolError, ToolResult, ToolSpec};
@@ -58,9 +58,14 @@ fn is_private_ip(ip: IpAddr) -> bool {
 /// DNS) and refuse private/internal ranges — loopback, link-local (cloud
 /// metadata), RFC1918, CGNAT, ULA. `STEPPER_WEB_FETCH_ALLOW_PRIVATE=1` skips
 /// the rejection for local dev servers.
-async fn reject_private_host(url: &str) -> Result<(), ToolError> {
+///
+/// Returns the validated `(host, addr)` to pin the actual request to, so a
+/// DNS-rebinding server can't pass this pre-flight with a public IP then have
+/// the real connection re-resolve to a private one (TOCTOU). `Ok(None)` means
+/// the escape hatch is set — connect unpinned.
+async fn reject_private_host(url: &str) -> Result<Option<(String, SocketAddr)>, ToolError> {
     if std::env::var(ALLOW_PRIVATE_ENV).is_ok_and(|v| v == "1") {
-        return Ok(());
+        return Ok(None);
     }
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| ToolError::InvalidArgs(format!("bad url: {e}")))?;
@@ -88,13 +93,14 @@ async fn reject_private_host(url: &str) -> Result<(), ToolError> {
     if addrs.is_empty() {
         return Err(ToolError::Execution(format!("dns resolve {host}: no addresses")));
     }
-    if let Some(ip) = addrs.into_iter().find(|ip| is_private_ip(*ip)) {
+    if let Some(ip) = addrs.iter().copied().find(|ip| is_private_ip(*ip)) {
         return Err(ToolError::Denied(format!(
             "refusing to fetch {url}: {host} resolves to private/internal address {ip} \
              (set {ALLOW_PRIVATE_ENV}=1 to allow local dev servers)"
         )));
     }
-    Ok(())
+    // No address was private; pin to the first validated one.
+    Ok(Some((host, SocketAddr::new(addrs[0], port))))
 }
 
 pub struct WebFetch {
@@ -147,14 +153,20 @@ impl Tool for WebFetch {
         )
         .await?;
 
-        reject_private_host(&a.url).await?;
+        let pin = reject_private_host(&a.url).await?;
 
         let timeout = fetch_timeout();
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .user_agent(concat!("stepper/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS).min(timeout))
-            .timeout(timeout)
+            .timeout(timeout);
+        // Connect to the exact address validated in the pre-flight (defeats a
+        // second, unchecked DNS lookup at connect time).
+        if let Some((host, addr)) = pin {
+            builder = builder.resolve(&host, addr);
+        }
+        let client = builder
             .build()
             .map_err(|e| ToolError::Execution(e.to_string()))?;
 
@@ -240,5 +252,25 @@ mod tests {
         assert!(is_private_ip("100.127.255.255".parse().unwrap()));
         assert!(!is_private_ip("100.63.255.255".parse().unwrap()));
         assert!(!is_private_ip("100.128.0.0".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn preflight_returns_validated_pin_for_public_literal_ip() {
+        // A public literal IP needs no DNS; the pre-flight returns it as the pin
+        // the client binds to, defeating any second lookup.
+        let pin = reject_private_host("http://93.184.216.34:8080/x")
+            .await
+            .unwrap();
+        let (host, addr) = pin.expect("public host yields a pin");
+        assert_eq!(host, "93.184.216.34");
+        assert_eq!(addr, "93.184.216.34:8080".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn preflight_denies_private_literal_ip() {
+        let err = reject_private_host("http://169.254.169.254/latest/meta-data/")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "got {err:?}");
     }
 }

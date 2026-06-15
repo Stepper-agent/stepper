@@ -558,6 +558,7 @@ async fn retryable_api_error_exhausts_retries_then_fails() {
             status: 503,
             code: None,
             message: "overloaded".into(),
+            retry_after: None,
         })],
     };
 

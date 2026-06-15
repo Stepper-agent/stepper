@@ -280,6 +280,7 @@ pub fn parse_event(event: &str, data: &str) -> Result<Vec<WireDelta>, ProviderEr
                 status: 0,
                 code: None,
                 message,
+                retry_after: None,
             })
         }
         _ => Ok(Vec::new()),

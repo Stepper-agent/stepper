@@ -11,7 +11,24 @@ pub(crate) fn api_error_from_body(status: u16, body: &str) -> ProviderError {
         status,
         code,
         message: message.unwrap_or_else(|| truncate(body, 500)),
+        retry_after: None,
     }
+}
+
+/// Extract a retry delay from rate-limit headers: `Retry-After` (delta-seconds)
+/// first, then `x-ratelimit-reset-requests` / `x-ratelimit-reset` (OpenAI emits
+/// leading integer seconds). HTTP-date `Retry-After` is not parsed (rare on the
+/// streaming APIs); it falls back to the client's backoff.
+pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let leading_secs = |name: &str| -> Option<u64> {
+        let raw = headers.get(name)?.to_str().ok()?;
+        let digits: String = raw.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u64>().ok()
+    };
+    leading_secs("retry-after")
+        .or_else(|| leading_secs("x-ratelimit-reset-requests"))
+        .or_else(|| leading_secs("x-ratelimit-reset"))
+        .map(std::time::Duration::from_secs)
 }
 
 fn extract_error(body: &str) -> (Option<String>, Option<String>) {
@@ -54,4 +71,32 @@ pub(crate) fn transport(e: impl std::fmt::Display) -> ProviderError {
 
 pub(crate) fn decode(e: impl std::fmt::Display) -> ProviderError {
     ProviderError::Decode(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::HeaderMap;
+
+    #[test]
+    fn parse_retry_after_reads_delta_seconds() {
+        let mut h = HeaderMap::new();
+        h.insert("retry-after", "7".parse().unwrap());
+        assert_eq!(parse_retry_after(&h), Some(std::time::Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn parse_retry_after_falls_back_to_ratelimit_reset() {
+        let mut h = HeaderMap::new();
+        h.insert("x-ratelimit-reset-requests", "12s".parse().unwrap());
+        assert_eq!(parse_retry_after(&h), Some(std::time::Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn parse_retry_after_none_when_absent_or_unparseable() {
+        assert_eq!(parse_retry_after(&HeaderMap::new()), None);
+        let mut h = HeaderMap::new();
+        h.insert("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap());
+        assert_eq!(parse_retry_after(&h), None, "http-date is not parsed");
+    }
 }

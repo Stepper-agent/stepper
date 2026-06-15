@@ -15,6 +15,14 @@ use stepper_provider::{
 };
 use stepper_tools::{ToolCx, ToolRegistry};
 
+/// Per-call hard cap on raw tool output kept in the window.
+const TOOL_RESULT_CALL_CAP: usize = 16_384;
+/// Soft per-turn budget; once a turn's running tool output approaches this, each
+/// further result is shrunk more aggressively (down to the floor below).
+const TOOL_RESULT_TURN_BUDGET: usize = 65_536;
+/// Smallest excerpt kept for an over-budget result (head + tail).
+const TOOL_RESULT_MIN_KEEP: usize = 2_048;
+
 pub struct LayerOutcome {
     pub summary: String,
     pub usage: Usage,
@@ -86,6 +94,9 @@ impl AgentLoop<'_> {
         let mut continuations = 0u32;
         const MAX_CONTINUATIONS: u32 = 3;
         let mut produced: Vec<Message> = Vec::new();
+        // Running raw tool-output chars this turn; oversized results are shrunk so
+        // a few big reads can't dominate the window before compaction triggers.
+        let mut running_tool_bytes = 0usize;
 
         for _step in 0..self.step_cap.max(1) {
             if self.cx.cancel.is_cancelled() {
@@ -207,21 +218,20 @@ impl AgentLoop<'_> {
                 });
             }
 
-            let mut results = Vec::new();
-            for (id, name, input) in tool_calls {
-                // The prior layer declares the next parallel layer's workers via
-                // `assign_tasks`; capture the latest non-empty list (mirroring the
-                // tool, which rejects an empty list — a rejected retry must not
-                // wipe a previously declared plan).
+            // First pass before any execution: capture the latest non-empty
+            // `assign_tasks` plan (mirroring the tool, which rejects an empty
+            // list — a rejected retry must not wipe a declared plan). Done up
+            // front so the parallel partition below can't reorder or skip it.
+            for (_, name, input) in &tool_calls {
                 if name == "assign_tasks" {
-                    let parsed = crate::tasks::parse_subtasks(&input);
+                    let parsed = crate::tasks::parse_subtasks(input);
                     if !parsed.is_empty() {
                         captured_tasks = parsed;
                     }
                 }
-                let block = self.run_tool(&id, &name, input).await;
-                results.push(block);
             }
+            let mut results = self.run_tools(tool_calls).await;
+            self.shrink_oversized_results(&mut results, &mut running_tool_bytes);
             messages.push(Message {
                 role: Role::Tool,
                 content: results.clone(),
@@ -264,7 +274,7 @@ impl AgentLoop<'_> {
                     }
                     tokio::select! {
                         _ = self.cx.cancel.cancelled() => return Err(CoreError::Cancelled),
-                        _ = tokio::time::sleep(retry_backoff(attempt)) => {}
+                        _ = tokio::time::sleep(retry_delay(&e, attempt)) => {}
                     }
                 }
                 outcome => return outcome,
@@ -381,6 +391,67 @@ impl AgentLoop<'_> {
 
     /// Run one tool call, emitting start/finish events, and return the
     /// `tool_result` block to thread back to the model.
+    /// Execute one assistant turn's tool calls, running the `parallel_safe`
+    /// (read-only) ones concurrently and the rest strictly sequentially in
+    /// request order. Results are returned in the original `tool_calls` order so
+    /// `tool_call_id` pairing in the threaded Tool message is unchanged.
+    async fn run_tools(&self, tool_calls: Vec<(String, String, Value)>) -> Vec<ContentBlock> {
+        let n = tool_calls.len();
+        let mut parallel = Vec::new();
+        let mut sequential = Vec::new();
+        for (i, (id, name, input)) in tool_calls.into_iter().enumerate() {
+            let safe = self
+                .tools
+                .get(&name)
+                .map(|t| t.spec().parallel_safe)
+                .unwrap_or(false);
+            if safe {
+                parallel.push((i, id, name, input));
+            } else {
+                sequential.push((i, id, name, input));
+            }
+        }
+
+        let mut results: Vec<Option<ContentBlock>> = (0..n).map(|_| None).collect();
+        // The concurrent batch: each future borrows `&self` immutably (run_tool
+        // is `&self`), so no spawn / 'static bound is needed.
+        let par = futures::future::join_all(
+            parallel
+                .into_iter()
+                .map(|(i, id, name, input)| async move { (i, self.run_tool(&id, &name, input).await) }),
+        )
+        .await;
+        for (i, block) in par {
+            results[i] = Some(block);
+        }
+        // Mutating tools (write/edit/bash/dispatch) stay sequential and ordered.
+        for (i, id, name, input) in sequential {
+            results[i] = Some(self.run_tool(&id, &name, input).await);
+        }
+        results.into_iter().map(|b| b.expect("every slot filled")).collect()
+    }
+
+    /// Bound per-turn raw tool output: a result over the (turn-tightening) cap is
+    /// replaced with a head+tail excerpt so a few big reads/greps can't dominate
+    /// the window before message-level compaction even triggers.
+    fn shrink_oversized_results(&self, results: &mut [ContentBlock], running: &mut usize) {
+        for block in results.iter_mut() {
+            if let ContentBlock::ToolResult { content, .. } = block {
+                let size = crate::compaction::tool_result_chars(content);
+                // The cap shrinks as the turn accumulates output, but never below
+                // a floor so each result keeps a usable head+tail.
+                let remaining = TOOL_RESULT_TURN_BUDGET.saturating_sub(*running);
+                let cap = TOOL_RESULT_CALL_CAP.min(remaining).max(TOOL_RESULT_MIN_KEEP);
+                if size > cap {
+                    let rendered = render_tool_content(content);
+                    *content =
+                        vec![stepper_provider::ToolContent::text(head_tail_elide(&rendered, cap))];
+                }
+                *running = running.saturating_add(crate::compaction::tool_result_chars(content));
+            }
+        }
+    }
+
     async fn run_tool(&self, id: &str, name: &str, input: Value) -> ContentBlock {
         self.emit_tool_started(id, name, &input).await;
 
@@ -533,6 +604,65 @@ fn looks_unfinished(text: &str) -> bool {
     CUES.iter().any(|c| lower.contains(c))
 }
 
+/// Flatten a tool result's content blocks into one string for elision.
+fn render_tool_content(content: &[stepper_provider::ToolContent]) -> String {
+    content
+        .iter()
+        .map(|c| match c {
+            stepper_provider::ToolContent::Text { text } => text.clone(),
+            stepper_provider::ToolContent::Json { json } => json.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Keep the head and tail of an over-budget body with an elision marker between,
+/// preserving the start/end context the model usually needs. Char-boundary safe.
+fn head_tail_elide(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    let head_len = floor_boundary(text, cap * 3 / 5);
+    let tail_start = ceil_boundary(text, text.len() - (cap - cap * 3 / 5));
+    let elided = tail_start - head_len;
+    format!(
+        "{}\n…[{elided} chars elided; re-read the source for the full output]…\n{}",
+        &text[..head_len],
+        &text[tail_start..],
+    )
+}
+
+fn floor_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn ceil_boundary(s: &str, mut idx: usize) -> usize {
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+/// Honor a server-specified `Retry-After` on a 429/5xx (capped at 60s so a
+/// hostile/huge value can't park the turn), otherwise fall back to the client's
+/// exponential backoff.
+fn retry_delay(err: &stepper_provider::ProviderError, attempt: u32) -> std::time::Duration {
+    if let stepper_provider::ProviderError::Api {
+        retry_after: Some(d),
+        ..
+    } = err
+    {
+        return (*d).min(std::time::Duration::from_secs(60));
+    }
+    retry_backoff(attempt)
+}
+
 fn retry_backoff(attempt: u32) -> std::time::Duration {
     let base_ms = 500u64 << attempt.saturating_sub(1).min(4);
     let jitter_ms = std::time::SystemTime::now()
@@ -566,7 +696,28 @@ fn summarize(name: &str, input: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::looks_unfinished;
+    use super::{looks_unfinished, retry_delay};
+    use std::time::Duration;
+    use stepper_provider::ProviderError;
+
+    fn api(retry_after: Option<Duration>) -> ProviderError {
+        ProviderError::Api {
+            status: 429,
+            code: None,
+            message: "rate limited".into(),
+            retry_after,
+        }
+    }
+
+    #[test]
+    fn retry_delay_honors_server_retry_after_capped_else_backoff() {
+        assert_eq!(retry_delay(&api(Some(Duration::from_secs(5))), 1), Duration::from_secs(5));
+        // A hostile/huge value is capped so it can't park the turn.
+        assert_eq!(retry_delay(&api(Some(Duration::from_secs(9999))), 1), Duration::from_secs(60));
+        // No header → exponential backoff (non-zero).
+        assert!(retry_delay(&api(None), 1) > Duration::ZERO);
+        assert!(retry_delay(&ProviderError::Transport("x".into()), 1) > Duration::ZERO);
+    }
 
     #[test]
     fn looks_unfinished_flags_intent_and_empty_not_completions() {
