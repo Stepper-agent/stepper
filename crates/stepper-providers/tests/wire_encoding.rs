@@ -350,3 +350,45 @@ fn responses_drops_a_thinking_only_assistant_turn_entirely() {
     );
     assert_eq!(input.len(), 2, "only the two user messages remain");
 }
+
+#[test]
+fn image_attachments_encode_per_dialect() {
+    let req = ChatRequest::new("m").with_messages(vec![Message {
+        role: Role::User,
+        content: vec![
+            ContentBlock::Text("describe this".into()),
+            ContentBlock::Image { media_type: "image/png".into(), data: "AAAB".into() },
+        ],
+    }]);
+
+    // Anthropic: a base64 `source` image block alongside the text block.
+    let a = wire::anthropic::build_request_body(&req, "m", true);
+    let ac = &a["messages"][0]["content"];
+    assert_eq!(ac[0]["type"], "text");
+    assert_eq!(ac[1]["type"], "image");
+    assert_eq!(ac[1]["source"]["type"], "base64");
+    assert_eq!(ac[1]["source"]["media_type"], "image/png");
+    assert_eq!(ac[1]["source"]["data"], "AAAB");
+
+    // OpenAI: a content array with an `image_url` data: URL.
+    let o = wire::openai::build_request_body(&req, "m", true);
+    let oc = &o["messages"][0]["content"];
+    assert_eq!(oc[0]["type"], "text");
+    assert_eq!(oc[1]["type"], "image_url");
+    assert_eq!(oc[1]["image_url"]["url"], "data:image/png;base64,AAAB");
+
+    // Responses: an `input_image` with a data: URL.
+    let r = wire::responses::build_request_body(&req, "m", true, false);
+    let rc = &r["input"][0]["content"];
+    assert_eq!(rc[0]["type"], "input_text");
+    assert_eq!(rc[1]["type"], "input_image");
+    assert_eq!(rc[1]["image_url"], "data:image/png;base64,AAAB");
+
+    // A text-only user message keeps OpenAI's plain-string content (back-compat).
+    let plain = wire::openai::build_request_body(
+        &ChatRequest::new("m").with_messages(vec![Message::user("hi")]),
+        "m",
+        true,
+    );
+    assert_eq!(plain["messages"][0]["content"], "hi");
+}

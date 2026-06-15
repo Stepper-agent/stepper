@@ -28,7 +28,59 @@ async fn main() -> anyhow::Result<()> {
         },
         Some(Command::Config(args)) => config_cmd(args, cli.global),
         Some(Command::Init) => init_cmd(cli.global),
+        Some(Command::Layer { name }) => scaffold_layer_cmd(&name, cli.global),
+        Some(Command::Cmd { name }) => scaffold_command_cmd(&name, cli.global),
+        Some(Command::ScaffoldLayer) => scaffold_pipeline_cmd(cli.global),
     }
+}
+
+fn global_cwd(global: &GlobalArgs) -> anyhow::Result<std::path::PathBuf> {
+    match &global.cwd {
+        Some(p) => Ok(p.clone()),
+        None => Ok(std::env::current_dir()?),
+    }
+}
+
+fn scaffold_layer_cmd(name: &str, global: GlobalArgs) -> anyhow::Result<()> {
+    let cwd = global_cwd(&global)?;
+    if !stepper_config::scaffold::is_safe_name(name) {
+        anyhow::bail!("invalid layer name '{name}' — letters, digits, '-' and '_' only");
+    }
+    match stepper_config::scaffold::scaffold_layer(&cwd, name, &format!("The {name} layer."))? {
+        Some(path) => println!("wrote {} — add \"{name}\" to setting.json step", path.display()),
+        None => println!("layer/{name}/index.md already exists"),
+    }
+    Ok(())
+}
+
+fn scaffold_command_cmd(name: &str, global: GlobalArgs) -> anyhow::Result<()> {
+    let cwd = global_cwd(&global)?;
+    if !stepper_config::scaffold::is_safe_name(name) {
+        anyhow::bail!("invalid command name '{name}' — letters, digits, '-' and '_' only");
+    }
+    match stepper_config::scaffold::scaffold_command(&cwd, name)? {
+        Some(path) => println!("wrote {} — use /{name} in the TUI", path.display()),
+        None => println!("commands/{name}.md already exists"),
+    }
+    Ok(())
+}
+
+fn scaffold_pipeline_cmd(global: GlobalArgs) -> anyhow::Result<()> {
+    use stepper_config::scaffold;
+    let cwd = global_cwd(&global)?;
+    scaffold::ensure_skeleton(&cwd)?;
+    let created = scaffold::scaffold_default_pipeline(&cwd)?;
+    for path in &created {
+        println!("wrote {}", path.display());
+    }
+    if scaffold::set_pipeline_steps_if_empty(&cwd, &scaffold::pipeline_step_names())? {
+        println!("set step:[plan, implement, review] in setting.json");
+    } else if created.is_empty() {
+        println!("the default pipeline already exists");
+    } else {
+        println!("kept your existing step pipeline (add the new layers to it manually)");
+    }
+    Ok(())
 }
 
 fn config_cmd(args: cli::ConfigArgs, global: GlobalArgs) -> anyhow::Result<()> {
@@ -85,6 +137,9 @@ fn init_cmd(global: GlobalArgs) -> anyhow::Result<()> {
         .unwrap_or_else(std::env::current_dir)?;
     let stepper_dir = cwd.join(".stepper");
     std::fs::create_dir_all(&stepper_dir)?;
+    // Lay down the discoverable subdirectory skeleton (layer/ commands/ skills/
+    // output-styles/) so the layout is obvious even before anything is authored.
+    stepper_config::scaffold::ensure_skeleton(&cwd)?;
 
     let stepper_md = stepper_dir.join("stepper.md");
     if stepper_md.exists() {
@@ -154,7 +209,7 @@ pub(crate) fn scaffold_setting_json(default_model: Option<&str>, mode: &str) -> 
         None => String::new(),
     };
     format!(
-        "{{\n  \"$schema\": \"stepper://setting.schema.json\",\n  \"step\": [],\n{default_model_line}  \"mode\": \"{mode}\",\n  \"providers\": {{}},\n  \"permissions\": {{\n    \"allow\": [\"Read(/**)\", \"Bash(cargo *)\"],\n    \"ask\": [\"Bash(git push:*)\"],\n    \"deny\": [\"Read(//etc/**)\", \"Bash(rm -rf *)\"]\n  }},\n  \"approvals\": [],\n  \"hooks\": {{}}\n}}\n"
+        "{{\n  \"$schema\": \"stepper://setting.schema.json\",\n  \"step\": [],\n{default_model_line}  \"mode\": \"{mode}\",\n  \"providers\": {{}},\n  \"permissions\": {{\n    \"allow\": [\"Read(/**)\", \"Bash(cargo *)\"],\n    \"ask\": [\"Bash(git push:*)\"],\n    \"deny\": [\"Read(//etc/**)\", \"Bash(rm -rf *)\", \"Bash(rm -fr *)\", \"Bash(sudo *)\", \"Bash(git push --force *)\", \"Bash(git push -f *)\"]\n  }},\n  \"approvals\": [],\n  \"hooks\": {{}}\n}}\n"
     )
 }
 

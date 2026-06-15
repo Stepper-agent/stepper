@@ -68,7 +68,35 @@ pub enum Overlay {
     /// API-key entry for a provider (`/login`, or a keyless model switch). Keys
     /// are typed in masked; Enter sends `Action::SetApiKey`, Esc cancels.
     ApiKey(ApiKeyOverlay),
+    /// The background-process "shell view" (Down key): up/down selects a process,
+    /// `k` kills it, Esc/q closes.
+    Shell(ShellView),
 }
+
+/// Shell-view overlay state: which process row is highlighted.
+pub struct ShellView {
+    pub selected: usize,
+}
+
+/// Status of a `!cmd &` background process in the shell view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcStatus {
+    Running,
+    Exited(Option<i32>),
+}
+
+/// A background process tracked for the shell view: its command, status, and a
+/// bounded tail of its console output.
+pub struct ProcView {
+    pub id: u64,
+    pub command: String,
+    pub status: ProcStatus,
+    pub output: VecDeque<String>,
+}
+
+/// How many recent output lines each background process retains (a ring buffer,
+/// so a chatty `bun dev` can't grow unbounded).
+const PROC_OUTPUT_TAIL: usize = 500;
 
 /// The masked API-key entry overlay state.
 pub struct ApiKeyOverlay {
@@ -198,6 +226,11 @@ pub struct AppState {
     /// prompt racing an approval (e.g. the auto `/login` on launch) is never lost.
     pub pending_prompts: VecDeque<String>,
     pub picker: Option<FilePicker>,
+    /// Background processes (`!cmd &`) shown in the shell view (Down key).
+    pub processes: Vec<ProcView>,
+    /// Images pasted (Ctrl+V) and staged for the next prompt — shown as an input
+    /// indicator. Cleared on submit (they ride with that turn).
+    pub pending_image_count: usize,
     pub queue: VecDeque<Queued>,
     pub notice: Option<String>,
     pub spinner: usize,
@@ -240,6 +273,8 @@ impl AppState {
             pending_approvals: VecDeque::new(),
             pending_prompts: VecDeque::new(),
             picker: None,
+            processes: Vec::new(),
+            pending_image_count: 0,
             queue: VecDeque::new(),
             notice: None,
             spinner: 0,
@@ -304,6 +339,29 @@ impl AppState {
         self.palette_selected = 0;
     }
 
+    /// The currently-highlighted palette command name (clamped to the match set),
+    /// for Enter-to-run. None when the palette has no matches.
+    pub fn palette_selected_command(&self) -> Option<String> {
+        let matches = self.command_matches();
+        if matches.is_empty() {
+            return None;
+        }
+        let idx = self.palette_selected.min(matches.len() - 1);
+        Some(matches[idx].clone())
+    }
+
+    /// Run the highlighted palette command now: clear the typed `/partial`, reset
+    /// the selection, and emit the `SlashCommand` effect (Enter in the palette).
+    pub fn palette_run_selected(&mut self) -> Effects {
+        let mut effects = Effects::new();
+        if let Some(name) = self.palette_selected_command() {
+            self.textarea = fresh_textarea();
+            self.palette_selected = 0;
+            effects.push(Effect::Send(Action::SlashCommand { name, args: String::new() }));
+        }
+        effects
+    }
+
     // ── @ file picker (IO-free; the file list is supplied by the event loop) ──
 
     /// (Re)build the picker for `query` after the event loop has listed the
@@ -351,6 +409,20 @@ impl AppState {
         })
     }
 
+    /// Commit the highlighted entry as a path verbatim — directory OR file —
+    /// without drilling in. Enter on a directory yields `dir/` (trailing slash);
+    /// the caller inserts it as `@dir/ ` and closes the picker. This is what gives
+    /// the user an escape from the @-picker (Tab drills in, Enter commits + exits).
+    pub fn picker_commit(&self) -> Option<String> {
+        let p = self.picker.as_ref()?;
+        let name = p.current()?;
+        let prefix = match p.query.rfind('/') {
+            Some(i) => &p.query[..=i],
+            None => "",
+        };
+        Some(format!("{prefix}{name}"))
+    }
+
     pub fn insert_picker_path(&mut self, path: &str) {
         self.textarea.insert_str(format!("@{path} "));
         self.picker = None;
@@ -369,8 +441,41 @@ impl AppState {
                     | Overlay::Permissions(_)
                     | Overlay::Picker(_)
                     | Overlay::ApiKey(_)
+                    | Overlay::Shell(_)
             )
         )
+    }
+
+    // ── background-process shell view (Down key) ──
+
+    /// Open the shell view if any process is being tracked (else a no-op so Down
+    /// stays free for the textarea). Won't clobber a live approval's oneshot.
+    pub fn open_shell_view(&mut self) {
+        if self.processes.is_empty() {
+            return;
+        }
+        self.open_overlay(Overlay::Shell(ShellView { selected: 0 }));
+    }
+
+    pub fn shell_move(&mut self, delta: i32) {
+        if let Some(Overlay::Shell(s)) = &mut self.overlay {
+            let n = self.processes.len() as i32;
+            if n > 0 {
+                s.selected = (((s.selected as i32 + delta) % n + n) % n) as usize;
+            }
+        }
+    }
+
+    /// Kill the highlighted process: emit `KillProcess` for core to terminate it.
+    pub fn shell_kill_selected(&mut self) -> Effects {
+        let mut effects = Effects::new();
+        if let Some(Overlay::Shell(s)) = &self.overlay
+            && let Some(p) = self.processes.get(s.selected)
+            && p.status == ProcStatus::Running
+        {
+            effects.push(Effect::Send(Action::KillProcess(p.id)));
+        }
+        effects
     }
 
     /// Type into the API-key overlay (a printable char).
@@ -624,6 +729,28 @@ impl AppState {
                 self.flush_block(&mut effects);
                 self.dispatch_queued(&mut effects);
             }
+            AppEvent::ProcessStarted { id, command } => {
+                self.processes.push(ProcView {
+                    id,
+                    command,
+                    status: ProcStatus::Running,
+                    output: VecDeque::new(),
+                });
+                self.notice = Some("background process started — press ↓ for the shell view".into());
+            }
+            AppEvent::ProcessOutput { id, line } => {
+                if let Some(p) = self.processes.iter_mut().find(|p| p.id == id) {
+                    p.output.push_back(line);
+                    while p.output.len() > PROC_OUTPUT_TAIL {
+                        p.output.pop_front();
+                    }
+                }
+            }
+            AppEvent::ProcessExited { id, code } => {
+                if let Some(p) = self.processes.iter_mut().find(|p| p.id == id) {
+                    p.status = ProcStatus::Exited(code);
+                }
+            }
             AppEvent::Error(text) => self.notice = Some(format!("error: {text}")),
         }
         effects
@@ -683,7 +810,9 @@ impl AppState {
             other @ (Action::SlashCommand { .. }
             | Action::Rewind { .. }
             | Action::Resume { .. }
-            | Action::SetApiKey { .. }) => {
+            | Action::SetApiKey { .. }
+            | Action::KillProcess(_)
+            | Action::AttachImage { .. }) => {
                 effects.push(Effect::Send(other));
             }
             Action::ScrollUp(_) | Action::ScrollDown(_) | Action::Redraw => {}
@@ -700,10 +829,16 @@ impl AppState {
             return;
         }
         self.textarea = fresh_textarea();
+        // Pasted images were forwarded to core as they were pasted; the next turn
+        // consumes them, so clear the staged indicator now.
+        self.pending_image_count = 0;
         if self.turn_active {
             self.queue.push_back(item);
         } else {
             self.turn_active = true;
+            // Echo the prompt into scrollback first, so the transcript reads
+            // chat-style: the user's line, then the assistant's reply below it.
+            effects.push(Effect::CommitToScrollback(item.echo_md()));
             effects.push(Effect::Send(item.into_action()));
         }
     }
@@ -711,6 +846,9 @@ impl AppState {
     fn dispatch_queued(&mut self, effects: &mut Effects) {
         if let Some(next) = self.queue.pop_front() {
             self.turn_active = true;
+            // Echo a queued prompt at dispatch time (not enqueue) so it lands in
+            // chronological order, right above the reply it produces.
+            effects.push(Effect::CommitToScrollback(next.echo_md()));
             effects.push(Effect::Send(next.into_action()));
         }
     }
@@ -741,6 +879,15 @@ impl Queued {
         match self {
             Queued::Chat(t) => Action::SubmitInput(t),
             Queued::Shell(c) => Action::RunShell(c),
+        }
+    }
+
+    /// The chat-style transcript line committed to scrollback when this item is
+    /// sent, so the user's own prompt is visible above the assistant's reply.
+    fn echo_md(&self) -> String {
+        match self {
+            Queued::Chat(t) => format!("**❯ you**\n\n{t}"),
+            Queued::Shell(c) => format!("**❯ !{c}**"),
         }
     }
 }
@@ -804,6 +951,30 @@ mod tests {
     }
 
     #[test]
+    fn palette_enter_runs_the_highlighted_command_and_clears_input() {
+        let mut s = test_state();
+        s.textarea.insert_str("/re");
+        s.palette_move(1); // highlight "rewind" (index 1 of review/rewind/resume)
+        let effects = s.palette_run_selected();
+        match effects.as_slice() {
+            [Effect::Send(Action::SlashCommand { name, args })] => {
+                assert_eq!(name, "rewind");
+                assert!(args.is_empty());
+            }
+            _ => panic!("Enter should run the highlighted command"),
+        }
+        assert!(s.input_text().is_empty(), "the typed /partial is cleared");
+        assert_eq!(s.palette_selected, 0, "selection resets after running");
+    }
+
+    #[test]
+    fn palette_run_selected_is_a_noop_without_matches() {
+        let mut s = test_state();
+        s.textarea.insert_str("/nope");
+        assert!(s.palette_run_selected().is_empty(), "no matches → nothing runs");
+    }
+
+    #[test]
     fn streaming_then_turn_complete_commits_scrollback() {
         let mut s = test_state();
         s.apply_event(AppEvent::TurnStarted { turn_id: 1 });
@@ -859,14 +1030,32 @@ mod tests {
     }
 
     #[test]
-    fn submit_when_idle_sends_immediately() {
+    fn submit_when_idle_echoes_prompt_then_sends_immediately() {
         let mut s = test_state();
         let effects = s.apply_action(Action::SubmitInput("hi".into()));
+        // The prompt is echoed to scrollback first, then sent — chat-style trace.
         match effects.as_slice() {
-            [Effect::Send(Action::SubmitInput(t))] => assert_eq!(t.as_str(), "hi"),
-            _ => panic!("expected immediate send"),
+            [Effect::CommitToScrollback(md), Effect::Send(Action::SubmitInput(t))] => {
+                assert!(md.contains("hi"), "echo carries the prompt: {md}");
+                assert!(md.contains("you"), "echo is labelled: {md}");
+                assert_eq!(t.as_str(), "hi");
+            }
+            _ => panic!("expected an echo commit then an immediate send"),
         }
         assert!(s.turn_active);
+    }
+
+    #[test]
+    fn shell_submit_echoes_the_bang_command() {
+        let mut s = test_state();
+        let effects = s.apply_action(Action::RunShell("ls -la".into()));
+        match effects.as_slice() {
+            [Effect::CommitToScrollback(md), Effect::Send(Action::RunShell(c))] => {
+                assert!(md.contains("!ls -la"), "shell echo shows the bang command: {md}");
+                assert_eq!(c.as_str(), "ls -la");
+            }
+            _ => panic!("expected an echo commit then a shell send"),
+        }
     }
 
     #[test]
@@ -1208,6 +1397,32 @@ mod tests {
             Some(Selection::Navigate(q)) => assert_eq!(q, "src/models/"),
             _ => panic!("expected navigate combining prefix and dir"),
         }
+    }
+
+    #[test]
+    fn picker_commit_returns_directory_path_so_enter_can_escape() {
+        let mut s = test_state();
+        s.set_picker(
+            "/home/user/".to_string(),
+            vec!["src/".into(), "notes.md".into()],
+            "",
+        );
+        // Enter on a directory commits the dir path verbatim (trailing slash kept)
+        // instead of drilling in — that is the escape from the infinite drill.
+        match s.picker_commit() {
+            Some(path) => assert_eq!(path, "/home/user/src/"),
+            None => panic!("expected the directory path to commit"),
+        }
+        s.insert_picker_path("/home/user/src/");
+        assert_eq!(s.input_text(), "@/home/user/src/ ");
+        assert!(s.picker.is_none(), "committing closes the picker");
+    }
+
+    #[test]
+    fn picker_commit_also_returns_file_paths() {
+        let mut s = test_state();
+        s.set_picker("/a/".to_string(), vec!["b.txt".into()], "");
+        assert_eq!(s.picker_commit().as_deref(), Some("/a/b.txt"));
     }
 
     #[test]

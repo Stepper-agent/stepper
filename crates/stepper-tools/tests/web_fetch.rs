@@ -138,7 +138,9 @@ async fn web_fetch_is_gated_and_not_fetched_when_approver_denies() {
 
     let reg = ToolRegistry::builtins();
     let approver = Recording::new(Decision::Deny);
-    let cx = cx_with(PermissionMode::Auto, RuleSet::default(), approver.clone());
+    // Gated mode: Auto auto-allows WebFetch now, so a gated mode is needed to
+    // route it through the approver (which denies → not fetched).
+    let cx = cx_with(PermissionMode::Default, RuleSet::default(), approver.clone());
 
     let url = format!("{}/secret", server.uri());
     let err = reg
@@ -164,7 +166,8 @@ async fn web_fetch_marks_error_on_non_success_status() {
 
     let reg = ToolRegistry::builtins();
     let approver = Recording::new(Decision::Allow);
-    let cx = cx_with(PermissionMode::Auto, RuleSet::default(), approver.clone());
+    // Gated mode so the fetch is routed through the approver (calls()==1).
+    let cx = cx_with(PermissionMode::Default, RuleSet::default(), approver.clone());
 
     let url = format!("{}/missing", server.uri());
     let result = reg

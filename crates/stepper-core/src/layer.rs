@@ -1,4 +1,4 @@
-use stepper_provider::Message;
+use stepper_provider::{ContentBlock, Message, Role};
 
 /// What the pipeline does when a layer fails (after exhausting `retries`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -70,18 +70,22 @@ pub struct SubTask {
 pub struct Handoff {
     pub user_turn: String,
     pub prior: Vec<(String, String)>,
+    /// Images pasted with this turn (media_type, base64), attached to the opening
+    /// user message so the model can see them.
+    pub images: Vec<(String, String)>,
 }
 
 impl Handoff {
-    pub fn new(user_turn: String) -> Self {
+    pub fn new(user_turn: String, images: Vec<(String, String)>) -> Self {
         Handoff {
             user_turn,
             prior: Vec::new(),
+            images,
         }
     }
 
     /// The opening user message for a layer: prior summaries (if any) then the
-    /// user's turn.
+    /// user's turn, plus any pasted images.
     pub fn initial_messages(&self) -> Vec<Message> {
         let mut text = String::new();
         if !self.prior.is_empty() {
@@ -92,7 +96,20 @@ impl Handoff {
             text.push_str("---\n\n# Your task\n\n");
         }
         text.push_str(&self.user_turn);
-        vec![Message::user(text)]
+        if self.images.is_empty() {
+            return vec![Message::user(text)];
+        }
+        let mut content = vec![ContentBlock::Text(text)];
+        for (media_type, data) in &self.images {
+            content.push(ContentBlock::Image {
+                media_type: media_type.clone(),
+                data: data.clone(),
+            });
+        }
+        vec![Message {
+            role: Role::User,
+            content,
+        }]
     }
 
     /// The opening message for one parallel worker: the shared prior-layer context
@@ -109,5 +126,41 @@ impl Handoff {
         text.push_str("# Your assigned subtask\n\n");
         text.push_str(subtask);
         vec![Message::user(text)]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_messages_attach_pasted_images_to_the_user_message() {
+        let h = Handoff::new(
+            "what is in this screenshot?".into(),
+            vec![("image/png".into(), "AAAB".into())],
+        );
+        let msgs = h.initial_messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, Role::User);
+        let content = &msgs[0].content;
+        assert!(
+            matches!(&content[0], ContentBlock::Text(t) if t.contains("screenshot")),
+            "text block first"
+        );
+        match &content[1] {
+            ContentBlock::Image { media_type, data } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, "AAAB");
+            }
+            other => panic!("expected an image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn initial_messages_without_images_stay_plain_text() {
+        let h = Handoff::new("hi".into(), Vec::new());
+        let msgs = h.initial_messages();
+        assert_eq!(msgs[0].content.len(), 1);
+        assert!(matches!(&msgs[0].content[0], ContentBlock::Text(_)));
     }
 }

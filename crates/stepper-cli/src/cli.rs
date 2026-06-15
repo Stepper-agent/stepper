@@ -68,6 +68,19 @@ pub enum Command {
     Config(ConfigArgs),
     /// Scan the repo and generate `.stepper/stepper.md`.
     Init,
+    /// Scaffold a new layer: `stepper layer <name>`.
+    Layer {
+        /// Layer name (letters, digits, '-' and '_').
+        name: String,
+    },
+    /// Scaffold a new slash command: `stepper command <name>`.
+    #[command(name = "command")]
+    Cmd {
+        /// Command name (letters, digits, '-' and '_').
+        name: String,
+    },
+    /// Write a default plan → implement → review layer pipeline.
+    ScaffoldLayer,
 }
 
 #[derive(Args)]

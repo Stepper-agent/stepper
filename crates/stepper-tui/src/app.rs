@@ -77,7 +77,12 @@ pub async fn run(
             maybe_ev = input_rx.recv() => {
                 match maybe_ev {
                     Some(ev) => {
-                        handle_terminal_event(&mut state, &action_tx, ev);
+                        // An action can now commit to scrollback (e.g. echoing the
+                        // submitted prompt), so route its effects through the same
+                        // `run_effects` the core-event arm uses.
+                        if handle_terminal_event(&mut guard.terminal, &mut state, &action_tx, ev)? {
+                            force_clear = true;
+                        }
                         dirty = true;
                     }
                     None => break, // reader thread ended
@@ -121,24 +126,31 @@ pub async fn run(
     Ok(())
 }
 
-fn handle_terminal_event(state: &mut AppState, action_tx: &ActionTx, ev: Event) {
+/// Handle one terminal event. Returns `Ok(true)` if anything was committed to
+/// scrollback (so the caller forces a viewport resync), like `run_effects`.
+fn handle_terminal_event(
+    terminal: &mut ratatui::DefaultTerminal,
+    state: &mut AppState,
+    action_tx: &ActionTx,
+    ev: Event,
+) -> anyhow::Result<bool> {
     if let Event::Key(k) = &ev
         && k.kind != KeyEventKind::Press
     {
-        return;
+        return Ok(false);
     }
 
     // The @-file picker, while open, captures all keys.
     if state.picker.is_some() {
         handle_picker_key(state, &ev);
-        return;
+        return Ok(false);
     }
 
     // The builtin overlays (context/permissions/rewind/resume picker) capture
     // keys; the approval overlay keeps its y/a/n path through lower_event.
     if state.overlay_captures_keys() {
         handle_overlay_key(state, action_tx, &ev);
-        return;
+        return Ok(false);
     }
 
     // Typing '@' at a word boundary opens the file picker (the filesystem scan
@@ -149,7 +161,7 @@ fn handle_terminal_event(state: &mut AppState, action_tx: &ActionTx, ev: Event) 
         && at_word_boundary(state)
     {
         open_or_refresh_picker(state, String::new());
-        return;
+        return Ok(false);
     }
 
     // The slash-command palette (input is a `/<partial>` token) captures
@@ -159,30 +171,59 @@ fn handle_terminal_event(state: &mut AppState, action_tx: &ActionTx, ev: Event) 
         && let Event::Key(k) = &ev
     {
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = k.modifiers.contains(KeyModifiers::ALT);
         match k.code {
             KeyCode::Up => {
                 state.palette_move(-1);
-                return;
+                return Ok(false);
             }
             KeyCode::Down => {
                 state.palette_move(1);
-                return;
+                return Ok(false);
             }
             KeyCode::Tab if !shift => {
                 state.palette_complete();
-                return;
+                return Ok(false);
+            }
+            // Enter runs the highlighted command immediately (Shift/Alt+Enter stay
+            // newline inserts, handled by lower_event below). Tab still completes
+            // so the user can add arguments before running.
+            KeyCode::Enter if !shift && !alt => {
+                return run_effects(terminal, action_tx, state.palette_run_selected());
             }
             _ => {}
         }
     }
 
+    // Down on an empty prompt opens the background-process shell view (Claude
+    // Code style) when any process is tracked. With text in the box, Down keeps
+    // moving the textarea cursor.
+    if let Event::Key(k) = &ev
+        && k.code == KeyCode::Down
+        && state.input_text().is_empty()
+        && !state.processes.is_empty()
+    {
+        state.open_shell_view();
+        return Ok(false);
+    }
+
+    // Ctrl+V pastes an image from the OS clipboard (macOS Cmd+V is intercepted by
+    // the terminal, so Ctrl+V is the paste key inside the app). The image is
+    // staged for the next prompt; a non-image clipboard falls through.
+    if let Event::Key(k) = &ev
+        && k.code == KeyCode::Char('v')
+        && k.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        paste_clipboard_image(state, action_tx);
+        return Ok(false);
+    }
+
     match lower_event(&ev, state) {
+        // An action's effects can include a scrollback commit (the prompt echo),
+        // so run them through `run_effects` rather than only forwarding sends.
         Lowered::Action(action) => {
-            for eff in state.apply_action(action) {
-                if let Effect::Send(forward) = eff {
-                    let _ = action_tx.try_send(forward);
-                }
-            }
+            let effects = state.apply_action(action);
+            return run_effects(terminal, action_tx, effects);
         }
         Lowered::ForwardToTextarea => {
             state.esc_armed = false; // typing breaks the Esc-Esc chord
@@ -192,6 +233,7 @@ fn handle_terminal_event(state: &mut AppState, action_tx: &ActionTx, ev: Event) 
         }
         Lowered::Ignore => {}
     }
+    Ok(false)
 }
 
 /// Keys for the builtin overlays: the list picker navigates/selects/cancels,
@@ -242,6 +284,25 @@ fn handle_overlay_key(state: &mut AppState, action_tx: &ActionTx, ev: &Event) {
         }
         return;
     }
+    // The background-process shell view: ↑↓ select, `k` kills, Esc/q closes.
+    if matches!(state.overlay, Some(Overlay::Shell(_))) {
+        if let Event::Key(k) = ev {
+            match k.code {
+                KeyCode::Up => state.shell_move(-1),
+                KeyCode::Down => state.shell_move(1),
+                KeyCode::Char('k') => {
+                    for eff in state.shell_kill_selected() {
+                        if let Effect::Send(action) = eff {
+                            let _ = action_tx.try_send(action);
+                        }
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => state.overlay_close(),
+                _ => {}
+            }
+        }
+        return;
+    }
     if let Event::Key(k) = ev
         && matches!(
             k.code,
@@ -257,6 +318,44 @@ fn at_word_boundary(state: &AppState) -> bool {
     text.is_empty() || text.ends_with(char::is_whitespace)
 }
 
+/// Read a PNG image off the OS clipboard, stage it for the next prompt (sending
+/// it to core via `AttachImage`), and bump the input indicator. A non-image
+/// clipboard is a quiet no-op; an error surfaces as a notice.
+fn paste_clipboard_image(state: &mut AppState, action_tx: &ActionTx) {
+    match read_clipboard_image() {
+        Ok(Some((media_type, data))) => {
+            state.pending_image_count += 1;
+            let n = state.pending_image_count;
+            state.notice = Some(format!(
+                "image attached ({n} pending) — it rides with your next message"
+            ));
+            let _ = action_tx.try_send(stepper_protocol::Action::AttachImage { media_type, data });
+        }
+        Ok(None) => {}
+        Err(e) => state.notice = Some(format!("clipboard image paste failed: {e}")),
+    }
+}
+
+/// `(media_type, base64)` of the clipboard image, or `None` if the clipboard
+/// holds no image. PNG-encoded from the raw RGBA arboard hands back.
+fn read_clipboard_image() -> Result<Option<(String, String)>, String> {
+    use base64::Engine;
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    let img = match clipboard.get_image() {
+        Ok(img) => img,
+        Err(_) => return Ok(None),
+    };
+    let (w, h) = (img.width as u32, img.height as u32);
+    let rgba = image::RgbaImage::from_raw(w, h, img.bytes.into_owned())
+        .ok_or("clipboard image had an unexpected byte length")?;
+    let mut png: Vec<u8> = Vec::new();
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    let data = base64::engine::general_purpose::STANDARD.encode(&png);
+    Ok(Some(("image/png".to_string(), data)))
+}
+
 fn handle_picker_key(state: &mut AppState, ev: &Event) {
     let Event::Key(k) = ev else {
         return;
@@ -264,11 +363,19 @@ fn handle_picker_key(state: &mut AppState, ev: &Event) {
     match k.code {
         KeyCode::Up => state.picker_move(-1),
         KeyCode::Down => state.picker_move(1),
-        KeyCode::Enter | KeyCode::Tab => match state.picker_selection() {
+        // Tab = drill / autocomplete: a directory re-lists deeper, a file inserts.
+        KeyCode::Tab => match state.picker_selection() {
             Some(Selection::Navigate(query)) => open_or_refresh_picker(state, query),
             Some(Selection::Insert(path)) => state.insert_picker_path(&path),
             None => {}
         },
+        // Enter = commit the highlighted path (directory OR file) and exit @-mode,
+        // inserting `@path ` so the user is never trapped drilling into folders.
+        KeyCode::Enter => {
+            if let Some(path) = state.picker_commit() {
+                state.insert_picker_path(&path);
+            }
+        }
         KeyCode::Esc => state.picker_cancel(),
         KeyCode::Backspace => {
             let mut query = state.picker_query().unwrap_or_default().to_string();
@@ -336,7 +443,7 @@ fn run_effects(
                 let _ = action_tx.try_send(action);
             }
             Effect::CommitToScrollback(md) => {
-                let text = tui_markdown::from_str(&md);
+                let text = crate::markdown::render_markdown(&md);
                 let height = (text.lines.len() as u16).max(1);
                 terminal.insert_before(height, |buf| {
                     Paragraph::new(text).render(buf.area, buf);

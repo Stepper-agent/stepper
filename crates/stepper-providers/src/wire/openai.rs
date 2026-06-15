@@ -65,7 +65,28 @@ fn map_messages(req: &ChatRequest) -> Vec<Value> {
     for m in &req.messages {
         match m.role {
             Role::System => {}
-            Role::User => out.push(json!({ "role": "user", "content": m.text() })),
+            Role::User => {
+                // Plain string when text-only (back-compat); the array form with
+                // `image_url` data: URLs only when an image is attached.
+                let images: Vec<Value> = m
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Image { media_type, data } => Some(json!({
+                            "type": "image_url",
+                            "image_url": { "url": format!("data:{media_type};base64,{data}") },
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                if images.is_empty() {
+                    out.push(json!({ "role": "user", "content": m.text() }));
+                } else {
+                    let mut parts = vec![json!({ "type": "text", "text": m.text() })];
+                    parts.extend(images);
+                    out.push(json!({ "role": "user", "content": parts }));
+                }
+            }
             Role::Assistant => {
                 let mut text = String::new();
                 let mut tool_calls = Vec::new();

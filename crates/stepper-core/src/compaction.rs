@@ -82,6 +82,9 @@ fn message_chars(message: &Message) -> usize {
         .iter()
         .map(|block| match block {
             ContentBlock::Text(text) => text.len(),
+            // An image's char-size proxy: the base64 payload length (compaction
+            // only needs a rough magnitude, not real vision-token accounting).
+            ContentBlock::Image { data, .. } => data.len(),
             ContentBlock::Thinking { text, .. } => text.len(),
             ContentBlock::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
             ContentBlock::ToolResult { content, .. } => content

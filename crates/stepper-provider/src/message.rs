@@ -17,6 +17,14 @@ pub enum Role {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ContentBlock {
     Text(String),
+    /// An image attachment on a user message (e.g. a pasted screenshot).
+    /// `media_type` is a MIME type like "image/png"; `data` is the base64 payload.
+    /// Each dialect encodes it differently (Anthropic base64 source, OpenAI /
+    /// Responses `data:` URL).
+    Image {
+        media_type: String,
+        data: String,
+    },
     /// Model reasoning. `signature` is Anthropic's integrity token
     /// (`signature_delta`); only signed thinking blocks can be replayed in
     /// history, so encoders drop unsigned ones.

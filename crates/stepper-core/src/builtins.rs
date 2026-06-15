@@ -26,6 +26,10 @@ pub fn names() -> Vec<String> {
         "compact",
         "context",
         "cost",
+        "init",
+        "scaffold-layer",
+        "layer",
+        "command",
         "login",
         "model",
         "models",
@@ -100,6 +104,22 @@ pub async fn handle(
             notice(tx, NoticeLevel::Info, cost_text(cost)).await;
             true
         }
+        "init" => {
+            handle_init(&orchestrator.project_root, tx).await;
+            true
+        }
+        "scaffold-layer" => {
+            handle_scaffold_layer(&orchestrator.project_root, tx).await;
+            true
+        }
+        "layer" => {
+            handle_new_layer(args.trim(), &orchestrator.project_root, tx).await;
+            true
+        }
+        "command" => {
+            handle_new_command(args.trim(), &orchestrator.project_root, tx).await;
+            true
+        }
         "login" => {
             handle_login(args.trim(), orchestrator, tx).await;
             true
@@ -129,7 +149,107 @@ pub async fn handle(
 }
 
 fn help_text() -> String {
-    "commands: /help · /clear (reset conversation) · /compact [instructions] (compact the conversation now) · /context (window breakdown) · /cost (session usage & USD) · /login [provider] (set an API key) · /model [provider/model] (show or switch) · /models (pick from fetched models) · /permissions (rules & approvals) · /resume (pick a session) · /rewind (pick a checkpoint, also Esc-Esc) · plus any .stepper/commands/*.md".into()
+    "commands: /help · /clear (reset conversation) · /compact [instructions] (compact the conversation now) · /context (window breakdown) · /cost (session usage & USD) · /init (create the .stepper/ skeleton) · /scaffold-layer (write a default plan→implement→review pipeline) · /layer <name> (new layer) · /command <name> (new slash command) · /login [provider] (set an API key) · /model [provider/model] (show or switch) · /models (pick from fetched models) · /permissions (rules & approvals) · /resume (pick a session) · /rewind (pick a checkpoint, also Esc-Esc) · plus any .stepper/commands/*.md".into()
+}
+
+/// `/init` — ensure the `.stepper/` directory skeleton exists.
+async fn handle_init(project_root: &Path, tx: &EventTx) {
+    match stepper_config::scaffold::ensure_skeleton(project_root) {
+        Ok(()) => {
+            notice(
+                tx,
+                NoticeLevel::Info,
+                "ensured .stepper/ skeleton (layer/ commands/ skills/ output-styles/)".into(),
+            )
+            .await
+        }
+        Err(e) => notice(tx, NoticeLevel::Warn, format!("init failed: {e}")).await,
+    }
+}
+
+/// `/scaffold-layer` — write a default plan→implement→review pipeline and, if no
+/// pipeline is configured yet, wire it into `setting.json` `step`.
+async fn handle_scaffold_layer(project_root: &Path, tx: &EventTx) {
+    use stepper_config::scaffold;
+    match scaffold::scaffold_default_pipeline(project_root) {
+        Ok(created) => {
+            let set = scaffold::set_pipeline_steps_if_empty(project_root, &scaffold::pipeline_step_names())
+                .unwrap_or(false);
+            let made = if created.is_empty() {
+                "pipeline layers already existed".to_string()
+            } else {
+                format!("wrote {} layer file(s): plan → implement → review", created.len())
+            };
+            let step = if set {
+                " and set step:[plan,implement,review]"
+            } else {
+                " (kept your existing step pipeline)"
+            };
+            notice(
+                tx,
+                NoticeLevel::Info,
+                format!("{made}{step} — restart stepper to run the pipeline"),
+            )
+            .await;
+        }
+        Err(e) => notice(tx, NoticeLevel::Warn, format!("scaffold-layer failed: {e}")).await,
+    }
+}
+
+/// `/layer <name>` — scaffold a single custom layer.
+async fn handle_new_layer(name: &str, project_root: &Path, tx: &EventTx) {
+    use stepper_config::scaffold;
+    if !scaffold::is_safe_name(name) {
+        notice(
+            tx,
+            NoticeLevel::Warn,
+            "usage: /layer <name> — letters, digits, '-' and '_' only".into(),
+        )
+        .await;
+        return;
+    }
+    match scaffold::scaffold_layer(project_root, name, &format!("The {name} layer.")) {
+        Ok(Some(path)) => {
+            notice(
+                tx,
+                NoticeLevel::Info,
+                format!("created {} — add \"{name}\" to setting.json step and restart", path.display()),
+            )
+            .await
+        }
+        Ok(None) => {
+            notice(tx, NoticeLevel::Warn, format!("layer/{name}/index.md already exists")).await
+        }
+        Err(e) => notice(tx, NoticeLevel::Warn, format!("creating layer failed: {e}")).await,
+    }
+}
+
+/// `/command <name>` — scaffold a single user slash command.
+async fn handle_new_command(name: &str, project_root: &Path, tx: &EventTx) {
+    use stepper_config::scaffold;
+    if !scaffold::is_safe_name(name) {
+        notice(
+            tx,
+            NoticeLevel::Warn,
+            "usage: /command <name> — letters, digits, '-' and '_' only".into(),
+        )
+        .await;
+        return;
+    }
+    match scaffold::scaffold_command(project_root, name) {
+        Ok(Some(path)) => {
+            notice(
+                tx,
+                NoticeLevel::Info,
+                format!("created {} — restart to use /{name}", path.display()),
+            )
+            .await
+        }
+        Ok(None) => {
+            notice(tx, NoticeLevel::Warn, format!("commands/{name}.md already exists")).await
+        }
+        Err(e) => notice(tx, NoticeLevel::Warn, format!("creating command failed: {e}")).await,
+    }
 }
 
 fn fmt_usage(u: &Usage) -> String {

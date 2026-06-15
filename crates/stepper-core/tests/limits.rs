@@ -176,7 +176,7 @@ async fn max_turns_cap_aborts_a_runaway_turn() {
     let (tx, _drain) = drain_events();
 
     let err = orch
-        .run_turn("go".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .run_turn("go".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await
         .unwrap_err();
 
@@ -210,7 +210,7 @@ async fn budget_cap_aborts_once_session_cost_reaches_it() {
     let (tx, _drain) = drain_events();
 
     let err = orch
-        .run_turn("go".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .run_turn("go".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await
         .unwrap_err();
 
@@ -240,18 +240,18 @@ async fn budget_accumulates_across_turns_in_one_session() {
     let orch = orchestrator(resolver, dir.path().to_path_buf(), limits);
     let (tx, _drain) = drain_events();
 
-    orch.run_turn("one".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+    orch.run_turn("one".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await
         .expect("the first turn fits the budget");
 
     // Admission happens before each request: $3 spent < $5 lets turn two run
     // (total $6); turn three must then be refused outright.
-    orch.run_turn("two".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+    orch.run_turn("two".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await
         .expect("the second turn still fits");
 
     let err = orch
-        .run_turn("three".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .run_turn("three".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await
         .unwrap_err();
     assert!(
@@ -279,7 +279,7 @@ async fn caps_leave_a_turn_within_limits_untouched() {
     let (tx, _drain) = drain_events();
 
     let summaries = orch
-        .run_turn("go".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .run_turn("go".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await
         .expect("a turn within the caps completes normally")
         .summaries;

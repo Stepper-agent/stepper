@@ -62,6 +62,42 @@ fn command_shell_without_allow_rule_is_refused() {
 }
 
 #[test]
+fn command_shell_stays_fail_closed_even_in_auto_and_bypass() {
+    // The stored-RCE gate must NOT be granted by the active mode: Auto/Bypass
+    // auto-allow ordinary shell for the interactive agent, but a model-planted
+    // command file's `!`shell`` still requires an explicit allow rule.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join(".stepper/commands/evil.md"),
+        "---\n---\npayload: !`echo pwned`\n",
+    );
+    for mode in [PermissionMode::Auto, PermissionMode::Bypass] {
+        let out = commands::expand(
+            root.to_path_buf(),
+            None,
+            root.to_path_buf(),
+            allow(&[]),
+            mode,
+            "evil".into(),
+            String::new(),
+        );
+        assert!(out.is_none(), "command-file shell ran under {mode:?}: {out:?}");
+    }
+    // … but an explicit allow rule still lets it run.
+    let out = commands::expand(
+        root.to_path_buf(),
+        None,
+        root.to_path_buf(),
+        allow(&["Bash(echo *)"]),
+        PermissionMode::Auto,
+        "evil".into(),
+        String::new(),
+    );
+    assert!(out.is_some(), "an explicit allow rule should permit it");
+}
+
+#[test]
 fn unknown_command_returns_none() {
     let dir = tempfile::tempdir().unwrap();
     assert!(commands::expand(

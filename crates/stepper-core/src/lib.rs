@@ -16,6 +16,7 @@ pub mod layer;
 pub mod model;
 pub mod orchestrator;
 pub mod ports;
+pub mod proc;
 pub mod resolver;
 pub mod session;
 pub mod setup;
@@ -84,6 +85,12 @@ pub fn spawn_core(
         // Actions deferred from mid-turn (SlashCommand/Rewind forwarded while a turn
         // ran) are replayed here after the turn, ahead of new channel actions.
         let mut pending: std::collections::VecDeque<Action> = std::collections::VecDeque::new();
+        // Live `!cmd &` background processes: id → kill token (for the shell view).
+        let mut procs: std::collections::HashMap<u64, CancellationToken> =
+            std::collections::HashMap::new();
+        let mut next_proc_id: u64 = 0;
+        // Images pasted (Ctrl+V) since the last prompt — attached to the next turn.
+        let mut pending_images: Vec<(String, String)> = Vec::new();
 
         loop {
             let action = match pending.pop_front() {
@@ -99,6 +106,8 @@ pub fn spawn_core(
                     turn_id += 1;
                     let _ = tx.send(AppEvent::TurnStarted { turn_id }).await;
                     checkpoint_turn(&snapshotter, turn_id, &tx).await;
+                    // Attach (and clear) any images pasted since the last prompt.
+                    let images = std::mem::take(&mut pending_images);
                     // A per-turn child token lets `Interrupt` cancel just this turn
                     // (not the whole app); cancelling it aborts the stream/tools.
                     let turn_cancel = cancel.child_token();
@@ -108,7 +117,7 @@ pub fn spawn_core(
                         async {
                             result = Some(
                                 orchestrator
-                                    .run_turn(prompt.clone(), &tx, approver.clone(), turn_cancel.clone())
+                                    .run_turn(prompt.clone(), images.clone(), &tx, approver.clone(), turn_cancel.clone())
                                     .await,
                             );
                         },
@@ -224,6 +233,7 @@ pub fn spawn_core(
                             turn_id += 1;
                             let _ = tx.send(AppEvent::TurnStarted { turn_id }).await;
                             checkpoint_turn(&snapshotter, turn_id, &tx).await;
+                            let images = std::mem::take(&mut pending_images);
                             let turn_cancel = cancel.child_token();
                             let mut result = None;
                             let mut deferred = Vec::new();
@@ -231,7 +241,7 @@ pub fn spawn_core(
                                 async {
                                     result = Some(
                                         orchestrator
-                                            .run_turn(prompt, &tx, approver.clone(), turn_cancel.clone())
+                                            .run_turn(prompt, images, &tx, approver.clone(), turn_cancel.clone())
                                             .await,
                                     );
                                 },
@@ -284,6 +294,24 @@ pub fn spawn_core(
                     let _ = tx.send(AppEvent::Notice { level, text }).await;
                 }
                 Action::RunShell(command) => {
+                    let (inner, background) = proc::parse_background(&command);
+                    if background {
+                        // `!cmd &` — spawn detached (no turn, no 120s timeout) and
+                        // track it for the shell view; output streams in as events.
+                        let id = next_proc_id;
+                        next_proc_id += 1;
+                        let token = cancel.child_token();
+                        procs.insert(id, token.clone());
+                        proc::spawn_background(
+                            id,
+                            inner,
+                            orchestrator.cwd.clone(),
+                            orchestrator.home.clone(),
+                            tx.clone(),
+                            token,
+                        );
+                        continue;
+                    }
                     turn_id += 1;
                     let _ = tx.send(AppEvent::TurnStarted { turn_id }).await;
                     let turn_cancel = cancel.child_token();
@@ -301,11 +329,40 @@ pub fn spawn_core(
                         break;
                     }
                 }
+                Action::KillProcess(id) => {
+                    if let Some(token) = procs.remove(&id) {
+                        token.cancel();
+                    }
+                }
+                Action::AttachImage { media_type, data } => {
+                    pending_images.push((media_type, data));
+                }
+                // Shift+Tab / mode switches must reach the permission engine —
+                // without this the orchestrator keeps its startup mode forever and
+                // switching into Auto (etc.) interactively has no effect.
+                Action::SetMode(m) => {
+                    orchestrator.mode = permission_mode(m);
+                }
                 _ => {}
             }
         }
     });
     rx
+}
+
+/// Map the protocol UI `Mode` (what Shift+Tab cycles) to the permission engine's
+/// `PermissionMode`. The two enums mirror each other 1:1.
+fn permission_mode(m: stepper_protocol::Mode) -> stepper_permission::PermissionMode {
+    use stepper_permission::PermissionMode as P;
+    use stepper_protocol::Mode as M;
+    match m {
+        M::Auto => P::Auto,
+        M::Plan => P::Plan,
+        M::AcceptEdits => P::AcceptEdits,
+        M::Default => P::Default,
+        M::DontAsk => P::DontAsk,
+        M::Bypass => P::Bypass,
+    }
 }
 
 /// Outcome of a watched turn: whether the outer loop should keep going or quit.
@@ -381,7 +438,13 @@ async fn run_shell(
         cwd: orchestrator.cwd.clone(),
         project_root: orchestrator.project_root.clone(),
         home: orchestrator.home.clone(),
-        mode: orchestrator.mode,
+        // A hand-typed `!cmd` is user-initiated, not model-initiated, so it runs
+        // permissionless (no approval prompt) under Bypass. The guards that still
+        // apply: the bash tool's secret-file screen (runs before the gate, so
+        // `!cat ~/.ssh/id_rsa` is still refused) and explicit `deny` rules (deny
+        // wins in every mode). This does NOT touch the `.stepper/commands` shell
+        // gate, which stays rule-only fail-closed (model-plantable, see commands.rs).
+        mode: stepper_permission::PermissionMode::Bypass,
         rules: orchestrator.rules.clone(),
         approver,
         cancel,

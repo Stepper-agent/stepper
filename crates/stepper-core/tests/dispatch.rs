@@ -474,7 +474,7 @@ async fn dispatched_subagents_cannot_use_a_tool_the_calling_layer_denied() {
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
     let _ = orch
-        .run_turn("go".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .run_turn("go".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await
         .unwrap();
 
@@ -533,7 +533,7 @@ async fn enabling_dispatch_lets_the_model_fan_out_subagents() {
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
     let summaries = orch
-        .run_turn("go".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .run_turn("go".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await
         .unwrap()
         .summaries;

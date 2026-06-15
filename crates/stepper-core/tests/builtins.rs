@@ -165,6 +165,159 @@ async fn builtins_emit_events_without_running_a_turn() {
     assert!(warn.contains("cannot switch"), "got: {warn}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn interactive_bang_shell_runs_permissionless_without_approval() {
+    // The orchestrator helper runs in AcceptEdits with no allow rules, so the
+    // model's bash tool WOULD gate `echo` (Ask). A hand-typed `!echo` is
+    // user-initiated and must run permissionless — no ApprovalRequested, no
+    // "shell: … not permitted" error.
+    let dir = tempfile::tempdir().unwrap();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator(dir.path().to_path_buf()),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+    action_tx
+        .send(Action::RunShell("echo perm_marker_42".into()))
+        .await
+        .unwrap();
+
+    let mut saw_output = false;
+    while let Some(ev) = events.recv().await {
+        match ev {
+            AppEvent::ApprovalRequested(_) => {
+                panic!("interactive `!` must not prompt for approval")
+            }
+            AppEvent::AssistantTokenDelta(t) if t.contains("perm_marker_42") => saw_output = true,
+            AppEvent::Notice { text, .. } if text.starts_with("shell:") => {
+                panic!("`!echo` should run, not error: {text}")
+            }
+            AppEvent::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(saw_output, "the `!echo` output should stream back as assistant text");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interactive_bang_shell_still_refuses_secret_files() {
+    // Permissionless does NOT mean unguarded: the bash secret-file screen runs
+    // before execution regardless of mode, so `!cat ~/.ssh/id_rsa` is refused.
+    let dir = tempfile::tempdir().unwrap();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator(dir.path().to_path_buf()),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+    action_tx
+        .send(Action::RunShell("cat ~/.ssh/id_rsa".into()))
+        .await
+        .unwrap();
+
+    let mut refused = false;
+    while let Some(ev) = events.recv().await {
+        match ev {
+            AppEvent::Notice { text, .. } if text.contains("secret") => refused = true,
+            AppEvent::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(refused, "a `!` touching a secret file must be refused even permissionless");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scaffold_layer_command_writes_the_default_pipeline() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator(root.clone()),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+    action_tx.send(slash("scaffold-layer", "")).await.unwrap();
+    let note = next_notice(&mut events).await;
+    assert!(note.contains("plan"), "scaffold notice names the pipeline: {note}");
+    for name in ["plan", "implement", "review"] {
+        assert!(
+            root.join(".stepper/layer").join(name).join("index.md").exists(),
+            "{name} layer file written"
+        );
+    }
+    let setting = std::fs::read_to_string(root.join(".stepper/setting.json")).unwrap_or_default();
+    assert!(setting.contains("plan"), "step pipeline set in setting.json: {setting}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn new_layer_command_rejects_unsafe_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator(dir.path().to_path_buf()),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+    action_tx.send(slash("layer", "../escape")).await.unwrap();
+    let note = next_notice(&mut events).await;
+    assert!(note.contains("usage"), "an unsafe name is refused: {note}");
+    assert!(
+        !dir.path().join(".stepper/layer/../escape").exists(),
+        "nothing is written for an unsafe name"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_bang_shell_streams_output_and_exits_without_a_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator(dir.path().to_path_buf()),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+    // `!echo … &` runs detached: no turn, but ProcessStarted/Output/Exited stream.
+    action_tx
+        .send(Action::RunShell("echo bg_marker_77 &".into()))
+        .await
+        .unwrap();
+
+    let (mut started, mut output, mut exited) = (false, false, false);
+    let collect = async {
+        while let Some(ev) = events.recv().await {
+            match ev {
+                AppEvent::ProcessStarted { command, .. } => {
+                    assert!(command.contains("echo bg_marker_77"), "got: {command}");
+                    started = true;
+                }
+                AppEvent::ProcessOutput { line, .. } if line.contains("bg_marker_77") => {
+                    output = true;
+                }
+                AppEvent::ProcessExited { code, .. } => {
+                    assert_eq!(code, Some(0));
+                    exited = true;
+                }
+                AppEvent::TurnStarted { .. } => panic!("a background `!cmd &` must not open a turn"),
+                _ => {}
+            }
+            if started && output && exited {
+                break;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), collect).await;
+    assert!(
+        started && output && exited,
+        "started={started} output={output} exited={exited}"
+    );
+}
+
 async fn wait_model_then_notice(rx: &mut EventRx) -> String {
     let mut saw_model = false;
     while let Some(ev) = rx.recv().await {

@@ -43,6 +43,9 @@ tui-markdown = "0.3.7"
 similar = { version = "3.1", features = ["inline"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 unicode-width = "0.2"
+# Clipboard image paste (Ctrl+V) — read the OS clipboard image, PNG-encode it.
+arboard = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 # HTTP + SSE provider stack (Phase 2)
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls", "charset", "http2"] }
 eventsource-stream = "0.2"

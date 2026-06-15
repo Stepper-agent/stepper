@@ -216,6 +216,7 @@ impl Orchestrator {
     pub async fn run_turn(
         &self,
         user_turn: String,
+        images: Vec<(String, String)>,
         event_tx: &EventTx,
         approver: Arc<dyn Approver>,
         cancel: CancellationToken,
@@ -239,7 +240,7 @@ impl Orchestrator {
             )
             .await;
 
-        let mut handoff = Handoff::new(user_turn);
+        let mut handoff = Handoff::new(user_turn, images);
 
         // Caps are enforced at the provider boundary: every chat_stream call is
         // one ReAct step, admitted against this turn's budget.

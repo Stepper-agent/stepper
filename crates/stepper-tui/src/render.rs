@@ -8,7 +8,7 @@ use stepper_protocol::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::state::{ApiKeyOverlay, AppState, FilePicker, ListPicker, Overlay};
+use crate::state::{ApiKeyOverlay, AppState, FilePicker, ListPicker, Overlay, ProcStatus, ShellView};
 use crate::theme::Theme;
 
 pub fn draw(terminal: &mut DefaultTerminal, state: &AppState, theme: &Theme) -> anyhow::Result<()> {
@@ -57,6 +57,7 @@ fn ui(frame: &mut Frame, state: &AppState, theme: &Theme) {
             }
             Overlay::Picker(picker) => render_list_picker(frame, rows[0], picker, theme),
             Overlay::ApiKey(o) => render_api_key(frame, rows[0], o, theme),
+            Overlay::Shell(s) => render_shell(frame, rows[0], state, s, theme),
         }
     } else if state.palette_active() {
         render_palette(frame, rows[0], state, theme);
@@ -167,7 +168,7 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &FilePicker, theme: &The
         Span::styled("@", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
         Span::styled(picker.query.clone(), Style::default().fg(theme.accent)),
         Span::styled(
-            "   ↑↓ select · Enter insert · Esc cancel",
+            "   ↑↓ select · Tab open · Enter insert · Esc cancel",
             Style::default().fg(theme.muted),
         ),
     ])];
@@ -182,6 +183,73 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &FilePicker, theme: &The
         lines.push(Line::from(Span::styled(format!("  {path}"), style)));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// The background-process shell view (Down key): a process list on top and the
+/// selected process's recent console output below.
+fn render_shell(frame: &mut Frame, area: Rect, state: &AppState, shell: &ShellView, theme: &Theme) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" shell · ↑↓ select · k kill · Esc close ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if state.processes.is_empty() || inner.height == 0 {
+        frame.render_widget(
+            Paragraph::new("no background processes — run `!cmd &`"),
+            inner,
+        );
+        return;
+    }
+
+    let sel = shell.selected.min(state.processes.len() - 1);
+    let list_h = ((state.processes.len() as u16) + 1)
+        .min(inner.height.saturating_sub(1).max(1))
+        .max(1);
+    let chunks =
+        Layout::vertical([Constraint::Length(list_h), Constraint::Min(0)]).split(inner);
+
+    let rows: Vec<Line> = state
+        .processes
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let (glyph, color, status) = match &p.status {
+                ProcStatus::Running => {
+                    (spinner_frame(state.spinner).to_string(), theme.accent, "running".to_string())
+                }
+                ProcStatus::Exited(Some(0)) => ("✓".to_string(), theme.success, "exit 0".to_string()),
+                ProcStatus::Exited(Some(c)) => ("✗".to_string(), theme.error, format!("exit {c}")),
+                ProcStatus::Exited(None) => ("✗".to_string(), theme.error, "exited".to_string()),
+            };
+            let style = if i == sel {
+                Style::default().fg(color).add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(color)
+            };
+            let cmd = truncate(&p.command, (inner.width as usize).saturating_sub(24));
+            Line::from(Span::styled(format!("{glyph} [{}] {status}  {cmd}", p.id), style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(rows)), chunks[0]);
+
+    if chunks[1].height > 0
+        && let Some(p) = state.processes.get(sel)
+    {
+        let avail = chunks[1].height as usize;
+        let lines: Vec<Line> = p
+            .output
+            .iter()
+            .rev()
+            .take(avail)
+            .rev()
+            .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(theme.muted))))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+            chunks[1],
+        );
+    }
 }
 
 fn render_palette(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -412,7 +480,7 @@ fn render_live(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         )));
     }
     if !state.live.assistant.is_empty() {
-        lines.extend(tui_markdown::from_str(&state.live.assistant).lines);
+        lines.extend(crate::markdown::render_markdown(&state.live.assistant).lines);
     } else if state.tool_lines.is_empty() && !state.turn_active {
         let hint = state
             .notice
@@ -421,13 +489,34 @@ fn render_live(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         lines.push(Line::from(Span::styled(hint, Style::default().fg(theme.muted))));
     }
 
-    let scroll = (lines.len() as u16).saturating_sub(area.height.max(1));
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
-        area,
-    );
+    // Fence the in-progress / result stream in a titled border so it is visually
+    // distinct from the committed scrollback above and the input below. On a tiny
+    // (height < 3) live area the border would eat all the content rows, so fall
+    // back to borderless there.
+    if area.height >= 3 {
+        let title = if state.turn_active {
+            format!(" {} working… ", spinner_frame(state.spinner))
+        } else {
+            " result ".to_string()
+        };
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.muted))
+            .title(title);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let scroll = (lines.len() as u16).saturating_sub(inner.height.max(1));
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).scroll((scroll, 0)),
+            inner,
+        );
+    } else {
+        let scroll = (lines.len() as u16).saturating_sub(area.height.max(1));
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).scroll((scroll, 0)),
+            area,
+        );
+    }
 }
 
 /// How many visual rows the input text needs at `width` columns once
@@ -479,10 +568,16 @@ fn scroll_offset(selected: usize, len: usize, window: usize) -> usize {
 fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // `!`-prefixed input is shell mode (Claude-Code-style).
     let bash_mode = state.input_text().starts_with('!');
-    let (title, border) = if bash_mode {
+    let (base_title, border) = if bash_mode {
         (" bash ! ", theme.warning)
     } else {
         (" message ", theme.border_active)
+    };
+    // Surface staged clipboard images (Ctrl+V) in the input title.
+    let title = if state.pending_image_count > 0 {
+        format!("{base_title}· 🖼 {} ", state.pending_image_count)
+    } else {
+        base_title.to_string()
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)

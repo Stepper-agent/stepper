@@ -9,6 +9,7 @@ pub mod discovery;
 pub mod error;
 pub mod frontmatter;
 pub mod model;
+pub mod scaffold;
 pub mod schema;
 pub mod settings;
 pub mod substitution;

@@ -21,6 +21,9 @@ ratatui-textarea = { workspace = true }
 tui-markdown = { workspace = true }
 similar = { workspace = true }
 unicode-width = { workspace = true }
+arboard = { workspace = true }
+image = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }

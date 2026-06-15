@@ -1,11 +1,10 @@
 use crate::context::{Approval, ToolCx};
-use crate::secret::{is_secret_path, is_secret_path_resolved};
 use crate::tools::parse_args;
 use crate::Tool;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use stepper_permission::PermissionRequest;
@@ -14,37 +13,14 @@ use stepper_provider::{ToolError, ToolResult, ToolSpec};
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_OUTPUT: usize = 30_000;
 
-/// Defense-in-depth under the permission engine: tokenize the command
-/// (quote-aware) and refuse to run it at all if any path-looking token resolves
-/// to a secret file — `cat ~/.ssh/id_rsa` must not bypass the read_file guard.
-/// An untokenizable command fails closed.
+/// Defense-in-depth under the permission engine: refuse to run a command if any
+/// path-looking token resolves to a secret file — `cat ~/.ssh/id_rsa` must not
+/// bypass the read_file guard. Delegates to the shared screen so the bash tool
+/// and the background-process path stay identical. An untokenizable command
+/// fails closed.
 fn find_secret_path_token(command: &str, cx: &ToolCx) -> Result<Option<PathBuf>, ToolError> {
-    let tokens = shell_words::split(command).map_err(|e| {
-        ToolError::Denied(format!(
-            "refusing to run command that cannot be tokenized for secret-path screening: {e}"
-        ))
-    })?;
-    for token in tokens {
-        let looks_like_path =
-            token.contains('/') || token.starts_with('~') || is_secret_path(Path::new(&token));
-        if !looks_like_path {
-            continue;
-        }
-        let expanded = match (token.strip_prefix("~/"), cx.home.as_deref()) {
-            (Some(rest), Some(home)) => home.join(rest),
-            _ if token == "~" && cx.home.is_some() => cx.home.clone().unwrap(),
-            _ => PathBuf::from(&token),
-        };
-        let abs = if expanded.is_absolute() {
-            expanded
-        } else {
-            cx.cwd.join(expanded)
-        };
-        if is_secret_path_resolved(&abs) {
-            return Ok(Some(abs));
-        }
-    }
-    Ok(None)
+    crate::secret::find_secret_path_in_command(command, &cx.cwd, cx.home.as_deref())
+        .map_err(|e| ToolError::Denied(format!("refusing to run command: {e}")))
 }
 
 pub struct Bash {

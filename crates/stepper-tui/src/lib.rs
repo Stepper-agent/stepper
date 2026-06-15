@@ -7,6 +7,7 @@
 mod app;
 mod files;
 mod input;
+mod markdown;
 mod render;
 mod state;
 mod terminal;

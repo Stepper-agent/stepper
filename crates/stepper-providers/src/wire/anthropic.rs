@@ -69,10 +69,20 @@ fn map_messages(req: &ChatRequest) -> Vec<Value> {
     for m in &req.messages {
         match m.role {
             Role::System => {}
-            Role::User => out.push(json!({
-                "role": "user",
-                "content": [json!({ "type": "text", "text": m.text() })],
-            })),
+            Role::User => {
+                // Text as one block, then any pasted images as base64 source
+                // blocks (Anthropic's image content shape).
+                let mut blocks: Vec<Value> = vec![json!({ "type": "text", "text": m.text() })];
+                for b in &m.content {
+                    if let ContentBlock::Image { media_type, data } = b {
+                        blocks.push(json!({
+                            "type": "image",
+                            "source": { "type": "base64", "media_type": media_type, "data": data },
+                        }));
+                    }
+                }
+                out.push(json!({ "role": "user", "content": blocks }));
+            }
             Role::Assistant => {
                 let mut blocks = Vec::new();
                 for b in &m.content {

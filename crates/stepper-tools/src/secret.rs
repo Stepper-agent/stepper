@@ -48,6 +48,42 @@ pub fn is_secret_path_resolved(path: &Path) -> bool {
         ))
 }
 
+/// Tokenize a shell command (quote-aware) and return the first path-looking
+/// token that resolves to a secret file, so a caller can refuse to run it —
+/// `cat ~/.ssh/id_rsa` must not slip through. `Err` = untokenizable (fail
+/// closed). The single screen used by both the bash tool and the background-
+/// process (`!cmd &`) path, which both run user-/model-initiated shell.
+pub fn find_secret_path_in_command(
+    command: &str,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    use std::path::PathBuf;
+    let tokens = shell_words::split(command)
+        .map_err(|e| format!("command cannot be tokenized for secret-path screening: {e}"))?;
+    for token in tokens {
+        let looks_like_path =
+            token.contains('/') || token.starts_with('~') || is_secret_path(Path::new(&token));
+        if !looks_like_path {
+            continue;
+        }
+        let expanded = match (token.strip_prefix("~/"), home) {
+            (Some(rest), Some(h)) => h.join(rest),
+            _ if token == "~" && home.is_some() => home.unwrap().to_path_buf(),
+            _ => PathBuf::from(&token),
+        };
+        let abs = if expanded.is_absolute() {
+            expanded
+        } else {
+            cwd.join(expanded)
+        };
+        if is_secret_path_resolved(&abs) {
+            return Ok(Some(abs));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

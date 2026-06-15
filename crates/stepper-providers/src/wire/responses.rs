@@ -47,11 +47,19 @@ fn map_input(req: &ChatRequest) -> Vec<Value> {
     for m in &req.messages {
         match m.role {
             Role::System => {}
-            Role::User => out.push(json!({
-                "type": "message",
-                "role": "user",
-                "content": [json!({ "type": "input_text", "text": m.text() })],
-            })),
+            Role::User => {
+                let mut content: Vec<Value> =
+                    vec![json!({ "type": "input_text", "text": m.text() })];
+                for b in &m.content {
+                    if let ContentBlock::Image { media_type, data } = b {
+                        content.push(json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{media_type};base64,{data}"),
+                        }));
+                    }
+                }
+                out.push(json!({ "type": "message", "role": "user", "content": content }));
+            }
             Role::Assistant => {
                 // The model emits its text before issuing tool calls, so the
                 // assistant message item must precede the function_call items.

@@ -104,5 +104,21 @@ pub enum AppEvent {
     TurnComplete {
         turn_id: u64,
     },
+    /// A `!cmd &` background process was spawned — opens a row in the shell view
+    /// (reachable with the Down key). `id` is the stable process handle.
+    ProcessStarted {
+        id: u64,
+        command: String,
+    },
+    /// A line of stdout/stderr from a background process, for its console pane.
+    ProcessOutput {
+        id: u64,
+        line: String,
+    },
+    /// A background process ended (with its exit code, if any).
+    ProcessExited {
+        id: u64,
+        code: Option<i32>,
+    },
     Error(String),
 }

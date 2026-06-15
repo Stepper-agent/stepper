@@ -479,7 +479,10 @@ async fn in_project_write_does_not_ask_the_approver() {
 }
 
 #[tokio::test]
-async fn bash_records_command_approval_in_auto_mode() {
+async fn bash_records_command_approval_in_gated_mode() {
+    // A gated mode (Default) routes an un-ruled shell command through the
+    // approver. (Auto auto-allows shell now, so it would not prompt — see the
+    // permission crate's auto-mode tests.)
     let dir = tempfile::tempdir().unwrap();
     let reg = ToolRegistry::builtins();
     let approver = Recording::new(Decision::Allow);
@@ -487,7 +490,7 @@ async fn bash_records_command_approval_in_auto_mode() {
         cwd: dir.path().to_path_buf(),
         project_root: dir.path().to_path_buf(),
         home: None,
-        mode: PermissionMode::Auto,
+        mode: PermissionMode::Default,
         rules: Arc::new(RuleSet::default()),
         approver: approver.clone(),
         cancel: CancellationToken::new(),
@@ -570,13 +573,15 @@ async fn bash_cancellation_token_aborts_run() {
 
 #[tokio::test]
 async fn bash_denied_by_default_when_no_allow_rule() {
+    // Gated mode: with no allow rule the shell prompts, and a denying approver
+    // turns that into a Denied error. (Auto would auto-allow it.)
     let dir = tempfile::tempdir().unwrap();
     let reg = ToolRegistry::builtins();
     let cx = ToolCx {
         cwd: dir.path().to_path_buf(),
         project_root: dir.path().to_path_buf(),
         home: None,
-        mode: PermissionMode::Auto,
+        mode: PermissionMode::Default,
         rules: Arc::new(RuleSet::default()),
         approver: Arc::new(DenyAll),
         cancel: CancellationToken::new(),

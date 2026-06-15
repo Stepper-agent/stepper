@@ -243,10 +243,26 @@ fn decide(
 }
 
 fn mode_default_bash(mode: PermissionMode) -> Decision {
-    // Shell is never auto-allowed by mode alone — only an explicit allow rule
-    // does that.
-    let _ = mode;
-    Decision::Ask
+    match mode {
+        // Auto = autonomous: the user opted into not being nagged for ordinary
+        // in-project work, so the per-atom default is Allow. The guardrails that
+        // still fire keep this from being a blanket bypass: an explicit `deny`
+        // rule wins first (decide()), an unanalyzable redirection/substitution
+        // escalates Allow→Ask (evaluate_inner), an out-of-project redirect target
+        // is gated as its own Write/Read and asks, and secret files are refused at
+        // execution (the bash tool's secret screen). A robust default deny list
+        // (scaffolded into .stepper/) is what stops a destructive verb with no
+        // redirect (e.g. `rm -rf`).
+        PermissionMode::Auto => Decision::Allow,
+        // Every other mode keeps shell gated unless an explicit allow rule matches
+        // (Bypass turns the resulting Ask into Allow at the top level, so the
+        // redirect/secret guards above still apply there).
+        PermissionMode::Plan
+        | PermissionMode::AcceptEdits
+        | PermissionMode::Default
+        | PermissionMode::DontAsk
+        | PermissionMode::Bypass => Decision::Ask,
+    }
 }
 
 fn mode_default_path(
@@ -294,8 +310,13 @@ fn mode_default_path(
 }
 
 fn mode_default_other(mode: PermissionMode) -> Decision {
-    let _ = mode;
-    Decision::Ask
+    // WebFetch / MCP follow the same posture as shell: Auto auto-allows (deny
+    // rules still win, web_fetch keeps its own SSRF guard), every other mode asks
+    // unless an explicit allow rule matches.
+    match mode {
+        PermissionMode::Auto => Decision::Allow,
+        _ => Decision::Ask,
+    }
 }
 
 #[cfg(test)]
@@ -412,25 +433,28 @@ mod tests {
 
     #[test]
     fn redirection_and_substitution_escalate_allow_to_ask() {
+        // A gated mode (Default): the per-atom default is Ask, so the gating
+        // mechanisms below are visible. (In Auto the per-atom default is Allow —
+        // see `auto_mode_*` — so the inner substitution command auto-allows there.)
         let rules = RuleSet::from_lists(&["Bash(echo *)".into()], &[], &[]);
         // plain allowed command stays allowed
         assert_eq!(
-            evaluate(&PermissionRequest::Bash("echo hi".into()), &rules, &root(), None, PermissionMode::Auto),
+            evaluate(&PermissionRequest::Bash("echo hi".into()), &rules, &root(), None, PermissionMode::Default),
             Decision::Allow
         );
         // redirection to an arbitrary target must not auto-allow
         assert_eq!(
-            evaluate(&PermissionRequest::Bash("echo x > /etc/passwd".into()), &rules, &root(), None, PermissionMode::Auto),
+            evaluate(&PermissionRequest::Bash("echo x > /etc/passwd".into()), &rules, &root(), None, PermissionMode::Default),
             Decision::Ask
         );
         // command substitution must not auto-allow
         assert_eq!(
-            evaluate(&PermissionRequest::Bash("echo $(rm -rf /)".into()), &rules, &root(), None, PermissionMode::Auto),
+            evaluate(&PermissionRequest::Bash("echo $(rm -rf /)".into()), &rules, &root(), None, PermissionMode::Default),
             Decision::Ask
         );
         // but a quoted '>' is not a redirection
         assert_eq!(
-            evaluate(&PermissionRequest::Bash("echo 'a > b'".into()), &rules, &root(), None, PermissionMode::Auto),
+            evaluate(&PermissionRequest::Bash("echo 'a > b'".into()), &rules, &root(), None, PermissionMode::Default),
             Decision::Allow
         );
     }
@@ -482,6 +506,124 @@ mod tests {
                 PermissionMode::AcceptEdits,
             ),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn auto_mode_auto_allows_plain_shell_but_still_gates_redirects_and_denies() {
+        // Auto with NO allow rules now auto-allows an ordinary command (the user's
+        // "stop nagging me" intent) …
+        let rules = RuleSet::default();
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Bash("cargo build".into()),
+                &rules,
+                &root(),
+                None,
+                PermissionMode::Auto,
+            ),
+            Decision::Allow
+        );
+        // … but an out-of-project redirect target still asks (gated as a Write) …
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Bash("echo x > /etc/passwd".into()),
+                &rules,
+                &root(),
+                None,
+                PermissionMode::Auto,
+            ),
+            Decision::Ask
+        );
+        // … a dynamic (unanalyzable) redirect target still escalates to Ask …
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Bash("echo x > $FILE".into()),
+                &rules,
+                &root(),
+                None,
+                PermissionMode::Auto,
+            ),
+            Decision::Ask
+        );
+        // … and an explicit deny still wins — the guardrail that catches a
+        // destructive verb (incl. one hidden in a substitution like
+        // `echo $(rm -rf /)`, whose inner atom auto-allows in Auto without it).
+        let denied = RuleSet::from_lists(&[], &[], &["Bash(rm -rf *)".into()]);
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Bash("rm -rf /".into()),
+                &denied,
+                &root(),
+                None,
+                PermissionMode::Auto,
+            ),
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn non_auto_modes_still_ask_for_unruled_shell() {
+        let rules = RuleSet::default();
+        for mode in [PermissionMode::Default, PermissionMode::AcceptEdits, PermissionMode::Plan] {
+            assert_eq!(
+                evaluate(
+                    &PermissionRequest::Bash("cargo build".into()),
+                    &rules,
+                    &root(),
+                    None,
+                    mode,
+                ),
+                Decision::Ask,
+                "mode {mode:?} must keep shell gated"
+            );
+        }
+        // headless `dont-ask` denies it (fail closed).
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Bash("cargo build".into()),
+                &rules,
+                &root(),
+                None,
+                PermissionMode::DontAsk,
+            ),
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn auto_mode_auto_allows_webfetch_and_mcp() {
+        let rules = RuleSet::default();
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::WebFetch("https://example.com".into()),
+                &rules,
+                &root(),
+                None,
+                PermissionMode::Auto,
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Mcp { server: "fs".into(), tool: "read".into() },
+                &rules,
+                &root(),
+                None,
+                PermissionMode::Auto,
+            ),
+            Decision::Allow
+        );
+        // default mode still asks
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::WebFetch("https://example.com".into()),
+                &rules,
+                &root(),
+                None,
+                PermissionMode::Default,
+            ),
+            Decision::Ask
         );
     }
 

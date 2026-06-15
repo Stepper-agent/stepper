@@ -175,6 +175,7 @@ async fn forwards_layer_one_summary_into_layer_two_handoff() {
     let summaries = orch
         .run_turn(
             "build me a project".into(),
+            Vec::new(),
             &tx,
             Arc::new(AllowAll),
             CancellationToken::new(),
@@ -226,6 +227,7 @@ async fn early_layer_step_cap_aborts_the_turn() {
     let err = orch
         .run_turn(
             "do it".into(),
+            Vec::new(),
             &tx,
             Arc::new(AllowAll),
             CancellationToken::new(),
@@ -263,7 +265,7 @@ async fn failed_layer_with_skip_policy_continues_to_next_layer() {
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
     let summaries = orch
-        .run_turn("do it".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .run_turn("do it".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await
         .expect("skip policy keeps the turn alive")
         .summaries;
@@ -434,7 +436,7 @@ async fn fallback_model_engages_after_a_non_retryable_failure_and_notices() {
     });
 
     let summaries = orch
-        .run_turn("go".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .run_turn("go".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await
         .expect("the fallback model rescues the layer")
         .summaries;
@@ -475,7 +477,7 @@ async fn non_retryable_failure_without_fallback_fails_without_retry() {
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
     let err = orch
-        .run_turn("go".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .run_turn("go".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await
         .unwrap_err();
 
@@ -505,7 +507,7 @@ async fn a_failing_layer_is_retried_and_can_recover() {
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
     let summaries = orch
-        .run_turn("go".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .run_turn("go".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await
         .expect("the retry recovers the layer")
         .summaries;

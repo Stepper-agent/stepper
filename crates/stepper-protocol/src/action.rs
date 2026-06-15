@@ -41,6 +41,15 @@ pub enum Action {
         provider: String,
         key: String,
     },
+    /// Kill a running background process (`!cmd &`) by its id, from the shell view.
+    KillProcess(u64),
+    /// Stage a pasted image (Ctrl+V) for the next prompt. `media_type` is a MIME
+    /// type ("image/png"); `data` is base64. Core buffers these and attaches them
+    /// to the next `SubmitInput` user message.
+    AttachImage {
+        media_type: String,
+        data: String,
+    },
     Quit,
     Redraw,
 }

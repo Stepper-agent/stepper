@@ -104,9 +104,27 @@ impl CoreIo {
     }
 }
 
+impl CoreIo {
+    /// The stored-RCE gate. A `.stepper/commands/*.md` file can be model-planted,
+    /// so shell substitution is **rule-only**: an explicit `allow` rule must match.
+    /// The active mode is deliberately NOT consulted — Auto/Bypass auto-allow
+    /// ordinary shell for the interactive agent, but must never silently run a
+    /// command file's `!`shell``. Evaluating under `Default` (which never
+    /// auto-allows bash by mode) reduces this to "an allow rule, or refuse".
+    fn shell_allowed_rule_only(&self, cmd: &str) -> bool {
+        evaluate(
+            &PermissionRequest::Bash(cmd.to_string()),
+            &self.rules,
+            &self.project_root,
+            self.home.as_deref(),
+            PermissionMode::Default,
+        ) == Decision::Allow
+    }
+}
+
 impl SubstitutionIo for CoreIo {
     fn run_shell(&self, cmd: &str) -> Result<String, String> {
-        if !self.allowed(&PermissionRequest::Bash(cmd.to_string())) {
+        if !self.shell_allowed_rule_only(cmd) {
             return Err(format!(
                 "shell `{cmd}` is not permitted in a slash command — add an explicit `allow` rule (e.g. Bash({cmd})) to run it"
             ));

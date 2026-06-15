@@ -258,7 +258,7 @@ async fn fans_out_parallel_layer_from_prior_task_list() {
 
     let (tx, log) = collecting_channel();
     let summaries = orch
-        .run_turn("ship it".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .run_turn("ship it".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await
         .unwrap()
         .summaries;
@@ -327,7 +327,7 @@ async fn every_assigned_task_runs_even_beyond_parallel_max() {
 
     let (tx, _log) = collecting_channel();
     let summaries = orch
-        .run_turn("go".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .run_turn("go".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await
         .unwrap()
         .summaries;
@@ -361,7 +361,7 @@ async fn an_over_large_fan_out_is_rejected_not_materialized() {
 
     let (tx, _log) = collecting_channel();
     let result = orch
-        .run_turn("go".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .run_turn("go".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await;
 
     assert!(result.is_err(), "an over-limit fan-out fails the layer (on_failure=Stop)");
@@ -387,7 +387,7 @@ async fn parallel_layer_without_a_task_list_runs_as_a_single_layer() {
 
     let (tx, log) = collecting_channel();
     let summaries = orch
-        .run_turn("ship it".into(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .run_turn("ship it".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
         .await
         .unwrap()
         .summaries;

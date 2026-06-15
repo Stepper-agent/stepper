@@ -48,13 +48,15 @@ fn deny_rule_beats_overlapping_allow_rule() {
 
 #[test]
 fn bash_npm_run_glob_matches_only_matching_command() {
+    // Gated mode so the non-matching command is distinguishable (in Auto it would
+    // auto-allow regardless of the rule).
     let rules = RuleSet::from_lists(&["Bash(npm run *)".into()], &[], &[]);
     assert_eq!(
         judge(
             PermissionRequest::Bash("npm run build".into()),
             &rules,
             &root(),
-            PermissionMode::Auto,
+            PermissionMode::Default,
         ),
         Decision::Allow
     );
@@ -63,7 +65,7 @@ fn bash_npm_run_glob_matches_only_matching_command() {
             PermissionRequest::Bash("npm install lodash".into()),
             &rules,
             &root(),
-            PermissionMode::Auto,
+            PermissionMode::Default,
         ),
         Decision::Ask
     );
@@ -89,13 +91,15 @@ fn compound_command_with_one_unsafe_atom_resolves_most_restrictive() {
 
 #[test]
 fn compound_command_with_one_unmatched_atom_falls_to_ask() {
+    // Gated mode: the unmatched atom (`curl …`) takes the mode default (Ask), and
+    // most-restrictive wins over the allowed `echo`. (In Auto both atoms allow.)
     let rules = RuleSet::from_lists(&["Bash(echo *)".into()], &[], &[]);
     assert_eq!(
         judge(
             PermissionRequest::Bash("echo hi && curl evil.example".into()),
             &rules,
             &root(),
-            PermissionMode::Auto,
+            PermissionMode::Default,
         ),
         Decision::Ask
     );
@@ -217,7 +221,9 @@ fn auto_mode_allows_in_project_and_asks_outside() {
 }
 
 #[test]
-fn auto_mode_never_auto_allows_bare_bash_without_rule() {
+fn auto_mode_auto_allows_bare_bash_without_rule() {
+    // Auto is autonomous: an ordinary command needs no allow rule (deny rules,
+    // redirect escalation, and secret screening remain the guardrails).
     let rules = RuleSet::default();
     assert_eq!(
         judge(
@@ -226,7 +232,7 @@ fn auto_mode_never_auto_allows_bare_bash_without_rule() {
             &root(),
             PermissionMode::Auto,
         ),
-        Decision::Ask
+        Decision::Allow
     );
 }
 
@@ -255,15 +261,16 @@ fn allow_rule_with_redirection_target_escalates_to_ask() {
 
 #[test]
 fn allow_rule_with_unmatched_substitution_or_backtick_falls_to_ask() {
+    // Gated mode: the inner command is its own atom; with no rule for it the mode
+    // default (Ask) governs the compound. (In Auto the inner atom auto-allows, so
+    // a deny rule — not the mode — is what gates it there.)
     let rules = RuleSet::from_lists(&["Bash(echo *)".into()], &[], &[]);
-    // The inner command is its own atom; with no rule for it the mode default
-    // (Ask) governs the compound.
     assert_eq!(
         judge(
             PermissionRequest::Bash("echo $(rm -rf /)".into()),
             &rules,
             &root(),
-            PermissionMode::Auto,
+            PermissionMode::Default,
         ),
         Decision::Ask
     );
@@ -272,7 +279,7 @@ fn allow_rule_with_unmatched_substitution_or_backtick_falls_to_ask() {
             PermissionRequest::Bash("echo `whoami`".into()),
             &rules,
             &root(),
-            PermissionMode::Auto,
+            PermissionMode::Default,
         ),
         Decision::Ask
     );
@@ -283,7 +290,7 @@ fn allow_rule_with_unmatched_substitution_or_backtick_falls_to_ask() {
             PermissionRequest::Bash("echo done &".into()),
             &rules,
             &root(),
-            PermissionMode::Auto,
+            PermissionMode::Default,
         ),
         Decision::Allow
     );
@@ -443,6 +450,8 @@ fn deny_rule_with_redirection_stays_deny_not_downgraded_to_ask() {
 
 #[test]
 fn mcp_rule_allows_specific_server_tool_pair() {
+    // Gated mode so the non-matching pairs are distinguishable (in Auto MCP
+    // auto-allows regardless of the rule).
     let rules = RuleSet::from_lists(&["Mcp(filesystem, read_file)".into()], &[], &[]);
     assert_eq!(
         judge(
@@ -452,7 +461,7 @@ fn mcp_rule_allows_specific_server_tool_pair() {
             },
             &rules,
             &root(),
-            PermissionMode::Auto,
+            PermissionMode::Default,
         ),
         Decision::Allow
     );
@@ -464,7 +473,7 @@ fn mcp_rule_allows_specific_server_tool_pair() {
             },
             &rules,
             &root(),
-            PermissionMode::Auto,
+            PermissionMode::Default,
         ),
         Decision::Ask
     );
@@ -476,7 +485,7 @@ fn mcp_rule_allows_specific_server_tool_pair() {
             },
             &rules,
             &root(),
-            PermissionMode::Auto,
+            PermissionMode::Default,
         ),
         Decision::Ask
     );
@@ -536,13 +545,15 @@ fn approvals_fold_into_allow_rules() {
 
 #[test]
 fn empty_bash_command_falls_back_to_mode_default() {
+    // Gated mode shows the fallback distinctly (Default's Ask); in Auto the
+    // bash default is Allow.
     let rules = RuleSet::default();
     assert_eq!(
         judge(
             PermissionRequest::Bash("".into()),
             &rules,
             &root(),
-            PermissionMode::Auto,
+            PermissionMode::Default,
         ),
         Decision::Ask
     );
@@ -550,13 +561,14 @@ fn empty_bash_command_falls_back_to_mode_default() {
 
 #[test]
 fn bash_npm_run_glob_does_not_over_match_run_prefix_without_space() {
+    // Gated mode so the over-match cases are distinguishable from the allowed one.
     let rules = RuleSet::from_lists(&["Bash(npm run *)".into()], &[], &[]);
     assert_eq!(
         judge(
             PermissionRequest::Bash("npm run build".into()),
             &rules,
             &root(),
-            PermissionMode::Auto,
+            PermissionMode::Default,
         ),
         Decision::Allow
     );
@@ -565,7 +577,7 @@ fn bash_npm_run_glob_does_not_over_match_run_prefix_without_space() {
             PermissionRequest::Bash("npm runner".into()),
             &rules,
             &root(),
-            PermissionMode::Auto,
+            PermissionMode::Default,
         ),
         Decision::Ask
     );
@@ -574,7 +586,7 @@ fn bash_npm_run_glob_does_not_over_match_run_prefix_without_space() {
             PermissionRequest::Bash("npm running".into()),
             &rules,
             &root(),
-            PermissionMode::Auto,
+            PermissionMode::Default,
         ),
         Decision::Ask
     );
@@ -609,10 +621,12 @@ fn accept_edits_mode_default_asks_bash_with_no_matching_rule() {
 }
 
 #[test]
-fn web_fetch_default_asks_without_rule_in_every_mode() {
+fn web_fetch_default_asks_without_rule_in_gated_modes() {
+    // Auto auto-allows WebFetch now (web_fetch keeps its own SSRF guard); the
+    // gated modes still ask without an explicit rule.
     let rules = RuleSet::default();
     for mode in [
-        PermissionMode::Auto,
+        PermissionMode::Default,
         PermissionMode::Plan,
         PermissionMode::AcceptEdits,
     ] {
@@ -626,6 +640,16 @@ fn web_fetch_default_asks_without_rule_in_every_mode() {
             Decision::Ask
         );
     }
+    // … and Auto auto-allows it.
+    assert_eq!(
+        judge(
+            PermissionRequest::WebFetch("https://example.com".into()),
+            &rules,
+            &root(),
+            PermissionMode::Auto,
+        ),
+        Decision::Allow
+    );
 }
 
 #[test]
@@ -671,6 +695,7 @@ fn web_fetch_deny_rule_overrides_allow_rule() {
 
 #[test]
 fn other_request_default_asks_without_rule() {
+    // Gated mode (Auto auto-allows like shell/fetch/mcp).
     let rules = RuleSet::default();
     assert_eq!(
         judge(
@@ -680,7 +705,7 @@ fn other_request_default_asks_without_rule() {
             },
             &rules,
             &root(),
-            PermissionMode::Auto,
+            PermissionMode::Default,
         ),
         Decision::Ask
     );
