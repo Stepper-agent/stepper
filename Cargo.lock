@@ -3108,7 +3108,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stepper-cli"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3129,7 +3129,7 @@ dependencies = [
 
 [[package]]
 name = "stepper-config"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "gray_matter",
  "regex",
@@ -3143,7 +3143,7 @@ dependencies = [
 
 [[package]]
 name = "stepper-core"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -3167,7 +3167,7 @@ dependencies = [
 
 [[package]]
 name = "stepper-mcp"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "reqwest 0.12.28",
@@ -3185,7 +3185,7 @@ dependencies = [
 
 [[package]]
 name = "stepper-permission"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "globset",
  "regex",
@@ -3196,7 +3196,7 @@ dependencies = [
 
 [[package]]
 name = "stepper-protocol"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3206,7 +3206,7 @@ dependencies = [
 
 [[package]]
 name = "stepper-provider"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -3219,7 +3219,7 @@ dependencies = [
 
 [[package]]
 name = "stepper-providers"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3248,7 +3248,7 @@ dependencies = [
 
 [[package]]
 name = "stepper-tools"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -3271,7 +3271,7 @@ dependencies = [
 
 [[package]]
 name = "stepper-tui"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arboard",
