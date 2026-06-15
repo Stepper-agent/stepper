@@ -15,12 +15,16 @@ give a short summary of what you changed.";
 /// The base/pinned context (`.stepper/stepper.md`, project over user). Empty when
 /// none exists.
 pub fn load_base_context(config: &Config) -> String {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     for dir in [config.project_dir.as_ref(), config.user_dir.as_ref()]
         .into_iter()
         .flatten()
     {
         if let Ok(text) = std::fs::read_to_string(dir.join("stepper.md")) {
-            return text;
+            // Resolve `@import` directives (Claude-Code-style) — relative to the
+            // `.stepper/` dir, `~/` to $HOME — so a migrated CLAUDE.md that pulls
+            // in shared rule files keeps working.
+            return stepper_config::imports::resolve_imports(&text, dir, home.as_deref());
         }
     }
     String::new()
