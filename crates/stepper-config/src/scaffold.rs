@@ -143,6 +143,40 @@ pub fn set_pipeline_steps_if_empty(project_root: &Path, steps: &[String]) -> io:
     Ok(true)
 }
 
+/// The single safe read-modify-write seam for runtime `setting.json` changes
+/// (persisting a `/model` pick, an AlwaysAllow approval, a `config set`, …):
+/// read the object (or the schema-stamped skeleton when absent), apply `edit`,
+/// and write it back pretty-printed. A present-but-unparseable file is an error,
+/// never clobbered (the same rule `stepper import` learned the hard way).
+pub fn update_settings(
+    stepper_dir: &Path,
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> io::Result<()> {
+    let path = stepper_dir.join("setting.json");
+    let mut value: serde_json::Value = match fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not valid JSON: {e}", path.display()),
+            )
+        })?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(stepper_dir)?;
+            serde_json::json!({ "$schema": "stepper://setting.schema.json" })
+        }
+        Err(e) => return Err(e),
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a JSON object", path.display()),
+        ));
+    };
+    edit(obj);
+    fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&value)?))?;
+    Ok(())
+}
+
 /// Scaffold one `layer/<name>/index.md`. `Ok(Some(path))` when written,
 /// `Ok(None)` if it already existed; the caller must pre-validate the name with
 /// [`is_safe_name`].

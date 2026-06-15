@@ -138,6 +138,8 @@ async fn compacts_above_soft_threshold_and_pins_the_system_prompt() {
         compaction_provider: None,
         temperature: None,
         top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
         worker: None,
     };
 
@@ -254,6 +256,8 @@ async fn uses_the_model_summarizer_when_a_compaction_provider_is_set() {
         compaction_provider: Some(compaction_provider),
         temperature: None,
         top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
         worker: None,
     };
 
@@ -331,6 +335,8 @@ async fn overflowing_seeded_history_is_compacted_before_the_first_request() {
         compaction_provider: None,
         temperature: None,
         top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
         worker: None,
     };
 

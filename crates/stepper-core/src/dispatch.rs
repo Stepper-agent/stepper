@@ -195,9 +195,11 @@ impl Dispatcher for OrchestratorDispatcher {
                         step_cap: self.step_cap,
                         hooks: self.hooks.clone(),
                         compaction_provider: self.compaction_provider.clone(),
-                        system: "You are a dispatched sub-agent. Complete the subtask and end with a \
-                                 concise summary of what you did."
-                            .into(),
+                        system: crate::setup::compose_system(
+                            "",
+                            "You are a dispatched sub-agent. Complete the subtask and end with a \
+                             concise summary of what you did.",
+                        ),
                         messages: vec![Message::user(req.prompt)],
                     });
                 }

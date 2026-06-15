@@ -44,6 +44,11 @@ pub struct GlobalArgs {
     /// Abort once the accumulated session cost (USD) reaches this cap.
     #[arg(long, global = true)]
     pub max_budget_usd: Option<f64>,
+    /// Stop a turn once it has run this many wall-clock seconds (runaway guard).
+    /// Wall-clock — it also counts time spent waiting at an approval prompt. 0 =
+    /// no limit.
+    #[arg(long, global = true)]
+    pub turn_timeout: Option<u64>,
     /// DANGEROUS: bypass-permissions mode — everything that would prompt is
     /// allowed; explicit deny rules still deny.
     #[arg(long, global = true, conflicts_with = "mode")]

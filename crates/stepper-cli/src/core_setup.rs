@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use stepper_config::{Config, Permissions, ProviderConfig};
+use stepper_config::{Config, LimitsConfig, Permissions, ProviderConfig};
 use stepper_core::{
     build_steps, load_base_context, ConfigProviderResolver, HookHost, ModelRegistry, Orchestrator,
     SessionLimits,
@@ -13,6 +13,18 @@ use stepper_permission::{PermissionMode, RuleSet};
 use stepper_providers::{CodexTokenStore, ProviderFactory};
 
 pub const DEFAULT_MODEL: &str = "ollama-cloud/qwen3-coder";
+
+/// Fold `setting.json` `limits` under the CLI-flag limits: each axis takes the
+/// CLI value when present, else the config value, else stays unset (no limit).
+fn merge_limits(cli: SessionLimits, config: Option<&LimitsConfig>) -> SessionLimits {
+    let cfg = config.cloned().unwrap_or_default();
+    SessionLimits::new(
+        cli.max_turns.or(cfg.max_turns),
+        cli.max_budget_usd.or(cfg.max_budget_usd),
+        cli.turn_timeout
+            .or_else(|| cfg.turn_timeout_secs.map(std::time::Duration::from_secs)),
+    )
+}
 
 /// Build the orchestrator and connect MCP servers. The returned `McpManager`
 /// must be kept alive for the session (it owns the live connections).
@@ -26,6 +38,9 @@ pub async fn build_orchestrator_with_fallback(
     limits: SessionLimits,
 ) -> anyhow::Result<(Orchestrator, McpManager)> {
     let mut config = Config::load(&cwd)?;
+    // Effective limits: a CLI flag wins; otherwise fall back to `setting.json`
+    // `limits`; otherwise no limit. (Set at first-run setup, per project.)
+    let limits = merge_limits(limits, config.settings.limits.as_ref());
     let default_model = model.unwrap_or(DEFAULT_MODEL).to_string();
     // Precedence: `--mode` flag > `setting.json` `mode` >
     // `permissions.defaultMode` > AcceptEdits.
@@ -193,6 +208,45 @@ fn convention_provider(name: &str) -> ProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_limits_prefers_cli_then_config_then_none() {
+        use std::time::Duration;
+        let cfg = LimitsConfig {
+            turn_timeout_secs: Some(600),
+            max_budget_usd: Some(5.0),
+            max_turns: Some(100),
+        };
+        // No CLI flags → config values fill in.
+        let merged = merge_limits(SessionLimits::new(None, None, None), Some(&cfg));
+        assert_eq!(merged.turn_timeout, Some(Duration::from_secs(600)));
+        assert_eq!(merged.max_budget_usd, Some(5.0));
+        assert_eq!(merged.max_turns, Some(100));
+
+        // A CLI flag wins over the config value on its axis.
+        let cli = SessionLimits::new(Some(7), None, Some(Duration::from_secs(30)));
+        let merged = merge_limits(cli, Some(&cfg));
+        assert_eq!(merged.max_turns, Some(7), "CLI --max-turns wins");
+        assert_eq!(merged.turn_timeout, Some(Duration::from_secs(30)), "CLI --turn-timeout wins");
+        assert_eq!(merged.max_budget_usd, Some(5.0), "unset CLI axis falls back to config");
+
+        // No config and no flags → no limits.
+        let merged = merge_limits(SessionLimits::new(None, None, None), None);
+        assert!(merged.turn_timeout.is_none() && merged.max_turns.is_none() && merged.max_budget_usd.is_none());
+
+        // A zero on any axis (from a flag or a hand-edited config) means "no
+        // limit" — never an instant kill. Goes through SessionLimits::new.
+        let zeros = LimitsConfig {
+            turn_timeout_secs: Some(0),
+            max_budget_usd: Some(0.0),
+            max_turns: Some(0),
+        };
+        let merged = merge_limits(SessionLimits::new(None, None, None), Some(&zeros));
+        assert!(
+            merged.turn_timeout.is_none() && merged.max_turns.is_none() && merged.max_budget_usd.is_none(),
+            "zero on any axis normalizes to no limit"
+        );
+    }
 
     #[test]
     fn parse_mode_accepts_known_strings_and_rejects_others() {

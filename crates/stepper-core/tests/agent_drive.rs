@@ -101,6 +101,8 @@ async fn finishes_turn_when_model_emits_no_tool_call() {
         compaction_provider: None,
         temperature: None,
         top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
         worker: None,
     };
 
@@ -143,6 +145,8 @@ async fn terminates_at_step_cap_when_model_never_stops() {
         compaction_provider: None,
         temperature: None,
         top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
         worker: None,
     };
 
@@ -217,6 +221,8 @@ async fn blocking_pretooluse_hook_denies_the_tool() {
         compaction_provider: None,
         temperature: None,
         top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
         worker: None,
     };
 
@@ -285,6 +291,8 @@ async fn posttooluse_hook_runs_after_the_tool_without_blocking_the_loop() {
         compaction_provider: None,
         temperature: None,
         top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
         worker: None,
     };
 
@@ -342,6 +350,8 @@ async fn already_cancelled_token_returns_cancelled_before_any_step() {
         compaction_provider: None,
         temperature: None,
         top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
         worker: None,
     };
 
@@ -408,6 +418,8 @@ async fn pretooluse_matcher_is_exact_and_does_not_substring_match() {
         compaction_provider: None,
         temperature: None,
         top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
         worker: None,
     };
 
@@ -485,6 +497,8 @@ fn agent<'a>(
         compaction_provider: None,
         temperature: None,
         top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
         worker: None,
     }
 }
@@ -636,6 +650,8 @@ async fn sampling_overrides_are_forwarded_to_the_provider_request() {
         compaction_provider: None,
         temperature: Some(0.3),
         top_p: Some(0.9),
+        reasoning_effort: None,
+        thinking_budget: None,
         worker: None,
     };
 
@@ -693,6 +709,8 @@ async fn max_tokens_comes_from_the_model_info_output_cap() {
         compaction_provider: None,
         temperature: None,
         top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
         worker: None,
     };
 

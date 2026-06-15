@@ -53,6 +53,12 @@ pub struct CatalogMeta {
     pub max_output_tokens: Option<u64>,
     pub input_per_mtok: Option<f64>,
     pub output_per_mtok: Option<f64>,
+    /// Whether the model supports tool/function calling — i.e. is usable as an
+    /// agent (vs an embedding/TTS/image model). Drives the first-run picker.
+    pub tool_call: bool,
+    /// `YYYY-MM-DD` release date when the catalog has one; used to order the
+    /// first-run picker newest-first.
+    pub release_date: Option<String>,
 }
 
 /// The parsed models.dev catalog: `provider id -> (model id -> metadata)`.
@@ -126,6 +132,8 @@ fn parse_catalog_meta(model: &serde_json::Value) -> CatalogMeta {
         max_output_tokens: model.pointer("/limit/output").and_then(|v| v.as_u64()),
         input_per_mtok: model.pointer("/cost/input").and_then(|v| v.as_f64()),
         output_per_mtok: model.pointer("/cost/output").and_then(|v| v.as_f64()),
+        tool_call: model.get("tool_call").and_then(|v| v.as_bool()).unwrap_or(false),
+        release_date: model.get("release_date").and_then(|v| v.as_str()).map(String::from),
     }
 }
 
@@ -232,11 +240,58 @@ pub async fn list_models(
         .collect()
 }
 
+/// Agent-capable (`tool_call`) catalog models for `provider`, newest-first — for
+/// the first-run picker, where no provider keys are configured yet (so a live
+/// `/v1/models` call would just 401) and embeddings/TTS/image models are noise.
+/// Empty when the catalog has no agent models for the provider.
+pub fn onboarding_models(catalog: &Catalog, provider: &str) -> Vec<ModelEntry> {
+    let Some(models) = catalog.models_for(provider) else {
+        return Vec::new();
+    };
+    let mut pairs: Vec<(&String, &CatalogMeta)> =
+        models.iter().filter(|(_, m)| m.tool_call).collect();
+    // Newest release first; id as a stable tiebreaker (undated models sort last).
+    pairs.sort_by(|(id_a, a), (id_b, b)| {
+        b.release_date.cmp(&a.release_date).then_with(|| id_a.cmp(id_b))
+    });
+    pairs
+        .into_iter()
+        .map(|(id, meta)| ModelEntry {
+            model_ref: format!("{provider}/{id}"),
+            display_name: meta.display_name.clone().unwrap_or_else(|| id.clone()),
+            context_window: meta.context_window,
+            max_output_tokens: meta.max_output_tokens,
+            input_per_mtok: meta.input_per_mtok,
+            output_per_mtok: meta.output_per_mtok,
+            id: id.clone(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn onboarding_models_filters_to_tool_call_newest_first() {
+        let mut by_provider = HashMap::new();
+        let mut anthropic = HashMap::new();
+        // Newer agent model, older agent model, and a non-agent (embedding) model.
+        anthropic.insert("claude-new".to_string(), CatalogMeta { tool_call: true, release_date: Some("2026-01-01".into()), context_window: Some(200_000), ..Default::default() });
+        anthropic.insert("claude-old".to_string(), CatalogMeta { tool_call: true, release_date: Some("2024-01-01".into()), ..Default::default() });
+        anthropic.insert("embed-1".to_string(), CatalogMeta { tool_call: false, ..Default::default() });
+        by_provider.insert("anthropic".to_string(), anthropic);
+        let catalog = Catalog { by_provider };
+
+        let got = onboarding_models(&catalog, "anthropic");
+        assert_eq!(got.len(), 2, "the non-tool_call model is excluded");
+        assert_eq!(got[0].model_ref, "anthropic/claude-new", "newest release first");
+        assert_eq!(got[1].model_ref, "anthropic/claude-old");
+        assert_eq!(got[0].context_window, Some(200_000));
+        assert!(onboarding_models(&catalog, "openai").is_empty());
+    }
 
     #[test]
     fn parse_catalog_extracts_provider_models_and_meta() {

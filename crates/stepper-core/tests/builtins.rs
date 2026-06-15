@@ -78,6 +78,8 @@ fn step() -> StepDef {
         retries: 0,
         temperature: None,
         top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
         permission: Vec::new(),
         parallel: false,
         parallel_max: 8,

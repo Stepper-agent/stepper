@@ -32,6 +32,12 @@ pub struct LayerFrontmatter {
     pub provider: Option<String>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    /// OpenAI-family reasoning effort: `minimal` | `low` | `medium` | `high`.
+    #[serde(alias = "reasoning-effort")]
+    pub reasoning_effort: Option<String>,
+    /// Anthropic extended-thinking budget in tokens (maps to `thinking`).
+    #[serde(alias = "thinking-budget")]
+    pub thinking_budget: Option<u32>,
     pub tools: ToolFilter,
     pub permission: BTreeMap<String, String>,
     pub mcp: McpAllow,
@@ -444,6 +450,25 @@ Plan body.\n";
         assert_eq!(layer.frontmatter.top_p, Some(0.9));
         assert!(!layer.frontmatter.hidden);
         assert_eq!(layer.name, "plan");
+    }
+
+    #[test]
+    fn parses_reasoning_overrides() {
+        let doc = "---\n\
+description: deep thinker\n\
+reasoning-effort: high\n\
+thinking-budget: 8000\n\
+---\nThink hard.\n";
+        let layer = parse_layer("plan", doc).unwrap();
+        assert_eq!(layer.frontmatter.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(layer.frontmatter.thinking_budget, Some(8000));
+    }
+
+    #[test]
+    fn reasoning_overrides_default_to_none() {
+        let layer = parse_layer("plan", "---\ndescription: d\n---\nbody").unwrap();
+        assert!(layer.frontmatter.reasoning_effort.is_none());
+        assert!(layer.frontmatter.thinking_budget.is_none());
     }
 
     #[test]

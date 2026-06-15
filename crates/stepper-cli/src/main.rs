@@ -203,7 +203,7 @@ fn init_cmd(global: GlobalArgs) -> anyhow::Result<()> {
 
     let setting = stepper_dir.join("setting.json");
     if !setting.exists() {
-        std::fs::write(&setting, scaffold_setting_json(None, "accept-edits"))?;
+        std::fs::write(&setting, scaffold_setting_json(None, "accept-edits", None))?;
         println!("wrote {}", setting.display());
     }
     Ok(())
@@ -248,9 +248,14 @@ fn detect_stack(cwd: &std::path::Path) -> String {
 
 /// The `.stepper/setting.json` scaffold. `default_model` adds a `defaultModel`
 /// line when present (the first-run setup passes the chosen model); `mode` sets
-/// the starting permission mode. With `None` + `"accept-edits"` the output is
-/// the plain `stepper init` template.
-pub(crate) fn scaffold_setting_json(default_model: Option<&str>, mode: &str) -> String {
+/// the starting permission mode; `limits` adds a `limits` block when any cap is
+/// set. With `None`/`"accept-edits"`/`None` the output is the plain `stepper
+/// init` template.
+pub(crate) fn scaffold_setting_json(
+    default_model: Option<&str>,
+    mode: &str,
+    limits: Option<&stepper_config::LimitsConfig>,
+) -> String {
     let default_model_line = match default_model {
         // Serialize the value through serde_json so any model string is escaped
         // into a valid JSON string (the scaffold is otherwise hand-formatted).
@@ -260,8 +265,15 @@ pub(crate) fn scaffold_setting_json(default_model: Option<&str>, mode: &str) -> 
         ),
         None => String::new(),
     };
+    let limits_line = match limits {
+        Some(l) if l.is_set() => format!(
+            "  \"limits\": {},\n",
+            serde_json::to_string(l).unwrap_or_else(|_| "{}".into())
+        ),
+        _ => String::new(),
+    };
     format!(
-        "{{\n  \"$schema\": \"stepper://setting.schema.json\",\n  \"step\": [],\n{default_model_line}  \"mode\": \"{mode}\",\n  \"providers\": {{}},\n  \"permissions\": {{\n    \"allow\": [\"Read(/**)\", \"Bash(cargo *)\"],\n    \"ask\": [\"Bash(git push:*)\"],\n    \"deny\": [\"Read(//etc/**)\", \"Bash(rm -rf *)\", \"Bash(rm -fr *)\", \"Bash(sudo *)\", \"Bash(git push --force *)\", \"Bash(git push -f *)\"]\n  }},\n  \"approvals\": [],\n  \"hooks\": {{}}\n}}\n"
+        "{{\n  \"$schema\": \"stepper://setting.schema.json\",\n  \"step\": [],\n{default_model_line}  \"mode\": \"{mode}\",\n{limits_line}  \"providers\": {{}},\n  \"permissions\": {{\n    \"allow\": [\"Read(/**)\", \"Bash(cargo *)\"],\n    \"ask\": [\"Bash(git push:*)\"],\n    \"deny\": [\"Read(//etc/**)\", \"Bash(rm -rf *)\", \"Bash(rm -fr *)\", \"Bash(sudo *)\", \"Bash(git push --force *)\", \"Bash(git push -f *)\"]\n  }},\n  \"approvals\": [],\n  \"hooks\": {{}}\n}}\n"
     )
 }
 
@@ -307,7 +319,11 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         None => std::env::current_dir()?,
     };
     let cli_mode = resolve_mode(&global);
-    let limits = SessionLimits::new(global.max_turns, global.max_budget_usd);
+    let limits = SessionLimits::new(
+        global.max_turns,
+        global.max_budget_usd,
+        global.turn_timeout.map(std::time::Duration::from_secs),
+    );
 
     if let Some(prompt) = global.print.clone() {
         return oneshot(&global, cli_mode, cwd, prompt, limits).await;
@@ -316,7 +332,7 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
     // First-run setup runs only on the interactive path (headless returned
     // above). When it writes a config its chosen model becomes this session's
     // model too, so the orchestrator and the footer agree.
-    let onboarding_model = onboarding::maybe_first_run(&cwd, global.no_init)?;
+    let onboarding_model = onboarding::maybe_first_run(&cwd, global.no_init).await?;
     let effective_model = global.model.clone().or(onboarding_model);
     let (provider, model) = split_model(effective_model.as_deref());
 
@@ -424,6 +440,13 @@ async fn oneshot(
             AppEvent::Error(e) => {
                 eprintln!("\nerror: {e}");
                 turn_error = Some(e);
+            }
+            // A wall-clock timeout stops the turn as a silent `Cancelled`; surface
+            // it as a failure so a headless/CI caller exits non-zero, like the
+            // --max-turns / --max-budget-usd caps do.
+            AppEvent::Notice { text, .. } if text.starts_with(stepper_core::TURN_TIMEOUT_NOTICE) => {
+                eprintln!("\n{text}");
+                turn_error = Some(text);
             }
             AppEvent::TurnComplete { .. } => break,
             _ => {}
@@ -591,27 +614,44 @@ mod tests {
 
     #[test]
     fn scaffold_default_matches_plain_init_and_parses() {
-        let s = scaffold_setting_json(None, "accept-edits");
+        let s = scaffold_setting_json(None, "accept-edits", None);
         assert!(!s.contains("defaultModel"));
+        assert!(!s.contains("limits"));
         let parsed: stepper_config::SettingsFile = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.mode.as_deref(), Some("accept-edits"));
         assert!(parsed.default_model.is_none());
         assert!(parsed.step.is_empty());
+        assert!(parsed.limits.is_none());
     }
 
     #[test]
     fn scaffold_embeds_chosen_model_and_mode() {
-        let s = scaffold_setting_json(Some("anthropic/claude-opus-4-8"), "plan");
+        let s = scaffold_setting_json(Some("anthropic/claude-opus-4-8"), "plan", None);
         let parsed: stepper_config::SettingsFile = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.default_model.as_deref(), Some("anthropic/claude-opus-4-8"));
         assert_eq!(parsed.mode.as_deref(), Some("plan"));
     }
 
     #[test]
+    fn scaffold_embeds_chosen_limits() {
+        let limits = stepper_config::LimitsConfig {
+            turn_timeout_secs: Some(600),
+            max_budget_usd: Some(5.0),
+            max_turns: None,
+        };
+        let s = scaffold_setting_json(Some("anthropic/claude-opus-4-8"), "auto", Some(&limits));
+        let parsed: stepper_config::SettingsFile = serde_json::from_str(&s).unwrap();
+        let got = parsed.limits.unwrap();
+        assert_eq!(got.turn_timeout_secs, Some(600));
+        assert_eq!(got.max_budget_usd, Some(5.0));
+        assert_eq!(got.max_turns, None);
+    }
+
+    #[test]
     fn scaffold_escapes_model_so_json_stays_valid() {
         // Even a model string with a quote (rejected upstream, but the scaffold
         // must not be the thing that produces invalid JSON) round-trips safely.
-        let s = scaffold_setting_json(Some("a\"b/c"), "accept-edits");
+        let s = scaffold_setting_json(Some("a\"b/c"), "accept-edits", None);
         let parsed: stepper_config::SettingsFile = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.default_model.as_deref(), Some("a\"b/c"));
     }

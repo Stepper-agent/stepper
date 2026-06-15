@@ -408,6 +408,24 @@ async fn handle_compact(
     let _ = tx.send(AppEvent::CompactionDone { freed_tokens }).await;
 }
 
+/// Write `model` as `defaultModel` into the project `.stepper/setting.json` (if a
+/// project config dir exists), else the user's `~/.stepper/setting.json`. `Ok(true)`
+/// when written. Errors (e.g. an unparseable destination) are returned, not fatal.
+fn persist_default_model(orchestrator: &Orchestrator, model: &str) -> std::io::Result<bool> {
+    let project = orchestrator.project_root.join(".stepper");
+    let dir = if project.is_dir() {
+        project
+    } else if let Some(home) = orchestrator.home.as_ref() {
+        home.join(".stepper")
+    } else {
+        return Ok(false);
+    };
+    stepper_config::scaffold::update_settings(&dir, |obj| {
+        obj.insert("defaultModel".into(), serde_json::Value::String(model.to_string()));
+    })?;
+    Ok(true)
+}
+
 async fn handle_model(arg: &str, orchestrator: &mut Orchestrator, tx: &EventTx) {
     if arg.is_empty() {
         let current = orchestrator
@@ -432,10 +450,17 @@ async fn handle_model(arg: &str, orchestrator: &mut Orchestrator, tx: &EventTx) 
                 step.model_ref = arg.to_string();
             }
             let _ = tx.send(AppEvent::ModelChanged(view)).await;
+            // Persist as `defaultModel` so the pick survives a restart (without it,
+            // the switch evaporates and the next launch reverts to the configured/
+            // built-in default). Project `.stepper` wins, else the user's.
+            let persisted = persist_default_model(orchestrator, arg);
             notice(
                 tx,
                 NoticeLevel::Info,
-                format!("primary model switched to {arg}"),
+                match persisted {
+                    Ok(true) => format!("primary model switched to {arg} (saved as default)"),
+                    _ => format!("primary model switched to {arg}"),
+                },
             )
             .await;
         }
@@ -514,7 +539,10 @@ async fn handle_context(orchestrator: &Orchestrator, session: &SessionRecord, tx
     let info = orchestrator.resolver.model_info(&step.model_ref);
     let ads = crate::skills::advertise(&step.skills);
     let skills = estimate_str(&ads);
-    let system_prompt = estimate_str(&step.system_prompt).saturating_sub(skills);
+    // The real system message also carries the universal agentic directives that
+    // compose_system() prepends to every layer — count them so the breakdown is honest.
+    let system_prompt = (estimate_str(&step.system_prompt) + estimate_str(crate::AGENT_DIRECTIVES))
+        .saturating_sub(skills);
     let memory = estimate_str(&orchestrator.base_context);
     let registry = orchestrator
         .base_tools

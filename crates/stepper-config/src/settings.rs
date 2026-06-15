@@ -48,6 +48,35 @@ pub struct SettingsFile {
     /// body swaps into the system prompt — consumed by the orchestrator).
     #[serde(default)]
     pub output_style: Option<String>,
+    /// Optional per-turn runaway guards. All `None` (the default) means no
+    /// limit — a turn runs until the agent finishes. A matching CLI flag
+    /// (`--turn-timeout` / `--max-budget-usd` / `--max-turns`) overrides these.
+    #[serde(default)]
+    pub limits: Option<LimitsConfig>,
+}
+
+/// Per-turn safety limits. Each field is opt-in; omit it (or set `null`) for no
+/// limit on that axis. Set at first-run setup or by hand.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LimitsConfig {
+    /// Wall-clock seconds a single turn may run before it is stopped (counts time
+    /// spent waiting at an approval prompt too). `0`/absent = no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_timeout_secs: Option<u64>,
+    /// USD the session may spend before a turn is stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_budget_usd: Option<f64>,
+    /// Total ReAct steps (provider requests) a turn may take across all layers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+}
+
+impl LimitsConfig {
+    /// Whether any limit is set (so callers can skip writing an empty block).
+    pub fn is_set(&self) -> bool {
+        self.turn_timeout_secs.is_some() || self.max_budget_usd.is_some() || self.max_turns.is_some()
+    }
 }
 
 /// Context-compaction tuning. `provider` names a (typically cheap) model used to

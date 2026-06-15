@@ -106,6 +106,8 @@ pub async fn run_parallel(
                 compaction_provider: task.compaction_provider,
                 temperature: None,
                 top_p: None,
+                reasoning_effort: None,
+                thinking_budget: None,
                 worker: Some(index),
             };
             let outcome = agent.drive(task.system, task.messages).await;

@@ -117,6 +117,8 @@ fn step(cap: usize) -> StepDef {
         retries: 0,
         temperature: None,
         top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
         permission: Vec::new(),
         parallel: false,
         parallel_max: 8,
@@ -171,7 +173,7 @@ async fn max_turns_cap_aborts_a_runaway_turn() {
     let orch = orchestrator(
         resolver,
         dir.path().to_path_buf(),
-        SessionLimits::new(Some(3), None),
+        SessionLimits::new(Some(3), None, None),
     );
     let (tx, _drain) = drain_events();
 
@@ -205,7 +207,7 @@ async fn budget_cap_aborts_once_session_cost_reaches_it() {
     let orch = orchestrator(
         resolver,
         dir.path().to_path_buf(),
-        SessionLimits::new(None, Some(4.0)),
+        SessionLimits::new(None, Some(4.0), None),
     );
     let (tx, _drain) = drain_events();
 
@@ -236,7 +238,7 @@ async fn budget_accumulates_across_turns_in_one_session() {
         usage_input: 1_000_000,
         input_per_mtok: 3.0,
     });
-    let limits = SessionLimits::new(None, Some(5.0));
+    let limits = SessionLimits::new(None, Some(5.0), None);
     let orch = orchestrator(resolver, dir.path().to_path_buf(), limits);
     let (tx, _drain) = drain_events();
 
@@ -274,7 +276,7 @@ async fn caps_leave_a_turn_within_limits_untouched() {
     let orch = orchestrator(
         resolver,
         dir.path().to_path_buf(),
-        SessionLimits::new(Some(10), Some(50.0)),
+        SessionLimits::new(Some(10), Some(50.0), None),
     );
     let (tx, _drain) = drain_events();
 
@@ -302,7 +304,7 @@ async fn cap_error_surfaces_as_an_error_event_through_spawn_core() {
     let orch = orchestrator(
         resolver,
         dir.path().to_path_buf(),
-        SessionLimits::new(Some(2), None),
+        SessionLimits::new(Some(2), None, None),
     );
     let (action_tx, action_rx) = mpsc::channel(16);
     let cancel = CancellationToken::new();
@@ -325,5 +327,99 @@ async fn cap_error_surfaces_as_an_error_event_through_spawn_core() {
         }
     }
     assert!(saw_cap_error, "the cap abort must surface as an Error event");
+    let _ = action_tx.send(Action::Quit).await;
+}
+
+/// A provider that sleeps before every reply (and always asks for another tool),
+/// so only the wall-clock turn timeout can stop it. It wakes immediately on
+/// cancel so the timeout cuts the turn short rather than waiting out the sleep.
+struct SlowProvider {
+    sleep: std::time::Duration,
+}
+
+#[async_trait]
+impl LlmProvider for SlowProvider {
+    fn provider(&self) -> &str {
+        "fake"
+    }
+    fn model(&self) -> &str {
+        "fake-m"
+    }
+    async fn chat_stream(
+        &self,
+        _request: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<ChatStream, ProviderError> {
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            _ = tokio::time::sleep(self.sleep) => {}
+        }
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(ChatEvent::ToolCallCompleted {
+                index: 0,
+                id: "c".into(),
+                name: "list_dir".into(),
+                input: serde_json::json!({ "path": "." }),
+            }),
+            Ok(ChatEvent::Done(StopReason::ToolUse)),
+        ])))
+    }
+}
+
+struct SlowResolver {
+    sleep: std::time::Duration,
+}
+
+impl ProviderResolver for SlowResolver {
+    fn resolve(&self, _model_ref: &str) -> Result<Box<dyn LlmProvider>, CoreError> {
+        Ok(Box::new(SlowProvider { sleep: self.sleep }))
+    }
+    fn model_info(&self, _model_ref: &str) -> ModelInfo {
+        ModelInfo {
+            context_window: 200_000,
+            max_output_tokens: 0,
+            input_per_mtok: 0.0,
+            output_per_mtok: 0.0,
+            cache_read_per_mtok: 0.0,
+            cache_write_per_mtok: 0.0,
+            estimated: false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn turn_timeout_stops_a_runaway_turn() {
+    use stepper_core::{spawn_core, SessionRecord};
+    use stepper_protocol::{Action, AppEvent};
+
+    let dir = tempfile::tempdir().unwrap();
+    let resolver = Arc::new(SlowResolver {
+        sleep: std::time::Duration::from_millis(400),
+    });
+    let orch = orchestrator(
+        resolver,
+        dir.path().to_path_buf(),
+        SessionLimits::new(None, None, Some(std::time::Duration::from_millis(40))),
+    );
+    let (action_tx, action_rx) = mpsc::channel(16);
+    let cancel = CancellationToken::new();
+    let mut event_rx = spawn_core(orch, SessionRecord::fresh(), action_rx, cancel);
+
+    action_tx.send(Action::SubmitInput("go".into())).await.unwrap();
+
+    let mut saw_timeout_notice = false;
+    let mut saw_error = false;
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            AppEvent::Notice { text, .. } if text.contains("turn time limit reached") => {
+                saw_timeout_notice = true;
+            }
+            AppEvent::Error(_) => saw_error = true,
+            AppEvent::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(saw_timeout_notice, "the wall-clock timeout must surface as a notice");
+    assert!(!saw_error, "a timeout ends the turn cleanly (cancelled), not an error");
     let _ = action_tx.send(Action::Quit).await;
 }

@@ -111,6 +111,8 @@ async fn react_loop_runs_a_tool_then_finishes() {
         compaction_provider: None,
         temperature: None,
         top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
         worker: None,
     };
 

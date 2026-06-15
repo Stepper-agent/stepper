@@ -20,7 +20,7 @@ pub use auth::{
 };
 pub use codex::{CodexTokenStore, CODEX_BASE_URL};
 pub use factory::{ProviderFactory, ProviderKind, ProviderSpec};
-pub use models::{list_models, Catalog, CatalogMeta, ModelEntry};
+pub use models::{fetch_catalog, list_models, onboarding_models, Catalog, CatalogMeta, ModelEntry};
 pub use openai_compat::OpenAiCompatAdapter;
 pub use responses::OpenAiResponsesAdapter;
 

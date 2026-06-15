@@ -194,6 +194,8 @@ fn step(name: &str, model_ref: &str, parallel: bool) -> StepDef {
         retries: 0,
         temperature: None,
         top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
         permission: Vec::new(),
         parallel,
         parallel_max: 8,

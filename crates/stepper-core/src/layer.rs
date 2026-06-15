@@ -40,6 +40,11 @@ pub struct StepDef {
     /// Sampling overrides forwarded to the provider (None = provider default).
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    /// Reasoning overrides forwarded to the provider: OpenAI-family
+    /// `reasoning_effort` and Anthropic extended-thinking `thinking_budget`
+    /// (None = off / provider default).
+    pub reasoning_effort: Option<String>,
+    pub thinking_budget: Option<u32>,
     /// Per-layer permission overrides `(rule, decision)` from frontmatter
     /// `permission:` — merged onto the base rules (tighten-only).
     pub permission: Vec<(String, String)>,

@@ -16,21 +16,35 @@ use stepper_protocol::{AppEvent, EventTx, LayerStatus, ModelView};
 use stepper_tools::{Approver, ToolCx, ToolRegistry};
 use tokio_util::sync::CancellationToken;
 
-/// Session-wide safety caps (`--max-turns`, `--max-budget-usd`). The step cap is
-/// per user turn (reset each `run_turn`); the budget covers the accumulated cost
-/// of the whole session, tracked in `spent_microusd` across turns.
+/// Session-wide safety caps (`--max-turns`, `--max-budget-usd`, `--turn-timeout`,
+/// or their `setting.json` `limits` equivalents). The step cap and the wall-clock
+/// timeout are per user turn (reset each `run_turn`); the budget covers the
+/// accumulated cost of the whole session, tracked in `spent_microusd` across
+/// turns. All `None` means no limit. The wall-clock timeout is enforced by the
+/// turn driver (`run_watched`), not by `TurnBudget` (which gates per-step caps).
 #[derive(Clone, Default)]
 pub struct SessionLimits {
     pub max_turns: Option<u32>,
     pub max_budget_usd: Option<f64>,
+    pub turn_timeout: Option<std::time::Duration>,
     pub spent_microusd: Arc<AtomicU64>,
 }
 
 impl SessionLimits {
-    pub fn new(max_turns: Option<u32>, max_budget_usd: Option<f64>) -> Self {
+    pub fn new(
+        max_turns: Option<u32>,
+        max_budget_usd: Option<f64>,
+        turn_timeout: Option<std::time::Duration>,
+    ) -> Self {
+        // Normalize a zero/negative on any axis to "no limit" (single chokepoint
+        // for every intake — CLI flag, setting.json, onboarding). Otherwise a
+        // `--turn-timeout 0` / `turnTimeoutSecs: 0` would sleep for `Duration::ZERO`
+        // and abort every turn instantly, and `maxBudgetUsd: 0` / `maxTurns: 0`
+        // would trip on the first step.
         SessionLimits {
-            max_turns,
-            max_budget_usd,
+            max_turns: max_turns.filter(|&n| n > 0),
+            max_budget_usd: max_budget_usd.filter(|&b| b > 0.0),
+            turn_timeout: turn_timeout.filter(|d| !d.is_zero()),
             spent_microusd: Arc::default(),
         }
     }
@@ -364,7 +378,10 @@ impl Orchestrator {
                     cancel: cancel.clone(),
                     compaction_provider: compaction_provider.clone(),
                     concurrency: 8,
-                    step_cap: 16,
+                    // Inherit the calling layer's step budget so a delegated
+                    // subtask isn't starved at a hardcoded 16 while the main loop
+                    // gets the full cap.
+                    step_cap: step.step_cap,
                 });
                 tools.register(Arc::new(crate::dispatch::DispatchTool::new(dispatcher)));
             }
@@ -408,6 +425,8 @@ impl Orchestrator {
                     compaction_provider: compaction_provider.clone(),
                     temperature: step.temperature,
                     top_p: step.top_p,
+                    reasoning_effort: step.reasoning_effort.clone(),
+                    thinking_budget: step.thinking_budget,
                     worker: None,
                 };
                 match agent.drive(system.clone(), initial.clone()).await {
@@ -497,6 +516,8 @@ impl Orchestrator {
                             compaction_provider: compaction_provider.clone(),
                             temperature: step.temperature,
                             top_p: step.top_p,
+                            reasoning_effort: step.reasoning_effort.clone(),
+                            thinking_budget: step.thinking_budget,
                             worker: None,
                         };
                         match agent.drive(system.clone(), initial.clone()).await {
@@ -694,11 +715,7 @@ impl Orchestrator {
     }
 
     fn system_for(&self, step: &StepDef) -> String {
-        if self.base_context.trim().is_empty() {
-            step.system_prompt.clone()
-        } else {
-            format!("{}\n\n{}", self.base_context, step.system_prompt)
-        }
+        crate::setup::compose_system(&self.base_context, &step.system_prompt)
     }
 }
 

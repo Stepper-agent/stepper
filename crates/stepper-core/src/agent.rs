@@ -44,6 +44,10 @@ pub struct AgentLoop<'a> {
     /// Sampling overrides forwarded to the provider (None = provider default).
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    /// Reasoning overrides: OpenAI-family `reasoning_effort` and Anthropic
+    /// extended-thinking budget (None = off / provider default).
+    pub reasoning_effort: Option<String>,
+    pub thinking_budget: Option<u32>,
     /// When `Some(i)`, this loop is fan-out worker `i`: its token/tool/usage
     /// progress is emitted as per-worker `WorkerActivity` (so the TUI can show it
     /// in the worker panel) instead of the global stream, which would otherwise
@@ -73,6 +77,14 @@ impl AgentLoop<'_> {
         let mut last_context = 0u64;
         let mut accounted = 0usize;
         let mut captured_tasks: Vec<SubTask> = Vec::new();
+        // One bounded "you described an action but didn't take it — keep going"
+        // nudge per turn: the code-level backstop to the AGENT_DIRECTIVES prompt
+        // for weak models that narrate then stop without calling the tool.
+        let mut nudged = false;
+        // Bounded continuations when the output is truncated at the token cap, so a
+        // cut-off mid-sentence reply isn't mistaken for a finished turn.
+        let mut continuations = 0u32;
+        const MAX_CONTINUATIONS: u32 = 3;
         let mut produced: Vec<Message> = Vec::new();
 
         for _step in 0..self.step_cap.max(1) {
@@ -123,8 +135,10 @@ impl AgentLoop<'_> {
                 temperature: self.temperature,
                 top_p: self.top_p,
                 stop: Vec::new(),
-                thinking: None,
-                reasoning_effort: None,
+                thinking: self
+                    .thinking_budget
+                    .map(|budget_tokens| stepper_provider::ThinkingConfig { budget_tokens }),
+                reasoning_effort: self.reasoning_effort.clone(),
                 // The per-layer system + tools prefix is stable across every ReAct
                 // step, so cache it (Anthropic; no-op for the other dialects).
                 cache: true,
@@ -156,6 +170,35 @@ impl AgentLoop<'_> {
             }
 
             if tool_calls.is_empty() {
+                // Truncated at the output cap → not a completion. Ask it to resume
+                // from where it was cut off (bounded so a model that always maxes
+                // out can't loop forever; the step cap is the final backstop).
+                if matches!(response.stop_reason, StopReason::MaxTokens)
+                    && continuations < MAX_CONTINUATIONS
+                {
+                    continuations += 1;
+                    let cont = Message::user(
+                        "Your previous message was cut off at the output limit. \
+                         Continue exactly where you left off — do not repeat what you already wrote.",
+                    );
+                    messages.push(cont.clone());
+                    produced.push(cont);
+                    continue;
+                }
+                // Narrate-then-stop backstop: if the model ended its turn while
+                // its text still reads like an unfulfilled intent (or is empty),
+                // nudge it once to actually act rather than returning a non-answer.
+                if !nudged && looks_unfinished(&response.text()) {
+                    nudged = true;
+                    let nudge = Message::user(
+                        "You described what to do next but did not do it, or returned nothing. \
+                         Continue now: use the tools to actually carry out the step. \
+                         Only stop once the task is truly complete.",
+                    );
+                    messages.push(nudge.clone());
+                    produced.push(nudge);
+                    continue;
+                }
                 return Ok(LayerOutcome {
                     summary: response.text(),
                     usage: total,
@@ -466,6 +509,30 @@ const MAX_REQUEST_RETRIES: u32 = 3;
 
 /// Exponential backoff with jitter: 500ms doubling per retry, plus up to +50%
 /// derived from the clock (no rng dependency).
+/// Whether an assistant turn that ended with no tool call still reads like an
+/// unfulfilled intent (or is empty) — the trigger for the one-shot continue
+/// nudge. The cue set is deliberately specific (imminent-action phrases, not
+/// generic sign-offs like "let me know"), so a false positive — costing one
+/// extra request — is rare; the single-nudge-per-turn bound caps it regardless.
+fn looks_unfinished(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    if lower.ends_with(':') {
+        return true;
+    }
+    const CUES: &[&str] = &[
+        "let me create", "let me write", "let me add", "let me implement",
+        "let me update", "let me start", "let me build", "let me make", "let me fix",
+        "i'll create", "i'll write", "i'll add", "i'll implement", "i'll update",
+        "i'll start", "i'll make", "i'll fix", "now i'll", "next i'll", "let's create",
+        "이제 ", "만들겠", "작성하겠", "구현하겠", "수정하겠", "진행하겠", "추가하겠", "고치겠",
+    ];
+    CUES.iter().any(|c| lower.contains(c))
+}
+
 fn retry_backoff(attempt: u32) -> std::time::Duration {
     let base_ms = 500u64 << attempt.saturating_sub(1).min(4);
     let jitter_ms = std::time::SystemTime::now()
@@ -494,5 +561,25 @@ fn summarize(name: &str, input: &Value) -> String {
     match arg {
         Some(a) => format!("{name}: {a}"),
         None => name.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_unfinished;
+
+    #[test]
+    fn looks_unfinished_flags_intent_and_empty_not_completions() {
+        // Empty / colon-ended / imminent-action cues → nudge.
+        assert!(looks_unfinished(""));
+        assert!(looks_unfinished("   "));
+        assert!(looks_unfinished("Here is the plan:"));
+        assert!(looks_unfinished("Now let me create the file with the layout."));
+        assert!(looks_unfinished("좋습니다. 이제 페이지를 만들겠습니다."));
+        assert!(looks_unfinished("I'll write the component now."));
+        // Genuine completions / generic sign-offs → no nudge.
+        assert!(!looks_unfinished("Done — I added the route and the test passes."));
+        assert!(!looks_unfinished("The page is built. Let me know if you want changes."));
+        assert!(!looks_unfinished("작업을 완료했습니다."));
     }
 }

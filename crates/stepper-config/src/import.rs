@@ -959,7 +959,10 @@ fn tilde(path: &Path, home: &Path) -> String {
 /// confirmation, and the `/import` notice).
 pub fn render_preview(plan: &ImportPlan) -> String {
     let mut out = String::new();
-    out.push_str(&format!("stepper import → {}\n", tilde(&plan.target_dir, &plan.home)));
+    out.push_str(&format!(
+        "stepper import → {} (global config, shared by every project — not this folder)\n",
+        tilde(&plan.target_dir, &plan.home)
+    ));
 
     if plan.sources.is_empty() {
         out.push_str("\nNo Claude or Codex config detected (~/.claude, ~/.codex).\n");

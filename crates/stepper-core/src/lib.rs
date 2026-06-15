@@ -39,7 +39,7 @@ pub use orchestrator::{Orchestrator, SessionLimits, TurnOutput};
 pub use ports::ProviderResolver;
 pub use resolver::ConfigProviderResolver;
 pub use session::{SessionRecord, SessionStore, TurnRecord};
-pub use setup::{build_steps, load_base_context, DEFAULT_SYSTEM_PROMPT};
+pub use setup::{build_steps, compose_system, load_base_context, AGENT_DIRECTIVES, DEFAULT_SYSTEM_PROMPT};
 pub use tasks::AssignTasksTool;
 
 use std::sync::Arc;
@@ -113,6 +113,7 @@ pub fn spawn_core(
                     let turn_cancel = cancel.child_token();
                     let mut result = None;
                     let mut deferred = Vec::new();
+                    let turn_timeout = orchestrator.limits.turn_timeout;
                     let control = run_watched(
                         async {
                             result = Some(
@@ -124,6 +125,8 @@ pub fn spawn_core(
                         &turn_cancel,
                         &mut action_rx,
                         &mut deferred,
+                        turn_timeout,
+                        &tx,
                     )
                     .await;
                     match result {
@@ -242,6 +245,7 @@ pub fn spawn_core(
                             let turn_cancel = cancel.child_token();
                             let mut result = None;
                             let mut deferred = Vec::new();
+                            let turn_timeout = orchestrator.limits.turn_timeout;
                             let control = run_watched(
                                 async {
                                     result = Some(
@@ -253,6 +257,8 @@ pub fn spawn_core(
                                 &turn_cancel,
                                 &mut action_rx,
                                 &mut deferred,
+                                turn_timeout,
+                                &tx,
                             )
                             .await;
                             if let Some(Ok(output)) = result {
@@ -329,6 +335,9 @@ pub fn spawn_core(
                         &turn_cancel,
                         &mut action_rx,
                         &mut deferred,
+                        // Interactive `!cmd` is not an agent turn — no time limit.
+                        None,
+                        &tx,
                     )
                     .await;
                     let _ = tx.send(AppEvent::TurnComplete { turn_id }).await;
@@ -379,6 +388,11 @@ enum Control {
     Quit,
 }
 
+/// Notice text prefix emitted when a turn is stopped by its wall-clock timeout.
+/// Shared so a headless (`-p`) caller can recognize the timeout and exit non-zero
+/// (the turn itself unwinds as a silent `Cancelled`, like an `Esc`).
+pub const TURN_TIMEOUT_NOTICE: &str = "stopped: turn time limit reached";
+
 /// Drive `work` (a running turn) to completion while concurrently watching the
 /// action channel, so a mid-turn `Interrupt` can cancel it. Without this, the
 /// action loop is blocked awaiting the turn and `Esc` would sit unread until the
@@ -395,11 +409,36 @@ async fn run_watched(
     turn_cancel: &CancellationToken,
     action_rx: &mut ActionRx,
     deferred: &mut Vec<Action>,
+    timeout: Option<std::time::Duration>,
+    tx: &mpsc::Sender<AppEvent>,
 ) -> Control {
     tokio::pin!(work);
+    // A `None` timeout never fires (pends forever); a `Some` one fires once and
+    // cancels the turn, which then unwinds via `CoreError::Cancelled`.
+    let timer = async {
+        match timeout {
+            Some(d) => tokio::time::sleep(d).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(timer);
+    let mut timed_out = false;
     loop {
         tokio::select! {
             _ = &mut work => return Control::Continue,
+            _ = &mut timer, if !timed_out => {
+                timed_out = true;
+                let _ = tx
+                    .send(AppEvent::Notice {
+                        level: NoticeLevel::Warn,
+                        text: format!(
+                            "{TURN_TIMEOUT_NOTICE} ({})",
+                            fmt_secs(timeout.unwrap_or_default().as_secs())
+                        ),
+                    })
+                    .await;
+                turn_cancel.cancel();
+            }
             action = action_rx.recv() => match action {
                 Some(Action::Interrupt) | None => turn_cancel.cancel(),
                 Some(Action::Quit) => {
@@ -409,6 +448,15 @@ async fn run_watched(
                 Some(other) => deferred.push(other),
             }
         }
+    }
+}
+
+/// Render a whole-second duration as `Nm Ns` / `Nm` / `Ns` for a notice.
+fn fmt_secs(secs: u64) -> String {
+    match (secs / 60, secs % 60) {
+        (0, s) => format!("{s}s"),
+        (m, 0) => format!("{m}m"),
+        (m, s) => format!("{m}m {s}s"),
     }
 }
 
