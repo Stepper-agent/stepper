@@ -473,6 +473,37 @@ fn render_live(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         return;
     }
     let mut lines: Vec<Line> = Vec::new();
+    // The plan/todo list (if any) sits at the top so multi-step progress is
+    // legible — the model's `todo_write` updates were stored but never drawn.
+    if !state.todos.is_empty() {
+        use stepper_protocol::TodoStatus;
+        lines.push(Line::from(Span::styled(
+            "plan",
+            Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
+        )));
+        for todo in &state.todos {
+            let (mark, style) = match todo.status {
+                TodoStatus::Completed => ("☑", Style::default().fg(theme.muted).add_modifier(Modifier::CROSSED_OUT)),
+                TodoStatus::InProgress => ("▶", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                TodoStatus::Pending => ("☐", Style::default().fg(theme.muted)),
+            };
+            lines.push(Line::from(Span::styled(format!("  {mark} {}", todo.content), style)));
+        }
+        lines.push(Line::from(""));
+    }
+    // Reasoning models stream their thinking before the answer — show it dimmed
+    // so the agent isn't a frozen spinner during a long reason. (The data was
+    // already accumulated into live.reasoning; only this draw was missing.)
+    if !state.live.reasoning.is_empty() {
+        let dim = Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC);
+        lines.push(Line::from(Span::styled("thinking…", dim)));
+        for rline in state.live.reasoning.lines() {
+            lines.push(Line::from(Span::styled(rline.to_string(), dim)));
+        }
+        if !state.tool_lines.is_empty() || !state.live.assistant.is_empty() {
+            lines.push(Line::from(""));
+        }
+    }
     for tl in &state.tool_lines {
         lines.push(Line::from(Span::styled(
             tl.clone(),
@@ -659,12 +690,30 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
 
 fn render_approval(frame: &mut Frame, area: Rect, req: &ApprovalRequest, theme: &Theme) {
     let mut lines: Vec<Line> = Vec::new();
+    // Compute the diff up front so the title can carry +/- counts (a file edit is
+    // the trust surface — the user should see the size of the change at a glance).
+    let file_diff = match &req.kind {
+        ApprovalKind::FileEdit(diff) => Some((diff, similar::TextDiff::from_lines(diff.old.as_str(), diff.new.as_str()))),
+        _ => None,
+    };
     let title = match &req.kind {
         ApprovalKind::Command { cmd, outside_project } => format!(
             "run command{}: {cmd}",
             if *outside_project { " (outside project)" } else { "" }
         ),
-        ApprovalKind::FileEdit(diff) => format!("edit {}", diff.path.display()),
+        ApprovalKind::FileEdit(diff) => {
+            let (mut adds, mut dels) = (0usize, 0usize);
+            if let Some((_, td)) = &file_diff {
+                for c in td.iter_all_changes() {
+                    match c.tag() {
+                        similar::ChangeTag::Insert => adds += 1,
+                        similar::ChangeTag::Delete => dels += 1,
+                        similar::ChangeTag::Equal => {}
+                    }
+                }
+            }
+            format!("edit {}  (+{adds} -{dels})", diff.path.display())
+        }
         ApprovalKind::OutsideProject { path, action } => {
             format!("{action} outside project: {}", path.display())
         }
@@ -675,19 +724,48 @@ fn render_approval(frame: &mut Frame, area: Rect, req: &ApprovalRequest, theme: 
         Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
     )));
 
-    if let ApprovalKind::FileEdit(diff) = &req.kind {
-        let td = similar::TextDiff::from_lines(diff.old.as_str(), diff.new.as_str());
-        for change in td.iter_all_changes() {
-            let (sign, color) = match change.tag() {
-                similar::ChangeTag::Delete => ('-', theme.diff_removed),
-                similar::ChangeTag::Insert => ('+', theme.diff_added),
-                similar::ChangeTag::Equal => (' ', theme.muted),
-            };
-            let body = change.value().trim_end_matches('\n').to_string();
-            lines.push(Line::from(Span::styled(
-                format!("{sign}{body}"),
-                Style::default().fg(color),
-            )));
+    // Where the first changed line lands, so the view scrolls to the change
+    // instead of the (usually unchanged) bottom of a big file.
+    let mut first_change: Option<usize> = None;
+    if let Some((_, td)) = &file_diff {
+        let changes: Vec<_> = td.iter_all_changes().collect();
+        // Keep an unchanged line only within CONTEXT lines of a real change;
+        // collapse longer runs into a "⋯ N unchanged" marker.
+        const CONTEXT: usize = 3;
+        let mut keep = vec![false; changes.len()];
+        for (i, c) in changes.iter().enumerate() {
+            if c.tag() != similar::ChangeTag::Equal {
+                let lo = i.saturating_sub(CONTEXT);
+                let hi = (i + CONTEXT).min(changes.len() - 1);
+                keep[lo..=hi].iter_mut().for_each(|k| *k = true);
+            }
+        }
+        let mut i = 0;
+        while i < changes.len() {
+            if keep[i] {
+                let c = &changes[i];
+                let (sign, color) = match c.tag() {
+                    similar::ChangeTag::Delete => ('-', theme.diff_removed),
+                    similar::ChangeTag::Insert => ('+', theme.diff_added),
+                    similar::ChangeTag::Equal => (' ', theme.muted),
+                };
+                if c.tag() != similar::ChangeTag::Equal && first_change.is_none() {
+                    first_change = Some(lines.len());
+                }
+                let body = c.value().trim_end_matches('\n').to_string();
+                lines.push(Line::from(Span::styled(format!("{sign}{body}"), Style::default().fg(color))));
+                i += 1;
+            } else {
+                let start = i;
+                while i < changes.len() && !keep[i] {
+                    i += 1;
+                }
+                let n = i - start;
+                lines.push(Line::from(Span::styled(
+                    format!("  ⋯ {n} unchanged line{}", if n == 1 { "" } else { "s" }),
+                    Style::default().fg(theme.muted),
+                )));
+            }
         }
     }
 
@@ -703,7 +781,12 @@ fn render_approval(frame: &mut Frame, area: Rect, req: &ApprovalRequest, theme: 
         .title(" approval ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let scroll = (lines.len() as u16).saturating_sub(inner.height.max(1));
+    // Scroll so the first change is near the top (one line of headroom); else
+    // pin to the bottom as before (small command/mcp prompts).
+    let scroll = match first_change {
+        Some(line) => (line.saturating_sub(1) as u16).min((lines.len() as u16).saturating_sub(inner.height.max(1))),
+        None => (lines.len() as u16).saturating_sub(inner.height.max(1)),
+    };
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })

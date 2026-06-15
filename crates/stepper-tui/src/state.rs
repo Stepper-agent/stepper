@@ -883,6 +883,15 @@ impl AppState {
         if !self.tool_lines.is_empty() {
             md.push('\n');
         }
+        // Preserve the thinking as a dimmed blockquote ahead of the answer.
+        if !self.live.reasoning.is_empty() {
+            for line in self.live.reasoning.lines() {
+                md.push_str("> ");
+                md.push_str(line);
+                md.push('\n');
+            }
+            md.push('\n');
+        }
         md.push_str(&self.live.assistant);
         effects.push(Effect::CommitToScrollback(md));
         self.live.clear();
