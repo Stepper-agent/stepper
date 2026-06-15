@@ -8,6 +8,7 @@
 pub mod discovery;
 pub mod error;
 pub mod frontmatter;
+pub mod import;
 pub mod imports;
 pub mod model;
 pub mod scaffold;
@@ -17,6 +18,7 @@ pub mod substitution;
 
 pub use discovery::{discover, Discovery};
 pub use error::ConfigError;
+pub use import::{apply_plan, build_plan, render_preview, ImportFrom, ImportPlan, ImportSummary};
 pub use frontmatter::{
     parse_command, parse_layer, parse_output_style, parse_skill, CommandDef, LayerDef,
     LayerFrontmatter, McpAllow, OutputStyleDef, SkillDef, ToolFilter,

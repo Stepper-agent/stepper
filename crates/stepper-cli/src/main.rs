@@ -31,7 +31,59 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Layer { name }) => scaffold_layer_cmd(&name, cli.global),
         Some(Command::Cmd { name }) => scaffold_command_cmd(&name, cli.global),
         Some(Command::ScaffoldLayer) => scaffold_pipeline_cmd(cli.global),
+        Some(Command::Import(args)) => import_cmd(args),
     }
+}
+
+/// `stepper import`: detect a Claude/Codex global config and migrate the
+/// portable parts into `~/.stepper/`. Prints the plan, then applies it —
+/// `--dry-run` stops after the preview, `--yes` skips the confirmation, and
+/// otherwise a `y/N` prompt gates the write.
+fn import_cmd(args: cli::ImportArgs) -> anyhow::Result<()> {
+    let from = match args.resolved_source() {
+        cli::ImportSourceArg::Claude => stepper_config::ImportFrom::Claude,
+        cli::ImportSourceArg::Codex => stepper_config::ImportFrom::Codex,
+        cli::ImportSourceArg::All => stepper_config::ImportFrom::All,
+    };
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set — cannot locate ~/.stepper"))?;
+
+    let plan = stepper_config::build_plan(&home, from)?;
+    print!("{}", stepper_config::render_preview(&plan));
+
+    if plan.is_empty() {
+        return Ok(());
+    }
+    if args.dry_run {
+        println!("\n(dry run — nothing was written)");
+        return Ok(());
+    }
+    if !args.yes && !confirm("\nApply this migration? [y/N] ")? {
+        println!("aborted — nothing was written");
+        return Ok(());
+    }
+
+    let summary = stepper_config::apply_plan(&plan)?;
+    println!(
+        "imported: {} stepper.md section(s), {} setting.json, {} file(s) copied",
+        summary.sections_appended,
+        if summary.settings_written { "wrote" } else { "no change to" },
+        summary.files_copied,
+    );
+    Ok(())
+}
+
+/// Prompt on stderr and read a `y/yes` answer from stdin. A non-interactive
+/// stdin (EOF) reads as "no", so a piped run never silently writes.
+fn confirm(prompt: &str) -> anyhow::Result<bool> {
+    eprint!("{prompt}");
+    std::io::stderr().flush().ok();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer)? == 0 {
+        return Ok(false);
+    }
+    Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
 fn global_cwd(global: &GlobalArgs) -> anyhow::Result<std::path::PathBuf> {

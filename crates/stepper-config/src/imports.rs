@@ -56,6 +56,37 @@ fn resolve(
     out
 }
 
+/// Rewrite every relative `@import` directive so it still resolves after the
+/// importing document is relocated to `new_base_dir`: a relative `@path` (one
+/// that resolved against `orig_dir`) is replaced with its absolute form, while
+/// `~/`-prefixed and already-absolute directives are kept verbatim (they resolve
+/// the same from anywhere). Used by `stepper import` when a `CLAUDE.md` whose
+/// `@path`s point into `~/.claude/` is migrated into `~/.stepper/stepper.md`.
+pub fn relocate_imports(content: &str, orig_dir: &Path, home: Option<&Path>) -> String {
+    let mut out = String::new();
+    for line in content.lines() {
+        match import_target(line) {
+            Some(target) if !is_anchored(target, home) => {
+                let abs = resolve_path(target, orig_dir, home);
+                out.push('@');
+                out.push_str(&abs.to_string_lossy());
+                out.push('\n');
+            }
+            _ => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// A directive target that resolves the same from any base dir: `~/…` (when a
+/// home is known) or an absolute path.
+fn is_anchored(target: &str, home: Option<&Path>) -> bool {
+    (home.is_some() && target.starts_with("~/")) || Path::new(target).is_absolute()
+}
+
 /// The import path if `line` is purely an `@<path>` directive (no surrounding
 /// text, no whitespace in the path), else `None`.
 fn import_target(line: &str) -> Option<&str> {
@@ -123,5 +154,24 @@ mod tests {
         let out = resolve_imports("email me @ a@b.com\n@path with space\n", Path::new("/tmp"), None);
         assert!(out.contains("a@b.com"));
         assert!(out.contains("@path with space"));
+    }
+
+    #[test]
+    fn relocate_rewrites_relative_keeps_anchored() {
+        let home = Path::new("/home/u");
+        let orig = home.join(".claude");
+        let out = relocate_imports(
+            "intro\n@convention/index.md\n@~/personal/x.md\n@/abs/y.md\nbody @inline\n",
+            &orig,
+            Some(home),
+        );
+        // relative → absolute against the original dir
+        assert!(out.contains("@/home/u/.claude/convention/index.md"), "{out}");
+        // `~/` and absolute directives are kept verbatim
+        assert!(out.contains("@~/personal/x.md"), "{out}");
+        assert!(out.contains("@/abs/y.md"), "{out}");
+        // non-directive lines untouched
+        assert!(out.contains("body @inline"));
+        assert!(!out.contains("@convention/index.md"), "relative rewritten: {out}");
     }
 }

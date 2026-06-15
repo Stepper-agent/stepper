@@ -30,6 +30,7 @@ pub fn names() -> Vec<String> {
         "scaffold-layer",
         "layer",
         "command",
+        "import",
         "login",
         "model",
         "models",
@@ -119,6 +120,10 @@ pub async fn handle(
             handle_new_command(args.trim(), &orchestrator.project_root, tx).await;
             true
         }
+        "import" => {
+            handle_import(args.trim(), orchestrator.home.as_deref(), tx).await;
+            true
+        }
         "login" => {
             handle_login(args.trim(), orchestrator, tx).await;
             true
@@ -148,7 +153,7 @@ pub async fn handle(
 }
 
 fn help_text() -> String {
-    "commands: /help · /clear (reset conversation) · /compact [instructions] (compact the conversation now) · /context (window breakdown) · /cost (session usage & USD) · /init (create the .stepper/ skeleton) · /scaffold-layer (write a default plan→implement→review pipeline) · /layer <name> (new layer) · /command <name> (new slash command) · /login [provider] (set an API key) · /model [provider/model] (show or switch) · /models (pick from fetched models) · /permissions (rules & approvals) · /resume (pick a session) · /rewind (pick a checkpoint, also Esc-Esc) · plus any .stepper/commands/*.md".into()
+    "commands: /help · /clear (reset conversation) · /compact [instructions] (compact the conversation now) · /context (window breakdown) · /cost (session usage & USD) · /init (create the .stepper/ skeleton) · /scaffold-layer (write a default plan→implement→review pipeline) · /layer <name> (new layer) · /command <name> (new slash command) · /import [claude|codex|all] [apply] (migrate another agent's config) · /login [provider] (set an API key) · /model [provider/model] (show or switch) · /models (pick from fetched models) · /permissions (rules & approvals) · /resume (pick a session) · /rewind (pick a checkpoint, also Esc-Esc) · plus any .stepper/commands/*.md".into()
 }
 
 /// `/init` — ensure the `.stepper/` directory skeleton exists.
@@ -248,6 +253,75 @@ async fn handle_new_command(name: &str, project_root: &Path, tx: &EventTx) {
             notice(tx, NoticeLevel::Warn, format!("commands/{name}.md already exists")).await
         }
         Err(e) => notice(tx, NoticeLevel::Warn, format!("creating command failed: {e}")).await,
+    }
+}
+
+/// `/import [claude|codex|all] [apply]` — preview (default) or apply a migration
+/// of another agent's global config into `~/.stepper/`. Without `apply` it only
+/// shows the plan; `/import apply` commits it. The migration is non-destructive
+/// and idempotent, so previewing then applying is safe.
+async fn handle_import(args: &str, home: Option<&Path>, tx: &EventTx) {
+    let Some(home) = home else {
+        notice(tx, NoticeLevel::Warn, "cannot locate your home directory — set HOME".into()).await;
+        return;
+    };
+    let mut from = stepper_config::ImportFrom::All;
+    let mut apply = false;
+    for token in args.split_whitespace() {
+        match token.to_ascii_lowercase().as_str() {
+            "apply" => apply = true,
+            "claude" => from = stepper_config::ImportFrom::Claude,
+            "codex" => from = stepper_config::ImportFrom::Codex,
+            "all" => from = stepper_config::ImportFrom::All,
+            _ => {
+                notice(
+                    tx,
+                    NoticeLevel::Warn,
+                    format!("usage: /import [claude|codex|all] [apply] (got '{token}')"),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+    let plan = match stepper_config::build_plan(home, from) {
+        Ok(plan) => plan,
+        Err(e) => {
+            notice(tx, NoticeLevel::Warn, format!("import failed: {e}")).await;
+            return;
+        }
+    };
+    let preview = stepper_config::render_preview(&plan);
+    if !apply || plan.is_empty() {
+        let hint = if plan.is_empty() {
+            String::new()
+        } else {
+            // Echo the previewed source so following the hint applies the same scope.
+            let apply_cmd = match from {
+                stepper_config::ImportFrom::Claude => "/import claude apply",
+                stepper_config::ImportFrom::Codex => "/import codex apply",
+                stepper_config::ImportFrom::All => "/import apply",
+            };
+            format!("\nrun `{apply_cmd}` to write it now (no further prompt; the migration is non-destructive)")
+        };
+        notice(tx, NoticeLevel::Info, format!("{preview}{hint}")).await;
+        return;
+    }
+    match stepper_config::apply_plan(&plan) {
+        Ok(summary) => {
+            notice(
+                tx,
+                NoticeLevel::Info,
+                format!(
+                    "{preview}\nimported: {} stepper.md section(s), {} setting.json, {} file(s) — restart to pick up changes",
+                    summary.sections_appended,
+                    if summary.settings_written { "wrote" } else { "no change to" },
+                    summary.files_copied,
+                ),
+            )
+            .await;
+        }
+        Err(e) => notice(tx, NoticeLevel::Warn, format!("import apply failed: {e}")).await,
     }
 }
 

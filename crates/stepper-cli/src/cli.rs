@@ -81,6 +81,42 @@ pub enum Command {
     },
     /// Write a default plan → implement → review layer pipeline.
     ScaffoldLayer,
+    /// Migrate another agent's global config (Claude Code / Codex) into
+    /// `~/.stepper/`. Shows the plan then asks before writing; `--dry-run`
+    /// previews only, `--yes` skips the prompt.
+    Import(ImportArgs),
+}
+
+#[derive(Args)]
+pub struct ImportArgs {
+    /// Which agent to import from (default `all`). Positional
+    /// (`stepper import claude`) — matches the `/import` slash form.
+    #[arg(value_enum)]
+    pub source: Option<ImportSourceArg>,
+    /// Same as the positional source, as a flag.
+    #[arg(long, value_enum)]
+    pub from: Option<ImportSourceArg>,
+    /// Show the migration plan without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Apply without the interactive confirmation prompt.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
+/// Import source for the CLI — clap enforces the value and lists it in `--help`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ImportSourceArg {
+    Claude,
+    Codex,
+    All,
+}
+
+impl ImportArgs {
+    /// The resolved source: the positional wins, else `--from`, else `all`.
+    pub fn resolved_source(&self) -> ImportSourceArg {
+        self.source.or(self.from).unwrap_or(ImportSourceArg::All)
+    }
 }
 
 #[derive(Args)]
@@ -184,5 +220,41 @@ mod tests {
         assert!(cli.global.no_init);
         let cli = Cli::try_parse_from(["stepper"]).unwrap();
         assert!(!cli.global.no_init);
+    }
+
+    #[test]
+    fn import_args_parse_positional_flag_and_defaults() {
+        let cli = Cli::try_parse_from(["stepper", "import"]).unwrap();
+        let Some(Command::Import(args)) = cli.command else {
+            panic!("expected import command");
+        };
+        assert_eq!(args.resolved_source(), ImportSourceArg::All);
+        assert!(!args.dry_run && !args.yes);
+
+        // Positional form (matches the `/import claude` slash spelling).
+        let cli = Cli::try_parse_from(["stepper", "import", "codex"]).unwrap();
+        let Some(Command::Import(args)) = cli.command else {
+            panic!("expected import command");
+        };
+        assert_eq!(args.resolved_source(), ImportSourceArg::Codex);
+
+        // Flag form, plus dry-run.
+        let cli = Cli::try_parse_from(["stepper", "import", "--from", "claude", "--dry-run"]).unwrap();
+        let Some(Command::Import(args)) = cli.command else {
+            panic!("expected import command");
+        };
+        assert_eq!(args.resolved_source(), ImportSourceArg::Claude);
+        assert!(args.dry_run);
+
+        // Positional wins over the flag.
+        let cli = Cli::try_parse_from(["stepper", "import", "claude", "--from", "codex", "-y"]).unwrap();
+        let Some(Command::Import(args)) = cli.command else {
+            panic!("expected import command");
+        };
+        assert_eq!(args.resolved_source(), ImportSourceArg::Claude);
+        assert!(args.yes);
+
+        // clap rejects an unknown value (no longer a downstream string error).
+        assert!(Cli::try_parse_from(["stepper", "import", "bogus"]).is_err());
     }
 }
