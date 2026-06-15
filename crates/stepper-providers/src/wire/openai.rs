@@ -254,6 +254,16 @@ struct PromptDetails {
 /// Parse one `data:` payload (already stripped of the `data: ` prefix and never
 /// the `[DONE]` sentinel — the adapter filters that).
 pub fn parse_chunk(data: &str) -> Result<Vec<WireDelta>, ProviderError> {
+    // A 200-OK stream can still carry an in-band error frame (`{"error":{...}}`)
+    // instead of choices — common on the OpenAI-compatible path (ollama-cloud,
+    // local oMLX) for context-length-exceeded / rate-limit / bad-request. Without
+    // this, the frame deserializes to zero choices and is silently dropped, and
+    // the turn dies as a generic `UnexpectedEnd` instead of the real message.
+    if let Ok(v) = serde_json::from_str::<Value>(data)
+        && v.get("error").is_some()
+    {
+        return Err(error::api_error_from_body(0, data));
+    }
     let chunk: Chunk = serde_json::from_str(data).map_err(error::decode)?;
     let mut out = Vec::new();
 
