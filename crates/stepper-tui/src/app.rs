@@ -450,6 +450,18 @@ fn run_effects(
                 })?;
                 committed = true;
             }
+            Effect::ClearScreen => {
+                // Purge scrollback + clear the screen so the prior conversation
+                // disappears; `committed` forces a fresh viewport repaint after.
+                use crossterm::terminal::{Clear, ClearType};
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    Clear(ClearType::Purge),
+                    Clear(ClearType::All),
+                    crossterm::cursor::MoveTo(0, 0),
+                );
+                committed = true;
+            }
         }
     }
     Ok(committed)

@@ -80,16 +80,15 @@ pub async fn handle(
             true
         }
         "clear" => {
-            session.turns.clear();
+            // A fresh session (new id) — a clean break, not just emptied turns.
+            // The old session stays on disk (resumable via /resume).
+            *session = SessionRecord::fresh();
             orchestrator.resume_seed.clear();
             *turn_id = 0;
             let _ = store.save(session);
-            notice(
-                tx,
-                NoticeLevel::Info,
-                "conversation cleared (session reset)".into(),
-            )
-            .await;
+            // `Cleared` (not a Notice) so the TUI also purges the terminal
+            // scrollback — the previous conversation disappears like `clear`.
+            let _ = tx.send(AppEvent::Cleared).await;
             true
         }
         "compact" => {

@@ -101,6 +101,9 @@ pub enum AppEvent {
         name: Option<String>,
         turns: u64,
     },
+    /// `/clear` started a fresh session: the TUI resets its live state AND purges
+    /// the terminal scrollback so the previous conversation disappears.
+    Cleared,
     TurnComplete {
         turn_id: u64,
     },

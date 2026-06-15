@@ -19,6 +19,9 @@ pub enum Effect {
     /// Commit a finalized assistant turn (markdown source) into native
     /// scrollback via `Terminal::insert_before`.
     CommitToScrollback(String),
+    /// Purge the terminal scrollback (`/clear`) so the prior conversation
+    /// disappears, then repaint the viewport fresh.
+    ClearScreen,
 }
 
 pub type Effects = SmallVec<[Effect; 2]>;
@@ -728,6 +731,19 @@ impl AppState {
                 self.workers.clear();
                 self.flush_block(&mut effects);
                 self.dispatch_queued(&mut effects);
+            }
+            AppEvent::Cleared => {
+                // Fresh session: drop all live + queued state and purge the
+                // terminal scrollback so the previous conversation is gone.
+                self.live.clear();
+                self.tool_lines.clear();
+                self.todos.clear();
+                self.workers.clear();
+                self.queue.clear();
+                self.usage = UsageView::default();
+                self.turn_active = false;
+                self.notice = Some("cleared — new session".into());
+                effects.push(Effect::ClearScreen);
             }
             AppEvent::ProcessStarted { id, command } => {
                 self.processes.push(ProcView {
@@ -1740,6 +1756,22 @@ mod tests {
             },
         ));
         assert!(matches!(s.overlay, Some(Overlay::Permissions(_))));
+    }
+
+    #[test]
+    fn cleared_resets_live_state_and_purges_the_screen() {
+        let mut s = test_state();
+        s.apply_event(AppEvent::AssistantTokenDelta("stale answer".into()));
+        s.turn_active = true;
+        s.queue.push_back(Queued::Chat("queued".into()));
+        let effects = s.apply_event(AppEvent::Cleared);
+        assert!(s.live.assistant.is_empty(), "live buffer cleared");
+        assert!(s.queue.is_empty(), "queue cleared");
+        assert!(!s.turn_active);
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::ClearScreen)),
+            "Cleared purges the terminal scrollback"
+        );
     }
 
     #[test]
