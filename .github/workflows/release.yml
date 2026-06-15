@@ -162,23 +162,30 @@ jobs:
           # if dev has moved on, skip rather than fail the release).
           git push origin HEAD:dev || echo "dev has diverged; skipped the README sync to dev"
 
-      # Ping the homepage to rebuild so its "latest release" badge and the update
+      # Trigger the homepage deploy so its "latest release" badge and the update
       # log (regenerated from the GitHub API at build) reflect this release right
-      # away. Needs a HOMEPAGE_DISPATCH_TOKEN secret (a PAT with actions/contents
-      # write on the homepage repo); without it the homepage refreshes on its
-      # daily cron instead, so this step is optional and never fails the release.
-      - name: Ping the homepage to rebuild
+      # away. Uses workflow_dispatch with `ref: prod` — the homepage's github-pages
+      # environment only allows deploys from prod, so a repository_dispatch (which
+      # runs on the default branch, dev) would be rejected. Needs a
+      # HOMEPAGE_DISPATCH_TOKEN secret (a PAT with `actions: write` on the homepage
+      # repo); without it the homepage refreshes on its daily cron instead, so this
+      # step is optional and never fails the release.
+      - name: Trigger the homepage deploy
         env:
           DISPATCH_TOKEN: ${{ secrets.HOMEPAGE_DISPATCH_TOKEN }}
         run: |
           if [ -z "$DISPATCH_TOKEN" ]; then
-            echo "HOMEPAGE_DISPATCH_TOKEN not set — the homepage will refresh on its daily cron. Skipping the instant ping."
+            echo "HOMEPAGE_DISPATCH_TOKEN not set — the homepage will refresh on its daily cron. Skipping the instant trigger."
             exit 0
           fi
-          curl -sS -X POST \
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $DISPATCH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{ github.repository_owner }}/homepage/dispatches" \
-            -d '{"event_type":"stepper-release"}' \
-            && echo "Pinged ${{ github.repository_owner }}/homepage to rebuild."
+            "https://api.github.com/repos/${{ github.repository_owner }}/homepage/actions/workflows/deploy.yml/dispatches" \
+            -d '{"ref":"prod"}')
+          if [ "$code" = "204" ]; then
+            echo "Triggered ${{ github.repository_owner }}/homepage deploy on prod (HTTP $code)."
+          else
+            echo "::warning::homepage deploy trigger returned HTTP $code — check that HOMEPAGE_DISPATCH_TOKEN has 'actions: write' on the homepage repo."
+          fi
