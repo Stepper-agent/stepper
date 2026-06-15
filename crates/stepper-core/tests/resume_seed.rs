@@ -215,6 +215,50 @@ async fn turn_persists_the_full_message_transcript_with_thinking_stripped() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_live_session_remembers_prior_turns_without_resume() {
+    // Two turns in ONE running session: the second request must carry the first
+    // turn's messages. (Regression: resume_seed was only ever set from --resume,
+    // so a live session forgot everything between turns.)
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let seen_messages: Arc<Mutex<Vec<Vec<Message>>>> = Arc::default();
+    let resolver = Arc::new(RecordingResolver {
+        tool_first: false,
+        calls: Arc::default(),
+        seen_messages: seen_messages.clone(),
+        seen_systems: Arc::default(),
+    });
+    let orch = orchestrator(resolver, root.clone());
+
+    let (action_tx, action_rx) = mpsc::channel(16);
+    let mut events = spawn_core(orch, SessionRecord::fresh(), action_rx, CancellationToken::new());
+
+    action_tx
+        .send(Action::SubmitInput("remember MAGIC_TOKEN_42".into()))
+        .await
+        .unwrap();
+    drive_turn(&mut events).await;
+    action_tx
+        .send(Action::SubmitInput("what did I tell you?".into()))
+        .await
+        .unwrap();
+    drive_turn(&mut events).await;
+
+    let requests = seen_messages.lock().unwrap();
+    assert_eq!(requests[0].len(), 1, "turn 1 starts fresh: {:#?}", requests[0]);
+    let second = &requests[1];
+    assert!(
+        second.len() >= 3,
+        "turn 2 must include the prior turn (user + reply) before the new prompt: {second:#?}"
+    );
+    assert!(
+        second.iter().any(|m| m.text().contains("MAGIC_TOKEN_42")),
+        "turn 2 remembers what turn 1 said: {second:#?}"
+    );
+    assert!(second.last().unwrap().text().contains("what did I tell you"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn resume_seeds_the_real_prior_messages_into_the_next_request() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();

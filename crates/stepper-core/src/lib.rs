@@ -135,6 +135,11 @@ pub fn spawn_core(
                                 messages: output.messages,
                             });
                             let _ = store.save(&session);
+                            // Carry the conversation into the live context so the
+                            // NEXT turn remembers it. Without this, resume_seed only
+                            // ever held the `--resume` history, so a live session
+                            // forgot everything between turns.
+                            orchestrator.resume_seed = session.seed_messages();
                         }
                         Some(Err(e)) if !matches!(e, CoreError::Cancelled) => {
                             let _ = tx.send(AppEvent::Error(e.to_string())).await;
@@ -258,6 +263,9 @@ pub fn spawn_core(
                                     messages: output.messages,
                                 });
                                 let _ = store.save(&session);
+                                // Same as the chat path: carry the conversation
+                                // forward so the next turn remembers this one.
+                                orchestrator.resume_seed = session.seed_messages();
                             }
                             let _ = tx.send(AppEvent::TurnComplete { turn_id }).await;
                             pending.extend(deferred);
