@@ -100,7 +100,23 @@ pub fn evaluate(
     home: Option<&Path>,
     mode: PermissionMode,
 ) -> Decision {
-    let decision = evaluate_inner(request, rules, project_root, home, mode);
+    // Default the effective cwd to project_root (relative paths anchor there, the
+    // historical behavior). Callers with a distinct working directory use
+    // `evaluate_in` so bash redirect targets resolve against the real cwd.
+    evaluate_in(request, rules, project_root, home, project_root, mode)
+}
+
+/// Like [`evaluate`], but resolves relative request/redirect paths against
+/// `cwd` (the bash tool's effective working directory) instead of project_root.
+pub fn evaluate_in(
+    request: &PermissionRequest,
+    rules: &RuleSet,
+    project_root: &Path,
+    home: Option<&Path>,
+    cwd: &Path,
+    mode: PermissionMode,
+) -> Decision {
+    let decision = evaluate_inner(request, rules, project_root, home, cwd, mode);
     match (mode, decision) {
         (PermissionMode::DontAsk, Decision::Ask) => Decision::Deny,
         (PermissionMode::Bypass, Decision::Ask) => Decision::Allow,
@@ -113,6 +129,7 @@ fn evaluate_inner(
     rules: &RuleSet,
     project_root: &Path,
     home: Option<&Path>,
+    cwd: &Path,
     mode: PermissionMode,
 ) -> Decision {
     match request {
@@ -164,6 +181,7 @@ fn evaluate_inner(
                                 rules,
                                 project_root,
                                 home,
+                                cwd,
                                 mode,
                             ))
                         })
@@ -173,10 +191,14 @@ fn evaluate_inner(
         PermissionRequest::Read(p)
         | PermissionRequest::Write(p)
         | PermissionRequest::Edit(p) => {
-            let in_project = path::is_in_project(p, project_root);
+            // Anchor a relative request/redirect path at the effective cwd before
+            // matching, so `> out.txt` from a subdir is judged there; rule
+            // patterns stay project_root-anchored inside `decide`/`is_in_project`.
+            let anchored = path::anchor_at_cwd(p, cwd);
+            let in_project = path::is_in_project(&anchored, project_root);
             let decision = decide(
                 request.tool(),
-                &MatchTarget::Path(p),
+                &MatchTarget::Path(&anchored),
                 rules,
                 project_root,
                 home,
@@ -188,7 +210,7 @@ fn evaluate_inner(
             // explicit `deny` still wins (it was checked first inside `decide`).
             if decision == Decision::Allow
                 && !request.is_read_only()
-                && path::is_protected(p, project_root)
+                && path::is_protected(&anchored, project_root)
             {
                 Decision::Ask
             } else {

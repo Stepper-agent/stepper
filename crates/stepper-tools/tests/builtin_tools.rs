@@ -116,6 +116,42 @@ async fn write_read_edit_grep_lifecycle() {
 }
 
 #[tokio::test]
+async fn enumerators_skip_deny_listed_subpaths() {
+    // A `deny Read(/secret/**)` rule must fence grep/glob/list_dir out of that
+    // subtree even though the search root (the project) is allowed.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("secret")).unwrap();
+    std::fs::write(root.join("public.txt"), "needle here\n").unwrap();
+    std::fs::write(root.join("secret/private.txt"), "needle here\n").unwrap();
+
+    let cx = ToolCx {
+        cwd: root.to_path_buf(),
+        project_root: root.to_path_buf(),
+        home: None,
+        mode: PermissionMode::AcceptEdits,
+        rules: Arc::new(RuleSet::from_lists(&[], &[], &["Read(/secret/**)".into()])),
+        approver: Arc::new(AllowAll),
+        cancel: CancellationToken::new(),
+    };
+    let reg = ToolRegistry::builtins();
+
+    let grep = reg.get("grep").unwrap().call(json!({"pattern": "needle"}), &cx).await.unwrap();
+    let grep = grep.content_text();
+    assert!(grep.contains("public.txt"), "allowed match kept: {grep}");
+    assert!(!grep.contains("private.txt"), "denied subpath excluded from grep: {grep}");
+
+    let glob = reg.get("glob").unwrap().call(json!({"pattern": "**/*.txt"}), &cx).await.unwrap();
+    let glob = glob.content_text();
+    assert!(glob.contains("public.txt"), "allowed file listed: {glob}");
+    assert!(!glob.contains("private.txt"), "denied subpath excluded from glob: {glob}");
+
+    // Listing the denied directory itself yields nothing (its child is denied).
+    let ls = reg.get("list_dir").unwrap().call(json!({"path": "secret"}), &cx).await.unwrap();
+    assert_eq!(ls.content_text(), "empty", "denied dir contents are not enumerated");
+}
+
+#[tokio::test]
 async fn bash_runs_and_reports_exit() {
     let dir = tempfile::tempdir().unwrap();
     let reg = ToolRegistry::builtins();

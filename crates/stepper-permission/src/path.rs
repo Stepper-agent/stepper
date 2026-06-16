@@ -21,6 +21,19 @@ pub fn resolve_pattern(pattern: &str, project_root: &Path, home: Option<&Path>) 
     Some(canonical_glob(&abs).to_string_lossy().into_owned())
 }
 
+/// Make a request path absolute by anchoring a relative path at `cwd` (the
+/// command's effective working directory), so a bash redirect like `> out.txt`
+/// run from a subdirectory is judged under that subdirectory, not project_root.
+/// Absolute paths are returned unchanged. Downstream matching still anchors
+/// *rule* patterns at project_root.
+pub fn anchor_at_cwd(path: &Path, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
 /// Resolve a request path to an absolute, symlink-free path so a symlink that
 /// points outside the project is judged by its *real* location.
 pub fn resolve_request_path(path: &Path, project_root: &Path) -> PathBuf {

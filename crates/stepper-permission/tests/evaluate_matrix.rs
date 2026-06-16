@@ -20,6 +20,53 @@ fn judge(
 }
 
 #[test]
+fn relative_redirect_resolves_against_cwd_not_project_root() {
+    use stepper_permission::evaluate_in;
+    let rules = RuleSet::from_lists(&[], &[], &["Write(/sub/**)".into()]);
+    let project = root();
+    let cwd = project.join("sub");
+    // A relative redirect run from cwd=/project/sub lands under /project/sub → denied.
+    assert_eq!(
+        evaluate_in(
+            &PermissionRequest::Bash("echo x > out.txt".into()),
+            &rules,
+            &project,
+            None,
+            &cwd,
+            PermissionMode::Auto,
+        ),
+        Decision::Deny,
+        "the relative redirect anchors at cwd, hitting deny Write(/sub/**)"
+    );
+    // The same relative target from the project root is /project/out.txt → not denied.
+    assert_ne!(
+        evaluate_in(
+            &PermissionRequest::Bash("echo x > out.txt".into()),
+            &rules,
+            &project,
+            None,
+            &project,
+            PermissionMode::Auto,
+        ),
+        Decision::Deny,
+        "from project root the redirect is outside /sub"
+    );
+    // An absolute target ignores cwd entirely (judged by its own path).
+    assert_eq!(
+        evaluate_in(
+            &PermissionRequest::Bash("echo x > /project/sub/abs.txt".into()),
+            &rules,
+            &project,
+            None,
+            &project,
+            PermissionMode::Auto,
+        ),
+        Decision::Deny,
+        "absolute target under /sub is denied regardless of cwd"
+    );
+}
+
+#[test]
 fn deny_rule_beats_overlapping_allow_rule() {
     let rules = RuleSet::from_lists(
         &["Bash(rm *)".into()],

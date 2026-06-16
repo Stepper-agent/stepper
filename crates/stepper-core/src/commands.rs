@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use stepper_config::{parse_command, substitute, CommandArgs, SubstitutionIo};
-use stepper_permission::{evaluate, path, Decision, PermissionMode, PermissionRequest, RuleSet};
+use stepper_permission::{evaluate_in, path, Decision, PermissionMode, PermissionRequest, RuleSet};
 use stepper_tools::secret::is_secret_path;
 
 /// Expand `/name args` into a prompt, or `None` if the command isn't found.
@@ -94,11 +94,12 @@ impl CoreIo {
     }
 
     fn allowed(&self, request: &PermissionRequest) -> bool {
-        evaluate(
+        evaluate_in(
             request,
             &self.rules,
             &self.project_root,
             self.home.as_deref(),
+            &self.cwd,
             self.mode,
         ) == Decision::Allow
     }
@@ -112,11 +113,12 @@ impl CoreIo {
     /// command file's `!`shell``. Evaluating under `Default` (which never
     /// auto-allows bash by mode) reduces this to "an allow rule, or refuse".
     fn shell_allowed_rule_only(&self, cmd: &str) -> bool {
-        evaluate(
+        evaluate_in(
             &PermissionRequest::Bash(cmd.to_string()),
             &self.rules,
             &self.project_root,
             self.home.as_deref(),
+            &self.cwd,
             PermissionMode::Default,
         ) == Decision::Allow
     }

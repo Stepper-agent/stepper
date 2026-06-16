@@ -1,4 +1,4 @@
-use crate::context::{Approval, ToolCx};
+use crate::context::{Approval, ReadGate, ToolCx};
 use crate::secret::is_secret_path_resolved;
 use crate::tools::parse_args;
 use crate::Tool;
@@ -87,14 +87,15 @@ impl Tool for Grep {
         let regex =
             Regex::new(&a.pattern).map_err(|e| ToolError::InvalidArgs(format!("bad regex: {e}")))?;
 
-        let result = tokio::task::spawn_blocking(move || grep_walk(&base, &regex))
+        let gate = cx.read_gate();
+        let result = tokio::task::spawn_blocking(move || grep_walk(&base, &regex, &gate))
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
         Ok(ToolResult::text(result))
     }
 }
 
-fn grep_walk(base: &PathBuf, regex: &Regex) -> String {
+fn grep_walk(base: &PathBuf, regex: &Regex, gate: &ReadGate) -> String {
     let mut out = Vec::new();
     for entry in WalkBuilder::new(base).build().flatten() {
         if out.len() >= MAX_MATCHES {
@@ -102,7 +103,7 @@ fn grep_walk(base: &PathBuf, regex: &Regex) -> String {
             break;
         }
         let path = entry.path();
-        if !path.is_file() || is_secret_path_resolved(path) {
+        if !path.is_file() || is_secret_path_resolved(path) || gate.denies(path) {
             continue;
         }
         let Ok(content) = std::fs::read_to_string(path) else {
@@ -166,11 +167,12 @@ impl Tool for GlobTool {
             .map_err(|e| ToolError::InvalidArgs(format!("bad glob: {e}")))?
             .compile_matcher();
 
+        let gate = cx.read_gate();
         let result = tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();
             for entry in WalkBuilder::new(&base).build().flatten() {
                 let path = entry.path();
-                if is_secret_path_resolved(path) {
+                if is_secret_path_resolved(path) || gate.denies(path) {
                     continue;
                 }
                 let rel = path.strip_prefix(&base).unwrap_or(path);
@@ -228,6 +230,7 @@ impl Tool for ListDir {
         )
         .await?;
 
+        let gate = cx.read_gate();
         let result = tokio::task::spawn_blocking(move || {
             let mut entries = Vec::new();
             for entry in WalkBuilder::new(&base)
@@ -235,7 +238,10 @@ impl Tool for ListDir {
                 .build()
                 .flatten()
             {
-                if entry.path() == base || is_secret_path_resolved(entry.path()) {
+                if entry.path() == base
+                    || is_secret_path_resolved(entry.path())
+                    || gate.denies(entry.path())
+                {
                     continue;
                 }
                 let suffix = if entry.path().is_dir() { "/" } else { "" };

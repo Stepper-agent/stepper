@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use stepper_permission::{evaluate, Decision, PermissionMode, PermissionRequest, RuleSet};
+use stepper_permission::{evaluate_in, Decision, PermissionMode, PermissionRequest, RuleSet};
 use stepper_provider::ToolError;
 use tokio_util::sync::CancellationToken;
 
@@ -35,6 +35,32 @@ pub struct ToolCx {
     pub cancel: CancellationToken,
 }
 
+/// A self-contained read-deny checker cloned from a [`ToolCx`], usable inside a
+/// `spawn_blocking` walk (which can't borrow the cx). It lets enumerators
+/// (grep/glob/list_dir) drop paths an explicit `deny Read(...)` rule covers, so a
+/// subpath deny is honored even when the search root itself is allowed.
+pub struct ReadGate {
+    rules: Arc<RuleSet>,
+    project_root: PathBuf,
+    home: Option<PathBuf>,
+    mode: PermissionMode,
+}
+
+impl ReadGate {
+    /// Whether an explicit `deny` rule covers reading `path` (Ask/Allow do not
+    /// filter — a denied path is silently skipped, never prompted mid-walk).
+    pub fn denies(&self, path: &Path) -> bool {
+        evaluate_in(
+            &PermissionRequest::Read(path.to_path_buf()),
+            &self.rules,
+            &self.project_root,
+            self.home.as_deref(),
+            &self.project_root,
+            self.mode,
+        ) == Decision::Deny
+    }
+}
+
 impl ToolCx {
     /// Resolve a (possibly relative) tool-supplied path against the cwd.
     pub fn resolve(&self, path: &str) -> PathBuf {
@@ -46,6 +72,17 @@ impl ToolCx {
         }
     }
 
+    /// A [`ReadGate`] snapshot for filtering deny-listed paths inside a blocking
+    /// walk (grep/glob/list_dir run in `spawn_blocking`).
+    pub fn read_gate(&self) -> ReadGate {
+        ReadGate {
+            rules: self.rules.clone(),
+            project_root: self.project_root.clone(),
+            home: self.home.clone(),
+            mode: self.mode,
+        }
+    }
+
     /// Gate an action through `deny > ask > allow`: `Allow` proceeds, `Deny`
     /// errors, `Ask` consults the approver.
     pub async fn gate(
@@ -53,11 +90,12 @@ impl ToolCx {
         request: PermissionRequest,
         approval: Approval,
     ) -> Result<(), ToolError> {
-        match evaluate(
+        match evaluate_in(
             &request,
             &self.rules,
             &self.project_root,
             self.home.as_deref(),
+            &self.cwd,
             self.mode,
         ) {
             Decision::Allow => Ok(()),
