@@ -28,6 +28,11 @@ impl Snapshotter {
 
     pub fn snapshot(&self, id: &str) -> Result<(), CoreError> {
         let dest = self.store.join(id);
+        // Create the checkpoint dir up front so an *empty* working tree still
+        // produces a real (restorable) snapshot. Otherwise the dir would only
+        // appear as a side effect of copying a file, and a first turn in a fresh
+        // project (no files yet) would leave no `turn-N` to `/rewind` to.
+        std::fs::create_dir_all(&dest).map_err(io)?;
         for rel in self.tracked_files()? {
             let from = self.project_root.join(&rel);
             let to = dest.join(&rel);
@@ -168,6 +173,31 @@ mod tests {
         );
         // a file created after the snapshot is pruned on rewind
         assert!(!root.join("new_after.txt").exists(), "post-snapshot file pruned");
+    }
+
+    #[test]
+    fn snapshot_of_an_empty_tree_is_restorable() {
+        // A fresh project's first turn checkpoints an empty working tree. The
+        // snapshot must still exist so `/rewind` to that pre-turn point works and
+        // prunes whatever the turn created (regression: the empty-tree snapshot
+        // used to create no directory, so restore failed with "no checkpoint").
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let snap = Snapshotter::new(root.clone());
+
+        snap.snapshot("turn-1").unwrap();
+        assert!(
+            root.join(".stepper/checkpoints/turn-1").is_dir(),
+            "an empty-tree snapshot must still create its checkpoint dir"
+        );
+
+        // The turn then creates a file; rewinding to turn-1 must remove it.
+        std::fs::write(root.join("created_during_turn.txt"), "stepper-e2e-ok").unwrap();
+        snap.restore("turn-1").unwrap();
+        assert!(
+            !root.join("created_during_turn.txt").exists(),
+            "rewind to the empty pre-turn checkpoint prunes the file the turn created"
+        );
     }
 
     #[test]
