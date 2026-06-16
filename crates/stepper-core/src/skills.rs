@@ -120,6 +120,7 @@ mod tests {
             rules: Arc::new(RuleSet::default()),
             approver: Arc::new(NoApprover),
             cancel: CancellationToken::new(),
+            sandbox_writable_roots: None,
         }
     }
 

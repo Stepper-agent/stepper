@@ -36,6 +36,7 @@ fn cx(dir: &std::path::Path) -> ToolCx {
         rules: Arc::new(RuleSet::default()),
         approver: Arc::new(AllowAll),
         cancel: CancellationToken::new(),
+        sandbox_writable_roots: None,
     }
 }
 
@@ -185,6 +186,7 @@ fn orchestrator_dispatcher(
         compaction_provider: None,
         concurrency: 4,
         step_cap: 4,
+        sandbox_writable_roots: None,
     }
 }
 
@@ -472,6 +474,7 @@ async fn dispatched_subagents_cannot_use_a_tool_the_calling_layer_denied() {
         dispatch_step_cap: None,        limits: stepper_core::SessionLimits::default(),
         fallback_model: None,
         resume_seed: Vec::new(),
+        sandbox_writable_roots: None,
     };
 
     let (tx, mut rx) = mpsc::channel(256);
@@ -534,6 +537,7 @@ async fn enabling_dispatch_lets_the_model_fan_out_subagents() {
         dispatch_step_cap: None,        limits: stepper_core::SessionLimits::default(),
         fallback_model: None,
         resume_seed: Vec::new(),
+        sandbox_writable_roots: None,
     };
 
     let (tx, mut rx) = mpsc::channel(256);

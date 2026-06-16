@@ -222,6 +222,10 @@ pub struct Orchestrator {
     /// sequential layer's opening messages (the message-level analogue of the
     /// old resume digest in `base_context`). Empty for a fresh session.
     pub resume_seed: Vec<Message>,
+    /// Writable roots for the opt-in OS bash sandbox (`settings.sandbox.enabled`),
+    /// or `None` when disabled. Threaded into every layer/worker `ToolCx` so the
+    /// `bash` tool can confine writes to the project + `additionalDirectories`.
+    pub sandbox_writable_roots: Option<Vec<PathBuf>>,
 }
 
 /// What one user turn produced: each layer's free-text outcome (the handoff
@@ -404,6 +408,7 @@ impl Orchestrator {
                     // calling layer's step budget so a delegated subtask isn't
                     // starved relative to the main loop.
                     step_cap: self.dispatch_step_cap.unwrap_or(step.step_cap),
+                    sandbox_writable_roots: self.sandbox_writable_roots.clone(),
                 });
                 tools.register(Arc::new(crate::dispatch::DispatchTool::new(dispatcher)));
             }
@@ -442,6 +447,7 @@ impl Orchestrator {
                     rules: layer_rules.clone(),
                     approver: approver.clone(),
                     cancel: cancel.clone(),
+                    sandbox_writable_roots: self.sandbox_writable_roots.clone(),
                 };
                 let agent = AgentLoop {
                     layer_name: step.name.clone(),
@@ -539,6 +545,7 @@ impl Orchestrator {
                                 rules: layer_rules.clone(),
                                 approver: approver.clone(),
                                 cancel: cancel.clone(),
+                                sandbox_writable_roots: self.sandbox_writable_roots.clone(),
                             },
                             event_tx: event_tx.clone(),
                             model_info: fallback_info,
@@ -702,6 +709,7 @@ impl Orchestrator {
                             rules: layer_rules.clone(),
                             approver: approver.clone(),
                             cancel: cancel.clone(),
+                            sandbox_writable_roots: self.sandbox_writable_roots.clone(),
                         },
                         model_info: self.resolver.model_info(&step.model_ref),
                         step_cap: step.step_cap,

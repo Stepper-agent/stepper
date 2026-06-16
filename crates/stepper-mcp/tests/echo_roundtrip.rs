@@ -137,6 +137,7 @@ fn cx(approver: Arc<dyn Approver>) -> ToolCx {
         rules: Arc::new(RuleSet::default()),
         approver,
         cancel: CancellationToken::new(),
+        sandbox_writable_roots: None,
     }
 }
 

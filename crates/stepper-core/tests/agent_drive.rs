@@ -68,6 +68,7 @@ fn make_cx(dir: &std::path::Path) -> ToolCx {
         rules: Arc::new(RuleSet::default()),
         approver: Arc::new(AllowAll),
         cancel: CancellationToken::new(),
+        sandbox_writable_roots: None,
     }
 }
 

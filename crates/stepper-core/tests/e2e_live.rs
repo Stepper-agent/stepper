@@ -180,6 +180,7 @@ async fn two_layer_pipeline_writes_a_file_and_rewinds() {
         dispatch_step_cap: None,        limits: stepper_core::SessionLimits::default(),
         fallback_model: None,
         resume_seed: Vec::new(),
+        sandbox_writable_roots: None,
     };
 
     let session = SessionRecord::fresh();
@@ -290,6 +291,7 @@ fn ollama_orchestrator(
         dispatch_step_cap: None,        limits: stepper_core::SessionLimits::default(),
         fallback_model: None,
         resume_seed: Vec::new(),
+        sandbox_writable_roots: None,
     }
 }
 

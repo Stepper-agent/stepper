@@ -4,11 +4,12 @@
 //!
 //! The real security boundary is the canonicalized path check in
 //! `stepper-permission` (a symlink inside the project that escapes is judged by
-//! its real location). OS-level `birdcage` sandboxing is a depth-defense layer
-//! to add once its API is pinned.
+//! its real location). The [`sandbox`] module adds an opt-in OS-level
+//! depth-defense layer (macOS Seatbelt) that confines the `bash` tool's writes.
 
 pub mod context;
 pub mod registry;
+pub mod sandbox;
 pub mod secret;
 pub mod tools;
 

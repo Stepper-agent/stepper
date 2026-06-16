@@ -128,6 +128,24 @@ pub async fn build_orchestrator_with_fallback(
     )?));
     let mode = Arc::new(std::sync::RwLock::new(mode));
 
+    // Opt-in OS bash sandbox: when `sandbox.enabled`, confine `bash` writes to the
+    // project root + `permissions.additionalDirectories` (resolved absolute).
+    // `None` keeps today's unconfined behavior. Read before `config` moves into
+    // the resolver below.
+    let sandbox_writable_roots = config
+        .settings
+        .sandbox
+        .as_ref()
+        .filter(|s| s.enabled)
+        .map(|_| {
+            let mut roots = vec![project_root.clone()];
+            for dir in &config.settings.permissions.additional_directories {
+                let p = PathBuf::from(dir);
+                roots.push(if p.is_absolute() { p } else { project_root.join(p) });
+            }
+            roots
+        });
+
     let hooks = Arc::new(HookHost::new(config.settings.hooks.clone(), cwd.clone()));
 
     let resolver = Arc::new(ConfigProviderResolver::new(
@@ -157,6 +175,7 @@ pub async fn build_orchestrator_with_fallback(
         limits,
         fallback_model: fallback_model.map(str::to_string),
         resume_seed: Vec::new(),
+        sandbox_writable_roots,
     };
     Ok((orchestrator, mcp))
 }

@@ -53,6 +53,22 @@ pub struct SettingsFile {
     /// (`--turn-timeout` / `--max-budget-usd` / `--max-turns`) overrides these.
     #[serde(default)]
     pub limits: Option<LimitsConfig>,
+    /// Opt-in OS-level bash sandbox (off by default). When enabled, the `bash`
+    /// tool's filesystem writes are confined to the project root +
+    /// `permissions.additionalDirectories`; it is a best-effort backstop under
+    /// the permission engine and a no-op on unsupported platforms.
+    #[serde(default)]
+    pub sandbox: Option<SandboxConfig>,
+}
+
+/// Opt-in OS-level sandbox for the `bash` tool. A best-effort defense-in-depth
+/// layer (macOS Seatbelt today): with `enabled = true`, shell writes outside the
+/// writable set fail, so a permission-engine miss can't escape the project.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Per-turn safety limits. Each field is opt-in; omit it (or set `null`) for no
@@ -227,5 +243,22 @@ mod tests {
         let d = s.dispatch.unwrap();
         assert_eq!(d.concurrency, None);
         assert_eq!(d.step_cap, None);
+    }
+
+    #[test]
+    fn sandbox_is_absent_by_default() {
+        let s: SettingsFile = serde_json::from_str("{}").unwrap();
+        assert!(s.sandbox.is_none());
+        // An explicit empty block parses but stays disabled.
+        let s: SettingsFile = serde_json::from_str(r#"{"sandbox":{}}"#).unwrap();
+        assert!(!s.sandbox.unwrap().enabled);
+    }
+
+    #[test]
+    fn sandbox_enabled_round_trips() {
+        let s: SettingsFile = serde_json::from_str(r#"{"sandbox":{"enabled":true}}"#).unwrap();
+        assert!(s.sandbox.as_ref().unwrap().enabled);
+        let back = serde_json::to_value(&s).unwrap();
+        assert_eq!(back["sandbox"]["enabled"], serde_json::json!(true));
     }
 }

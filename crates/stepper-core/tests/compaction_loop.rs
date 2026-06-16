@@ -118,6 +118,7 @@ async fn compacts_above_soft_threshold_and_pins_the_system_prompt() {
         rules: Arc::new(RuleSet::default()),
         approver: Arc::new(AllowAll),
         cancel: CancellationToken::new(),
+        sandbox_writable_roots: None,
     };
 
     let pinned_system = "PINNED SYSTEM PROMPT — do not rewrite".to_string();
@@ -238,6 +239,7 @@ async fn uses_the_model_summarizer_when_a_compaction_provider_is_set() {
         rules: Arc::new(RuleSet::default()),
         approver: Arc::new(AllowAll),
         cancel: CancellationToken::new(),
+        sandbox_writable_roots: None,
     };
 
     let mut history = vec![Message::user("kick off")];
@@ -314,6 +316,7 @@ async fn overflowing_seeded_history_is_compacted_before_the_first_request() {
         rules: Arc::new(RuleSet::default()),
         approver: Arc::new(AllowAll),
         cancel: CancellationToken::new(),
+        sandbox_writable_roots: None,
     };
 
     // 21 messages x 200 chars = 4200 chars ≈ 1050 tokens, over the 700 soft

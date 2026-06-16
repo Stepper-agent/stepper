@@ -128,6 +128,7 @@ async fn rewind_prunes_later_files_and_truncates_session() {
         dispatch_step_cap: None,        limits: stepper_core::SessionLimits::default(),
         fallback_model: None,
         resume_seed: Vec::new(),
+        sandbox_writable_roots: None,
     };
 
     let session = SessionRecord::fresh();

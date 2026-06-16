@@ -75,6 +75,7 @@ fn cx_with(root: &std::path::Path, mode: PermissionMode, approver: Arc<dyn Appro
         rules: Arc::new(RuleSet::from_lists(&["Bash(*)".into()], &[], &[])),
         approver,
         cancel: CancellationToken::new(),
+        sandbox_writable_roots: None,
     }
 }
 
@@ -135,6 +136,7 @@ async fn enumerators_skip_deny_listed_subpaths() {
         rules: Arc::new(RuleSet::from_lists(&[], &[], &["Read(/secret/**)".into()])),
         approver: Arc::new(AllowAll),
         cancel: CancellationToken::new(),
+        sandbox_writable_roots: None,
     };
     let reg = ToolRegistry::builtins();
 
@@ -533,6 +535,7 @@ async fn bash_records_command_approval_in_gated_mode() {
         rules: Arc::new(RuleSet::default()),
         approver: approver.clone(),
         cancel: CancellationToken::new(),
+        sandbox_writable_roots: None,
     };
 
     let result = reg
@@ -589,6 +592,7 @@ async fn bash_cancellation_token_aborts_run() {
         rules: Arc::new(RuleSet::from_lists(&["Bash(*)".into()], &[], &[])),
         approver: Arc::new(AllowAll),
         cancel: cancel.clone(),
+        sandbox_writable_roots: None,
     };
 
     let bash = reg.get("bash").unwrap();
@@ -626,6 +630,7 @@ async fn bash_denied_by_default_when_no_allow_rule() {
         rules: Arc::new(RuleSet::default()),
         approver: Arc::new(DenyAll),
         cancel: CancellationToken::new(),
+        sandbox_writable_roots: None,
     };
 
     let err = reg
@@ -823,6 +828,7 @@ async fn compound_bash_resolves_to_most_restrictive_decision_at_tool_level() {
         )),
         approver: approver.clone(),
         cancel: CancellationToken::new(),
+        sandbox_writable_roots: None,
     };
 
     let err = reg
@@ -1232,6 +1238,7 @@ async fn bash_command_touching_tilde_secret_path_is_refused_without_running() {
         rules: Arc::new(RuleSet::from_lists(&["Bash(*)".into()], &[], &[])),
         approver: approver.clone(),
         cancel: CancellationToken::new(),
+        sandbox_writable_roots: None,
     };
 
     let err = reg

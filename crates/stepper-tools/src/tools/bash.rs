@@ -81,10 +81,16 @@ impl Tool for Bash {
         .await?;
 
         // `bash -c` (not `-lc`): don't source the user's login profile into a
-        // permission-vetted command.
-        let child = tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg(&a.command)
+        // permission-vetted command. With the opt-in OS sandbox enabled this argv
+        // is rewritten to run through `/usr/bin/sandbox-exec`, confining writes to
+        // the project's writable roots as a best-effort backstop under the gate.
+        let mut argv = vec!["bash".to_string(), "-c".to_string(), a.command.clone()];
+        if let Some(roots) = cx.sandbox_writable_roots.as_deref() {
+            argv = crate::sandbox::confine_argv(argv, roots);
+        }
+        let (program, rest) = argv.split_first().expect("argv always has a program");
+        let child = tokio::process::Command::new(program)
+            .args(rest)
             .current_dir(&cx.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

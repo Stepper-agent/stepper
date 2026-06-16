@@ -99,6 +99,7 @@ async fn react_loop_runs_a_tool_then_finishes() {
         rules: Arc::new(RuleSet::default()),
         approver: Arc::new(AllowAll),
         cancel: CancellationToken::new(),
+        sandbox_writable_roots: None,
     };
     let agent = AgentLoop {
         layer_name: "test".into(),

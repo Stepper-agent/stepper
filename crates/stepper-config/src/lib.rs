@@ -28,7 +28,7 @@ pub use scaffold::{get_scalar, set_scalar};
 pub use schema::{settings_schema, validate_settings, validate_settings_values};
 pub use settings::{
     deep_merge, ApprovalRule, HookEntry, LimitsConfig, McpServerConfig, OrchestratorConfig,
-    Permissions, ProviderConfig, SettingsFile, PROVIDER_KINDS,
+    Permissions, ProviderConfig, SandboxConfig, SettingsFile, PROVIDER_KINDS,
 };
 pub use substitution::{substitute, CommandArgs, SubstitutionIo};
 

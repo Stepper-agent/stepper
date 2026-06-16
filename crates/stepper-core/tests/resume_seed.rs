@@ -147,6 +147,7 @@ fn orchestrator(resolver: Arc<dyn ProviderResolver>, root: std::path::PathBuf) -
         dispatch_step_cap: None,        limits: stepper_core::SessionLimits::default(),
         fallback_model: None,
         resume_seed: Vec::new(),
+        sandbox_writable_roots: None,
     }
 }
 

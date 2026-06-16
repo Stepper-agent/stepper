@@ -113,6 +113,7 @@ mod tests {
             rules: Arc::new(RuleSet::from_lists(&[], &[], &[])),
             approver: Arc::new(FixedApprover(verdict)),
             cancel: CancellationToken::new(),
+            sandbox_writable_roots: None,
         }
     }
 

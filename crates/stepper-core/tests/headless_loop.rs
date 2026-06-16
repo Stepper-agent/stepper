@@ -148,6 +148,7 @@ fn make_orch(resolver: Arc<dyn ProviderResolver>, root: std::path::PathBuf, mode
         limits: stepper_core::SessionLimits::default(),
         fallback_model: None,
         resume_seed: Vec::new(),
+        sandbox_writable_roots: None,
     }
 }
 

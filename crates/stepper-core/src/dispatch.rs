@@ -157,6 +157,7 @@ pub struct OrchestratorDispatcher {
     pub compaction_provider: Option<Arc<dyn LlmProvider>>,
     pub concurrency: usize,
     pub step_cap: usize,
+    pub sandbox_writable_roots: Option<Vec<PathBuf>>,
 }
 
 #[async_trait]
@@ -192,6 +193,7 @@ impl Dispatcher for OrchestratorDispatcher {
                             rules: self.rules.clone(),
                             approver: self.approver.clone(),
                             cancel: self.cancel.clone(),
+                            sandbox_writable_roots: self.sandbox_writable_roots.clone(),
                         },
                         model_info,
                         step_cap: self.step_cap,

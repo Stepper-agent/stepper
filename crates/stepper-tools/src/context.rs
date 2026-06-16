@@ -38,6 +38,11 @@ pub struct ToolCx {
     pub rules: Arc<RuleSet>,
     pub approver: Arc<dyn Approver>,
     pub cancel: CancellationToken,
+    /// Writable roots for the opt-in OS bash sandbox, or `None` when the sandbox
+    /// is disabled (the default). `Some(roots)` confines `bash` writes to those
+    /// roots (the project root + `additionalDirectories`); see
+    /// [`crate::sandbox`]. Carried per-cx so dispatched/worker layers inherit it.
+    pub sandbox_writable_roots: Option<Vec<PathBuf>>,
 }
 
 /// A self-contained read-deny checker cloned from a [`ToolCx`], usable inside a
@@ -173,6 +178,7 @@ mod tests {
             rules: Arc::new(RuleSet::from_lists(&[], &[], &[])),
             approver: Arc::new(NeverApprover),
             cancel,
+            sandbox_writable_roots: None,
         };
         // WebFetch in Default mode evaluates to Ask, so gate parks on the
         // approver; the already-fired cancel must resolve it promptly as Denied.

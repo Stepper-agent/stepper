@@ -534,6 +534,9 @@ async fn run_shell(
         rules: orchestrator.rules_snapshot(),
         approver,
         cancel,
+        // The OS sandbox still applies under Bypass: a hand-typed `!cmd` skips the
+        // approval prompt but not the defense-in-depth write confinement.
+        sandbox_writable_roots: orchestrator.sandbox_writable_roots.clone(),
     };
     match bash
         .call(serde_json::json!({ "command": command }), &cx)

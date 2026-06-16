@@ -86,6 +86,7 @@ fn cx_with(mode: PermissionMode, rules: RuleSet, approver: Arc<dyn Approver>) ->
         rules: Arc::new(rules),
         approver,
         cancel: CancellationToken::new(),
+        sandbox_writable_roots: None,
     }
 }
 

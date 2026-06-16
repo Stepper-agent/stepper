@@ -126,6 +126,7 @@ async fn external_mcp_server_lists_and_optionally_calls_a_tool() {
             rules: Arc::new(RuleSet::default()),
             approver: Arc::new(AllowAll),
             cancel: CancellationToken::new(),
+            sandbox_writable_roots: None,
         };
 
         let result = tool
