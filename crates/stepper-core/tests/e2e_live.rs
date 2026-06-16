@@ -142,6 +142,7 @@ async fn two_layer_pipeline_writes_a_file_and_rewinds() {
         factory,
         ModelRegistry::builtin(),
         None,
+        None,
     ));
 
     let orch = Orchestrator {
@@ -263,6 +264,7 @@ fn ollama_orchestrator(
         config,
         factory,
         ModelRegistry::builtin(),
+        None,
         None,
     ));
     Orchestrator {

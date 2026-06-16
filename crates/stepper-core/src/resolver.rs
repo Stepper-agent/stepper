@@ -15,6 +15,10 @@ pub struct ConfigProviderResolver {
     factory: ProviderFactory,
     registry: ModelRegistry,
     codex_store: Option<CodexTokenStore>,
+    /// models.dev catalog seeded once at construction (best-effort; `None` when
+    /// the fetch failed). Consulted before the builtin registry estimate so
+    /// unknown-but-cataloged models get real context/pricing.
+    catalog: Option<stepper_providers::Catalog>,
 }
 
 impl ConfigProviderResolver {
@@ -23,12 +27,14 @@ impl ConfigProviderResolver {
         factory: ProviderFactory,
         registry: ModelRegistry,
         codex_store: Option<CodexTokenStore>,
+        catalog: Option<stepper_providers::Catalog>,
     ) -> Self {
         ConfigProviderResolver {
             config,
             factory,
             registry,
             codex_store,
+            catalog,
         }
     }
 }
@@ -63,6 +69,13 @@ impl ProviderResolver for ConfigProviderResolver {
         match self.config.resolve_provider(model_ref) {
             Ok(rp) => {
                 let mut info = self.registry.lookup(&rp.name, &rp.model);
+                // Catalog figures override the builtin estimate; an explicit
+                // `context_window` on the provider still wins below.
+                if let Some(catalog) = &self.catalog
+                    && let Some(meta) = catalog.meta(&rp.name, &rp.model)
+                {
+                    info = info.overlaid_with(meta);
+                }
                 if let Some(ctx) = rp.context_window {
                     info.context_window = ctx;
                     info.estimated = false;
@@ -82,13 +95,21 @@ impl ProviderResolver for ConfigProviderResolver {
         // The redirect-following client — the auth client's `redirect: none`
         // would turn a CDN/host 3xx into a failed catalog fetch.
         let client = self.factory.http_client();
-        let catalog = match stepper_providers::models::fetch_catalog(&client).await {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!("models.dev catalog fetch failed: {e}");
-                None
+        // Reuse the catalog seeded at construction; only fetch here when it
+        // wasn't (e.g. construction-time offline), so the picker doesn't
+        // re-download the ~2.3MB document every `/models`.
+        let fetched = if self.catalog.is_none() {
+            match stepper_providers::models::fetch_catalog(&client).await {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!("models.dev catalog fetch failed: {e}");
+                    None
+                }
             }
+        } else {
+            None
         };
+        let catalog = self.catalog.as_ref().or(fetched.as_ref());
 
         let mut names: Vec<&String> = self.config.settings.providers.keys().collect();
         names.sort();
@@ -114,7 +135,7 @@ impl ProviderResolver for ConfigProviderResolver {
                 kind,
                 &base,
                 rp.api_key.as_deref(),
-                catalog.as_ref(),
+                catalog,
             )
             .await;
             out.extend(entries.iter().map(|e| ModelChoiceView {
@@ -205,7 +226,70 @@ mod tests {
             ProviderFactory::new().unwrap(),
             ModelRegistry::builtin(),
             None,
+            None,
         )
+    }
+
+    /// Resolver with an `acme` openai-compat provider and an injected catalog.
+    fn resolver_with_catalog(catalog: stepper_providers::Catalog, ctx: Option<u64>) -> ConfigProviderResolver {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::load(dir.path()).unwrap();
+        config.settings.providers.insert(
+            "acme".into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("http://localhost/v1".into()),
+                api_key: None,
+                auth: None,
+                default_model: None,
+                context_window: ctx,
+            },
+        );
+        ConfigProviderResolver::new(
+            config,
+            ProviderFactory::new().unwrap(),
+            ModelRegistry::builtin(),
+            None,
+            Some(catalog),
+        )
+    }
+
+    fn catalog_with(model: &str, ctx: u64, input: f64, output: f64) -> stepper_providers::Catalog {
+        stepper_providers::models::parse_catalog(&serde_json::json!({
+            "acme": { "models": { model: {
+                "name": model,
+                "limit": { "context": ctx, "output": 32_000 },
+                "cost": { "input": input, "output": output }
+            } } }
+        }))
+    }
+
+    #[test]
+    fn model_info_prefers_catalog_when_present() {
+        let info = resolver_with_catalog(catalog_with("some-model", 300_000, 7.0, 21.0), None)
+            .model_info("acme/some-model");
+        assert_eq!(info.context_window, 300_000);
+        assert_eq!(info.input_per_mtok, 7.0);
+        assert_eq!(info.output_per_mtok, 21.0);
+        assert_eq!(info.max_output_tokens, 32_000);
+        assert!(!info.estimated, "catalog figures are authoritative");
+    }
+
+    #[test]
+    fn model_info_explicit_override_still_wins_over_catalog() {
+        let info = resolver_with_catalog(catalog_with("some-model", 300_000, 7.0, 21.0), Some(50_000))
+            .model_info("acme/some-model");
+        assert_eq!(info.context_window, 50_000, "provider context_window beats the catalog");
+        assert_eq!(info.input_per_mtok, 7.0, "pricing still comes from the catalog");
+        assert!(!info.estimated);
+    }
+
+    #[test]
+    fn model_info_falls_back_to_registry_estimate_when_catalog_misses() {
+        let info = resolver_with_catalog(catalog_with("other-model", 300_000, 7.0, 21.0), None)
+            .model_info("acme/some-unknown-model");
+        assert_eq!(info.context_window, 128_000, "no catalog entry -> registry estimate");
+        assert!(info.estimated);
     }
 
     #[test]
@@ -264,6 +348,7 @@ mod tests {
             config,
             ProviderFactory::new().unwrap(),
             ModelRegistry::builtin(),
+            None,
             None,
         );
         let err = match resolver.resolve("typo/m") {

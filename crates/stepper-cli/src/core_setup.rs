@@ -98,6 +98,16 @@ pub async fn build_orchestrator_with_fallback(
 
     let factory = ProviderFactory::new()?;
     let codex_store = CodexTokenStore::load(CodexTokenStore::default_path(), factory.client()).ok();
+    // Seed ModelInfo (context window + pricing) from the live models.dev catalog
+    // so unknown-but-cataloged models get real figures instead of the builtin
+    // estimate. Best-effort — an offline/failed fetch falls back to the registry.
+    let catalog = match stepper_providers::models::fetch_catalog(&factory.http_client()).await {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("warning: models.dev catalog fetch failed, using the builtin model table: {e}");
+            None
+        }
+    };
     // The selected `outputStyle` body is folded into the base context so it
     // reaches every layer's system prompt (via `compose_system`) and is counted
     // honestly by `/context` (as part of `base_context`).
@@ -119,6 +129,7 @@ pub async fn build_orchestrator_with_fallback(
         factory,
         ModelRegistry::builtin(),
         codex_store,
+        catalog,
     ));
 
     let orchestrator = Orchestrator {

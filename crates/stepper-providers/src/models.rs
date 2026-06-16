@@ -75,6 +75,12 @@ impl Catalog {
             .get(provider)
             .or_else(|| self.by_provider.get(catalog_alias(provider)))
     }
+
+    /// Catalog metadata for one `provider`/`model_id`, alias-aware. `None` when
+    /// the provider or model id is not in the catalog.
+    pub fn meta(&self, provider: &str, model_id: &str) -> Option<&CatalogMeta> {
+        self.models_for(provider).and_then(|m| m.get(model_id))
+    }
 }
 
 fn catalog_alias(provider: &str) -> &str {
@@ -317,6 +323,22 @@ mod tests {
         assert_eq!(meta.max_output_tokens, Some(64000));
         assert_eq!(meta.input_per_mtok, Some(5.0));
         assert!(catalog.models_for("novendor").is_none(), "no models => skipped");
+    }
+
+    #[test]
+    fn catalog_meta_looks_up_alias_aware_and_misses_cleanly() {
+        let catalog = parse_catalog(&serde_json::json!({
+            "anthropic": { "models": { "claude-opus-4-5": {
+                "name": "Claude Opus 4.5", "limit": { "context": 200000 }
+            } } },
+            "ollama": { "models": { "qwen3-coder": { "name": "Qwen3 Coder" } } }
+        }));
+        let meta = catalog.meta("anthropic", "claude-opus-4-5").unwrap();
+        assert_eq!(meta.context_window, Some(200000));
+        // alias: our `ollama-cloud` resolves to models.dev's `ollama`.
+        assert!(catalog.meta("ollama-cloud", "qwen3-coder").is_some());
+        assert!(catalog.meta("anthropic", "no-such-model").is_none());
+        assert!(catalog.meta("no-such-provider", "x").is_none());
     }
 
     #[test]

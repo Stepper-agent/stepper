@@ -27,6 +27,35 @@ impl ModelInfo {
             + usage.cache_write as f64 * self.cache_write_per_mtok)
             / m
     }
+
+    /// Overlay any present `CatalogMeta` numeric field (context window, output
+    /// cap, input/output price per Mtok) onto these figures. The catalog carries
+    /// no cache rates, so the base cache rates are kept — a builtin's hand-tuned
+    /// rates survive and a catalog-only model keeps its 0.0 estimate. `estimated`
+    /// is cleared only when a real context/price figure was actually applied (an
+    /// all-`None` catalog entry must not relabel an estimate as authoritative).
+    pub(crate) fn overlaid_with(mut self, meta: &stepper_providers::CatalogMeta) -> ModelInfo {
+        let mut applied = false;
+        if let Some(ctx) = meta.context_window {
+            self.context_window = ctx;
+            applied = true;
+        }
+        if let Some(out) = meta.max_output_tokens {
+            self.max_output_tokens = out;
+        }
+        if let Some(input) = meta.input_per_mtok {
+            self.input_per_mtok = input;
+            applied = true;
+        }
+        if let Some(output) = meta.output_per_mtok {
+            self.output_per_mtok = output;
+            applied = true;
+        }
+        if applied {
+            self.estimated = false;
+        }
+        self
+    }
 }
 
 /// Short model refs accepted in place of full ids (`--model anthropic/opus`).
