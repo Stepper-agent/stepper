@@ -3,6 +3,9 @@ use stepper_protocol::{Action, ApprovalDecision, ApprovalKind, ApprovalRequest};
 
 use crate::state::{AppState, Overlay};
 
+/// Rows scrolled per PgUp/PgDn keypress in the live region.
+const SCROLL_PAGE: u16 = 5;
+
 pub enum Lowered {
     Action(Action),
     ForwardToTextarea,
@@ -71,6 +74,9 @@ pub fn lower_event(event: &Event, state: &AppState) -> Lowered {
         KeyCode::Enter if shift || alt => Lowered::Action(Action::InsertNewline),
         KeyCode::Char('j') if ctrl => Lowered::Action(Action::InsertNewline),
         KeyCode::Enter => submit_action(&state.input_text()),
+        // Scroll the live region's in-app scrollback (mouse wheel does the same).
+        KeyCode::PageUp => Lowered::Action(Action::ScrollUp(SCROLL_PAGE)),
+        KeyCode::PageDown => Lowered::Action(Action::ScrollDown(SCROLL_PAGE)),
         // Backspace on an empty input removes the most recently queued message.
         KeyCode::Backspace if state.input_text().is_empty() && !state.queue.is_empty() => {
             Lowered::Action(Action::RemoveLastQueued)
@@ -148,7 +154,7 @@ mod tests {
             model: ModelView { provider: "p".into(), model: "m".into() },
             mode: Mode::Auto,
             cwd: PathBuf::from("/tmp"),
-            commands: vec!["review".into(), "rewind".into()],
+            commands: vec![crate::CommandInfo::named("review"), crate::CommandInfo::named("rewind")],
         })
     }
 
@@ -172,6 +178,19 @@ mod tests {
             Lowered::Action(Action::SubmitInput(t)) => assert_eq!(t, "hello there"),
             _ => panic!("expected SubmitInput"),
         }
+    }
+
+    #[test]
+    fn page_keys_scroll_the_live_region() {
+        let s = state();
+        assert!(matches!(
+            lower_event(&key(KeyCode::PageUp), &s),
+            Lowered::Action(Action::ScrollUp(_))
+        ));
+        assert!(matches!(
+            lower_event(&key(KeyCode::PageDown), &s),
+            Lowered::Action(Action::ScrollDown(_))
+        ));
     }
 
     #[test]

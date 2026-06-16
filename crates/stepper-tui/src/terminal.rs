@@ -2,7 +2,8 @@ use std::io::stdout;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::supports_keyboard_enhancement;
@@ -41,6 +42,7 @@ impl TerminalGuard {
     pub fn new(inline_height: u16) -> Self {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            let _ = execute!(stdout(), DisableMouseCapture);
             pop_keyboard_enhancement();
             ratatui::restore();
             prev(info);
@@ -48,6 +50,9 @@ impl TerminalGuard {
         let terminal = ratatui::init_with_options(TerminalOptions {
             viewport: Viewport::Inline(inline_height),
         });
+        // Capture the mouse wheel so PgUp/PgDn-style scrollback also works by
+        // scrolling (best-effort — a terminal without mouse support just ignores it).
+        let _ = execute!(stdout(), EnableMouseCapture);
         if supports_keyboard_enhancement().unwrap_or(false)
             && execute!(
                 stdout(),
@@ -63,6 +68,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = execute!(stdout(), DisableMouseCapture);
         pop_keyboard_enhancement();
         ratatui::restore();
     }

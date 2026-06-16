@@ -4,7 +4,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use stepper_protocol::{
-    ApprovalKind, ApprovalRequest, ContextBreakdownView, LayerStatus, PermissionsSnapshotView,
+    ApprovalKind, ApprovalRequest, ContextBreakdownView, LayerStatus, NoticeLevel,
+    PermissionsSnapshotView,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -30,11 +31,14 @@ fn ui(frame: &mut Frame, state: &AppState, theme: &Theme) {
     // fixed-height inline viewport and collapse the live area to 0 (render_live
     // also guards height==0). On a normal screen a one-line prompt still gets the
     // usual 3-row box.
+    // A status notice (error/warn/info) gets its own always-on row above the
+    // footer so an error is visible regardless of turn/tool/assistant state.
+    let notice_h = if state.notice.is_some() { 1 } else { 0 };
     let total = frame.area();
     let content_rows = input_display_rows(&state.input_text(), total.width.saturating_sub(2));
     let max_input_h = total
         .height
-        .saturating_sub(worker_h + queue_h + 1 + 1)
+        .saturating_sub(worker_h + queue_h + notice_h + 1 + 1)
         .max(1);
     let input_h = (content_rows + 2).clamp(1, max_input_h);
     let rows = Layout::vertical([
@@ -42,6 +46,7 @@ fn ui(frame: &mut Frame, state: &AppState, theme: &Theme) {
         Constraint::Length(worker_h),
         Constraint::Length(queue_h),
         Constraint::Length(input_h),
+        Constraint::Length(notice_h),
         Constraint::Length(1),
     ])
     .split(total);
@@ -69,7 +74,29 @@ fn ui(frame: &mut Frame, state: &AppState, theme: &Theme) {
     }
     render_queue(frame, rows[2], state, theme);
     render_input(frame, rows[3], state, theme);
-    render_status(frame, rows[4], state, theme);
+    if notice_h > 0 {
+        render_notice(frame, rows[4], state, theme);
+    }
+    render_status(frame, rows[5], state, theme);
+}
+
+/// The always-on status-notice row above the footer: one severity-colored,
+/// truncated line (red error / yellow warn / muted info) so an error is never
+/// swallowed by an active turn or hidden behind tool/assistant output.
+fn render_notice(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let Some(notice) = &state.notice else {
+        return;
+    };
+    let color = match notice.level {
+        NoticeLevel::Error => theme.error,
+        NoticeLevel::Warn => theme.warning,
+        NoticeLevel::Info => theme.muted,
+    };
+    let text = truncate(&notice.text, area.width as usize);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color)))),
+        area,
+    );
 }
 
 /// The fan-out worker panel (Claude-Code-style sub-agent view): one row per live
@@ -268,13 +295,21 @@ fn render_palette(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     let rows = (inner.height as usize).saturating_sub(1);
     let selected = state.palette_selected.min(matches.len().saturating_sub(1));
     let offset = scroll_offset(selected, matches.len(), rows);
-    for (i, name) in matches.iter().enumerate().skip(offset).take(rows) {
+    for (i, cmd) in matches.iter().enumerate().skip(offset).take(rows) {
         let style = if i == selected {
             Style::default().fg(theme.accent).add_modifier(Modifier::REVERSED)
         } else {
             Style::default().fg(theme.muted)
         };
-        lines.push(Line::from(Span::styled(format!("  /{name}"), style)));
+        let label = if cmd.description.is_empty() {
+            format!("/{}", cmd.name)
+        } else {
+            format!("/{} — {}", cmd.name, cmd.description)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {}", truncate(&label, inner.width.saturating_sub(2) as usize)),
+            style,
+        )));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
@@ -513,11 +548,11 @@ fn render_live(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if !state.live.assistant.is_empty() {
         lines.extend(crate::markdown::render_markdown(&state.live.assistant).lines);
     } else if state.tool_lines.is_empty() && !state.turn_active {
-        let hint = state
-            .notice
-            .clone()
-            .unwrap_or_else(|| "ready — type a message · Enter send · Shift+Tab mode".into());
-        lines.push(Line::from(Span::styled(hint, Style::default().fg(theme.muted))));
+        // The notice now has its own always-on row, so the idle hint is a literal.
+        lines.push(Line::from(Span::styled(
+            "ready — type a message · Enter send · Shift+Tab mode",
+            Style::default().fg(theme.muted),
+        )));
     }
 
     // Fence the in-progress / result stream in a titled border so it is visually
@@ -536,13 +571,13 @@ fn render_live(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             .title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let scroll = (lines.len() as u16).saturating_sub(inner.height.max(1));
+        let scroll = live_scroll(lines.len(), inner.height, state.scroll_offset);
         frame.render_widget(
             Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).scroll((scroll, 0)),
             inner,
         );
     } else {
-        let scroll = (lines.len() as u16).saturating_sub(area.height.max(1));
+        let scroll = live_scroll(lines.len(), area.height, state.scroll_offset);
         frame.render_widget(
             Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).scroll((scroll, 0)),
             area,
@@ -585,6 +620,15 @@ fn wrapped_rows_for_line(line: &str, width: usize) -> usize {
         }
     }
     rows
+}
+
+/// The Paragraph scroll for the live region: pinned to the bottom, then moved up
+/// by the user's `offset` (clamped so over-scrolling past the top just shows the
+/// top). `offset == 0` keeps the latest output visible.
+fn live_scroll(line_count: usize, window: u16, offset: u16) -> u16 {
+    let total = line_count as u16;
+    let max_scroll = total.saturating_sub(window.max(1));
+    max_scroll.saturating_sub(offset.min(max_scroll))
 }
 
 /// First visible index for a scrolling list so `selected` stays inside a
@@ -870,7 +914,11 @@ mod tests {
             model: ModelView { provider: "ollama".into(), model: "qwen3".into() },
             mode: Mode::Plan,
             cwd: PathBuf::from("/tmp/work"),
-            commands: vec!["review".into(), "rewind".into(), "resume".into()],
+            commands: vec![
+                crate::CommandInfo { name: "review".into(), description: "review the diff".into() },
+                crate::CommandInfo::named("rewind"),
+                crate::CommandInfo::named("resume"),
+            ],
         })
     }
 
@@ -884,6 +932,7 @@ mod tests {
             out.contains("/review") && out.contains("/rewind") && out.contains("/resume"),
             "palette lists matches: {out}"
         );
+        assert!(out.contains("review the diff"), "palette shows the description: {out}");
     }
 
     #[test]
@@ -1221,11 +1270,43 @@ mod tests {
     }
 
     #[test]
+    fn scroll_offset_reveals_earlier_live_lines() {
+        let mut s = base_state();
+        // Many verbatim tool lines (not markdown-merged) overflow the live region.
+        for i in 0..30 {
+            s.tool_lines.push(format!("line{i:02}"));
+        }
+        // Pinned to the bottom: the last line shows, the first does not.
+        let bottom = render_to_string(&s, 40, 10);
+        assert!(bottom.contains("line29"), "pinned view shows the latest line: {bottom}");
+        assert!(!bottom.contains("line00"), "the first line is scrolled off: {bottom}");
+        // Scrolled all the way up (offset clamps to the top): the first line shows.
+        s.scroll_offset = 100;
+        let scrolled = render_to_string(&s, 40, 10);
+        assert!(scrolled.contains("line00"), "scrolling up reveals the first line: {scrolled}");
+    }
+
+    #[test]
+    fn error_notice_is_shown_even_during_an_active_turn() {
+        // The regression: an error during a turn (with tool output present) used to
+        // be swallowed because the only notice draw was the idle hint fallback.
+        let mut s = base_state();
+        s.turn_active = true;
+        s.tool_lines.push("▸ read_file: a.rs".into());
+        s.notice = Some(crate::state::Notice {
+            level: stepper_protocol::NoticeLevel::Error,
+            text: "boom".into(),
+        });
+        let out = render_to_string(&s, 100, 14);
+        assert!(out.contains("boom"), "error notice must render even mid-turn: {out}");
+    }
+
+    #[test]
     fn palette_scrolls_selection_into_view() {
         // A long command list on a short viewport must scroll so the selected
         // entry (past the fold) is visible and early entries scroll off.
         let mut s = base_state();
-        s.commands = (0..20).map(|i| format!("cmd{i:02}")).collect();
+        s.commands = (0..20).map(|i| crate::CommandInfo::named(&format!("cmd{i:02}"))).collect();
         s.textarea.insert_str("/cmd");
         s.palette_selected = 18;
         let out = render_to_string(&s, 40, 8);

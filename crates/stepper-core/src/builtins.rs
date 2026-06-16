@@ -18,29 +18,36 @@ use stepper_protocol::{
 };
 use stepper_provider::Usage;
 
+/// The built-in commands as `(name, args, description)` — the single source for
+/// the `/` palette, the `builtin_command_names` export, and `/help`, so the three
+/// can never drift.
+const COMMANDS: &[(&str, &str, &str)] = &[
+    ("help", "", "show this help"),
+    ("clear", "", "reset conversation"),
+    ("compact", "[instructions]", "compact the conversation now"),
+    ("context", "", "window breakdown"),
+    ("cost", "", "session usage & USD"),
+    ("init", "", "create the .stepper/ skeleton"),
+    ("scaffold-layer", "", "write a default plan→implement→review pipeline"),
+    ("layer", "<name>", "new layer"),
+    ("command", "<name>", "new slash command"),
+    ("import", "[claude|codex|cursor|gemini|all] [apply]", "migrate another agent's config"),
+    ("login", "[provider]", "set an API key"),
+    ("model", "[provider/model]", "show or switch"),
+    ("models", "", "pick from fetched models"),
+    ("permissions", "", "rules & approvals"),
+    ("resume", "", "pick a session"),
+    ("rewind", "", "pick a checkpoint, also Esc-Esc"),
+];
+
 /// Names of the built-in commands, for the `/` palette (merged with the user's).
 pub fn names() -> Vec<String> {
-    [
-        "help",
-        "clear",
-        "compact",
-        "context",
-        "cost",
-        "init",
-        "scaffold-layer",
-        "layer",
-        "command",
-        "import",
-        "login",
-        "model",
-        "models",
-        "permissions",
-        "resume",
-        "rewind",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+    COMMANDS.iter().map(|(n, _, _)| n.to_string()).collect()
+}
+
+/// `(name, description)` for the `/` palette — the arg hints stay in `/help`.
+pub fn descriptions() -> Vec<(&'static str, &'static str)> {
+    COMMANDS.iter().map(|(n, _, d)| (*n, *d)).collect()
 }
 
 /// Session-level usage accounting for `/cost`, accumulated by `spawn_core` from
@@ -153,7 +160,21 @@ pub async fn handle(
 }
 
 fn help_text() -> String {
-    "commands: /help · /clear (reset conversation) · /compact [instructions] (compact the conversation now) · /context (window breakdown) · /cost (session usage & USD) · /init (create the .stepper/ skeleton) · /scaffold-layer (write a default plan→implement→review pipeline) · /layer <name> (new layer) · /command <name> (new slash command) · /import [claude|codex|all] [apply] (migrate another agent's config) · /login [provider] (set an API key) · /model [provider/model] (show or switch) · /models (pick from fetched models) · /permissions (rules & approvals) · /resume (pick a session) · /rewind (pick a checkpoint, also Esc-Esc) · plus any .stepper/commands/*.md".into()
+    let parts: Vec<String> = COMMANDS
+        .iter()
+        .map(|(name, args, desc)| {
+            let mut s = format!("/{name}");
+            if !args.is_empty() {
+                s.push(' ');
+                s.push_str(args);
+            }
+            if !desc.is_empty() {
+                s.push_str(&format!(" ({desc})"));
+            }
+            s
+        })
+        .collect();
+    format!("commands: {} · plus any .stepper/commands/*.md", parts.join(" · "))
 }
 
 /// `/init` — ensure the `.stepper/` directory skeleton exists.
@@ -256,7 +277,7 @@ async fn handle_new_command(name: &str, project_root: &Path, tx: &EventTx) {
     }
 }
 
-/// `/import [claude|codex|all] [apply]` — preview (default) or apply a migration
+/// `/import [claude|codex|cursor|gemini|all] [apply]` — preview (default) or apply a migration
 /// of another agent's global config into `~/.stepper/`. Without `apply` it only
 /// shows the plan; `/import apply` commits it. The migration is non-destructive
 /// and idempotent, so previewing then applying is safe.
@@ -272,12 +293,14 @@ async fn handle_import(args: &str, home: Option<&Path>, tx: &EventTx) {
             "apply" => apply = true,
             "claude" => from = stepper_config::ImportFrom::Claude,
             "codex" => from = stepper_config::ImportFrom::Codex,
+            "cursor" => from = stepper_config::ImportFrom::Cursor,
+            "gemini" => from = stepper_config::ImportFrom::Gemini,
             "all" => from = stepper_config::ImportFrom::All,
             _ => {
                 notice(
                     tx,
                     NoticeLevel::Warn,
-                    format!("usage: /import [claude|codex|all] [apply] (got '{token}')"),
+                    format!("usage: /import [claude|codex|cursor|gemini|all] [apply] (got '{token}')"),
                 )
                 .await;
                 return;
@@ -300,6 +323,8 @@ async fn handle_import(args: &str, home: Option<&Path>, tx: &EventTx) {
             let apply_cmd = match from {
                 stepper_config::ImportFrom::Claude => "/import claude apply",
                 stepper_config::ImportFrom::Codex => "/import codex apply",
+                stepper_config::ImportFrom::Cursor => "/import cursor apply",
+                stepper_config::ImportFrom::Gemini => "/import gemini apply",
                 stepper_config::ImportFrom::All => "/import apply",
             };
             format!("\nrun `{apply_cmd}` to write it now (no further prompt; the migration is non-destructive)")
@@ -722,4 +747,30 @@ fn age_label(now: std::time::SystemTime, modified: std::time::SystemTime) -> Str
 
 async fn notice(tx: &EventTx, level: NoticeLevel, text: String) {
     let _ = tx.send(AppEvent::Notice { level, text }).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptions_cover_every_name_and_are_non_empty() {
+        let names = names();
+        let descs = descriptions();
+        assert_eq!(descs.len(), names.len(), "one description per command");
+        for (name, desc) in &descs {
+            assert!(names.contains(&name.to_string()), "{name} is a known command");
+            assert!(!desc.is_empty(), "{name} has a description");
+        }
+    }
+
+    #[test]
+    fn help_text_lists_every_command_with_its_args() {
+        let help = help_text();
+        assert!(help.contains("/import [claude|codex|cursor|gemini|all] [apply]"), "arg hints kept: {help}");
+        assert!(help.contains("/compact [instructions]"));
+        for (name, _, _) in COMMANDS {
+            assert!(help.contains(&format!("/{name}")), "/{name} listed in help");
+        }
+    }
 }

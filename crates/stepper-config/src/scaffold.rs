@@ -177,6 +177,124 @@ pub fn update_settings(
     Ok(())
 }
 
+/// The scalar `setting.json` keys editable via `stepper config set/get`: the
+/// dotted CLI key, its object path, and the value kind to parse the raw input as.
+enum ScalarKind {
+    Str,
+    U64,
+    F64,
+    Bool,
+}
+
+const SCALAR_KEYS: &[(&str, &[&str], ScalarKind)] = &[
+    ("defaultModel", &["defaultModel"], ScalarKind::Str),
+    ("mode", &["mode"], ScalarKind::Str),
+    ("limits.turnTimeoutSecs", &["limits", "turnTimeoutSecs"], ScalarKind::U64),
+    ("limits.maxBudgetUsd", &["limits", "maxBudgetUsd"], ScalarKind::F64),
+    ("limits.maxTurns", &["limits", "maxTurns"], ScalarKind::U64),
+    ("dispatch.enabled", &["dispatch", "enabled"], ScalarKind::Bool),
+    ("compaction.provider", &["compaction", "provider"], ScalarKind::Str),
+];
+
+fn scalar_key_list() -> String {
+    SCALAR_KEYS
+        .iter()
+        .map(|(k, _, _)| *k)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn parse_scalar(kind: &ScalarKind, raw: &str) -> Result<serde_json::Value, String> {
+    let raw = raw.trim();
+    match kind {
+        ScalarKind::Str => Ok(serde_json::Value::String(raw.to_string())),
+        ScalarKind::U64 => raw
+            .parse::<u64>()
+            .map(|n| serde_json::json!(n))
+            .map_err(|_| format!("expected a non-negative integer, got '{raw}'")),
+        ScalarKind::F64 => raw
+            .parse::<f64>()
+            .map(|n| serde_json::json!(n))
+            .map_err(|_| format!("expected a number, got '{raw}'")),
+        ScalarKind::Bool => raw
+            .parse::<bool>()
+            .map(|b| serde_json::json!(b))
+            .map_err(|_| format!("expected true or false, got '{raw}'")),
+    }
+}
+
+/// Navigate/create the nested object path and set the leaf value.
+fn set_pointer(root: &mut serde_json::Value, path: &[&str], leaf: serde_json::Value) -> Result<(), String> {
+    let mut cur = root;
+    for seg in &path[..path.len() - 1] {
+        let obj = cur
+            .as_object_mut()
+            .ok_or_else(|| format!("`{seg}` parent is not an object"))?;
+        cur = obj
+            .entry((*seg).to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    }
+    let last = path[path.len() - 1];
+    cur.as_object_mut()
+        .ok_or_else(|| format!("`{last}` parent is not an object"))?
+        .insert(last.to_string(), leaf);
+    Ok(())
+}
+
+/// `stepper config set`: set one allow-listed scalar key in `setting.json`,
+/// validating the merged result before writing (an invalid value — bad type,
+/// unknown mode — aborts without touching the file). Reuses [`update_settings`]'
+/// read-or-skeleton + atomic-write discipline, but is fallible so it can reject
+/// before the write. Unknown keys list the supported set.
+pub fn set_scalar(stepper_dir: &Path, key: &str, raw: &str) -> Result<(), String> {
+    let Some((_, path, kind)) = SCALAR_KEYS.iter().find(|(k, _, _)| *k == key) else {
+        return Err(format!("unknown key '{key}' (supported: {})", scalar_key_list()));
+    };
+    let leaf = parse_scalar(kind, raw)?;
+
+    let settings_path = stepper_dir.join("setting.json");
+    let mut root: serde_json::Value = match fs::read_to_string(&settings_path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|e| format!("{} is not valid JSON: {e}", settings_path.display()))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            serde_json::json!({ "$schema": "stepper://setting.schema.json" })
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    if !root.is_object() {
+        return Err(format!("{} is not a JSON object", settings_path.display()));
+    }
+    set_pointer(&mut root, path, leaf)?;
+
+    // Validate-before-write: the merged result must parse as SettingsFile and
+    // hold known enum values (so `set mode yolo` fails like `--validate`).
+    let parsed: crate::settings::SettingsFile = serde_json::from_value(root.clone())
+        .map_err(|e| format!("would produce an invalid setting.json: {e}"))?;
+    let problems = crate::schema::validate_settings_values(&parsed);
+    if !problems.is_empty() {
+        return Err(problems.join("; "));
+    }
+
+    fs::create_dir_all(stepper_dir).map_err(|e| e.to_string())?;
+    let body = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    fs::write(&settings_path, format!("{body}\n")).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// `stepper config get`: the current value of an allow-listed scalar key as a
+/// display string (`None` = unset). Reads from the already-merged `SettingsFile`.
+pub fn get_scalar(settings: &crate::settings::SettingsFile, key: &str) -> Result<Option<String>, String> {
+    let Some((_, path, _)) = SCALAR_KEYS.iter().find(|(k, _, _)| *k == key) else {
+        return Err(format!("unknown key '{key}' (supported: {})", scalar_key_list()));
+    };
+    let root = serde_json::to_value(settings).map_err(|e| e.to_string())?;
+    let pointer = format!("/{}", path.join("/"));
+    Ok(root.pointer(&pointer).filter(|v| !v.is_null()).map(|v| match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }))
+}
+
 /// Scaffold one `layer/<name>/index.md`. `Ok(Some(path))` when written,
 /// `Ok(None)` if it already existed; the caller must pre-validate the name with
 /// [`is_safe_name`].
@@ -271,5 +389,79 @@ mod tests {
         assert!(scaffold_layer(root, "audit", "Audit the code.").unwrap().is_none());
         assert!(scaffold_command(root, "greet").unwrap().is_some());
         assert!(scaffold_command(root, "greet").unwrap().is_none());
+    }
+
+    #[test]
+    fn set_scalar_writes_typed_values_and_creates_nested_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path();
+        set_scalar(sd, "defaultModel", "openai/gpt-5").unwrap();
+        set_scalar(sd, "mode", "auto").unwrap();
+        set_scalar(sd, "limits.turnTimeoutSecs", "90").unwrap();
+        set_scalar(sd, "limits.maxBudgetUsd", "2.5").unwrap();
+        set_scalar(sd, "dispatch.enabled", "true").unwrap();
+        set_scalar(sd, "compaction.provider", "anthropic").unwrap();
+
+        let raw = std::fs::read_to_string(sd.join("setting.json")).unwrap();
+        let parsed: crate::settings::SettingsFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.default_model.as_deref(), Some("openai/gpt-5"));
+        assert_eq!(parsed.mode.as_deref(), Some("auto"));
+        let limits = parsed.limits.unwrap();
+        assert_eq!(limits.turn_timeout_secs, Some(90));
+        assert_eq!(limits.max_budget_usd, Some(2.5));
+        assert!(parsed.dispatch.unwrap().enabled);
+        assert_eq!(parsed.compaction.unwrap().provider.as_deref(), Some("anthropic"));
+        // $schema skeleton is stamped on the created file.
+        assert!(raw.contains("$schema"));
+    }
+
+    #[test]
+    fn set_scalar_rejects_unknown_key_bad_type_and_bad_mode_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path();
+        let err = set_scalar(sd, "nope", "x").unwrap_err();
+        assert!(err.contains("unknown key") && err.contains("defaultModel"), "lists keys: {err}");
+        assert!(set_scalar(sd, "limits.turnTimeoutSecs", "soon").unwrap_err().contains("integer"));
+        assert!(set_scalar(sd, "dispatch.enabled", "yes").unwrap_err().contains("true or false"));
+        // an invalid mode is rejected by validate_settings_values, like --validate.
+        assert!(set_scalar(sd, "mode", "yolo").unwrap_err().contains("unknown permission mode"));
+        // None of the rejected sets created a file.
+        assert!(!sd.join("setting.json").exists(), "no write on any rejection");
+    }
+
+    #[test]
+    fn set_scalar_merges_into_existing_file_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path();
+        std::fs::create_dir_all(sd).unwrap();
+        std::fs::write(sd.join("setting.json"), r#"{"mode":"plan","limits":{"maxTurns":5}}"#).unwrap();
+        set_scalar(sd, "limits.turnTimeoutSecs", "30").unwrap();
+        let parsed: crate::settings::SettingsFile =
+            serde_json::from_str(&std::fs::read_to_string(sd.join("setting.json")).unwrap()).unwrap();
+        assert_eq!(parsed.mode.as_deref(), Some("plan"), "existing scalar preserved");
+        let limits = parsed.limits.unwrap();
+        assert_eq!(limits.max_turns, Some(5), "existing nested key preserved");
+        assert_eq!(limits.turn_timeout_secs, Some(30), "new nested key merged");
+    }
+
+    #[test]
+    fn set_scalar_errors_on_unparseable_destination_not_clobber() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path();
+        std::fs::create_dir_all(sd).unwrap();
+        std::fs::write(sd.join("setting.json"), "{ not json").unwrap();
+        assert!(set_scalar(sd, "mode", "auto").unwrap_err().contains("not valid JSON"));
+        assert_eq!(std::fs::read_to_string(sd.join("setting.json")).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn get_scalar_reads_value_or_none() {
+        let mut settings = crate::settings::SettingsFile::default();
+        assert_eq!(get_scalar(&settings, "mode").unwrap(), None);
+        settings.mode = Some("auto".into());
+        settings.default_model = Some("openai/gpt-5".into());
+        assert_eq!(get_scalar(&settings, "mode").unwrap().as_deref(), Some("auto"));
+        assert_eq!(get_scalar(&settings, "defaultModel").unwrap().as_deref(), Some("openai/gpt-5"));
+        assert!(get_scalar(&settings, "nope").is_err());
     }
 }

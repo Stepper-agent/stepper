@@ -13,7 +13,7 @@ use stepper_protocol::{
 };
 use stepper_providers::codex::{oauth, CodexTokenStore};
 use stepper_providers::ProviderFactory;
-use stepper_tui::{run_tui, TuiInit};
+use stepper_tui::{run_tui, CommandInfo, TuiInit};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -35,14 +35,16 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// `stepper import`: detect a Claude/Codex global config and migrate the
-/// portable parts into `~/.stepper/`. Prints the plan, then applies it —
-/// `--dry-run` stops after the preview, `--yes` skips the confirmation, and
+/// `stepper import`: detect a Claude/Codex/Cursor/Gemini global config and
+/// migrate the portable parts into `~/.stepper/`. Prints the plan, then applies
+/// it — `--dry-run` stops after the preview, `--yes` skips the confirmation, and
 /// otherwise a `y/N` prompt gates the write.
 fn import_cmd(args: cli::ImportArgs) -> anyhow::Result<()> {
     let from = match args.resolved_source() {
         cli::ImportSourceArg::Claude => stepper_config::ImportFrom::Claude,
         cli::ImportSourceArg::Codex => stepper_config::ImportFrom::Codex,
+        cli::ImportSourceArg::Cursor => stepper_config::ImportFrom::Cursor,
+        cli::ImportSourceArg::Gemini => stepper_config::ImportFrom::Gemini,
         cli::ImportSourceArg::All => stepper_config::ImportFrom::All,
     };
     let home = std::env::var_os("HOME")
@@ -142,6 +144,32 @@ fn config_cmd(args: cli::ConfigArgs, global: GlobalArgs) -> anyhow::Result<()> {
         .map(Ok)
         .unwrap_or_else(std::env::current_dir)?;
 
+    if let Some(action) = args.action {
+        return match action {
+            cli::ConfigAction::Get { key } => {
+                let cfg = stepper_config::Config::load(&cwd)
+                    .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
+                match stepper_config::get_scalar(&cfg.settings, &key) {
+                    Ok(Some(v)) => println!("{v}"),
+                    Ok(None) => println!("(unset)"),
+                    Err(e) => anyhow::bail!("{e}"),
+                }
+                Ok(())
+            }
+            cli::ConfigAction::Set { key, value } => {
+                let disc = stepper_config::discover(&cwd);
+                let dir = disc
+                    .project_dir
+                    .or(disc.user_dir)
+                    .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".stepper")))
+                    .ok_or_else(|| anyhow::anyhow!("no project .stepper and HOME is unset"))?;
+                stepper_config::set_scalar(&dir, &key, &value).map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("set {key} = {value} in {}", dir.join("setting.json").display());
+                Ok(())
+            }
+        };
+    }
+
     if args.schema {
         println!(
             "{}",
@@ -176,7 +204,7 @@ fn config_cmd(args: cli::ConfigArgs, global: GlobalArgs) -> anyhow::Result<()> {
             Err(e) => anyhow::bail!("invalid config: {e}"),
         }
     } else {
-        println!("usage: stepper config --schema | --validate");
+        println!("usage: stepper config --schema | --validate | set <key> <value> | get <key>");
         Ok(())
     }
 }
@@ -367,11 +395,19 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
             .await;
     }
 
-    let mut commands = stepper_core::builtin_command_names();
+    let mut commands: Vec<CommandInfo> = stepper_core::builtin_command_descriptions()
+        .into_iter()
+        .map(|(name, description)| CommandInfo {
+            name: name.to_string(),
+            description: description.to_string(),
+        })
+        .collect();
     commands.extend(
         stepper_config::Config::load(&cwd)
-            .map(|c| c.command_names())
-            .unwrap_or_default(),
+            .map(|c| c.command_descriptions())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, description)| CommandInfo { name, description }),
     );
 
     // `_mcp` keeps the MCP server connections open for the whole TUI session.

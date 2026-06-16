@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::widgets::{Paragraph, Widget};
 use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthStr;
@@ -150,6 +150,22 @@ fn handle_terminal_event(
     // keys; the approval overlay keeps its y/a/n path through lower_event.
     if state.overlay_captures_keys() {
         handle_overlay_key(state, action_tx, &ev);
+        return Ok(false);
+    }
+
+    // Mouse wheel scrolls the live-region scrollback (like PgUp/PgDn), but not
+    // while the `/` palette is up (where the wheel would scroll behind it).
+    if let Event::Mouse(m) = &ev {
+        if !state.palette_active() {
+            let action = match m.kind {
+                MouseEventKind::ScrollUp => Some(stepper_protocol::Action::ScrollUp(3)),
+                MouseEventKind::ScrollDown => Some(stepper_protocol::Action::ScrollDown(3)),
+                _ => None,
+            };
+            if let Some(a) = action {
+                let _ = state.apply_action(a);
+            }
+        }
         return Ok(false);
     }
 
@@ -326,13 +342,19 @@ fn paste_clipboard_image(state: &mut AppState, action_tx: &ActionTx) {
         Ok(Some((media_type, data))) => {
             state.pending_image_count += 1;
             let n = state.pending_image_count;
-            state.notice = Some(format!(
-                "image attached ({n} pending) — it rides with your next message"
-            ));
+            state.notice = Some(crate::state::Notice {
+                level: stepper_protocol::NoticeLevel::Info,
+                text: format!("image attached ({n} pending) — it rides with your next message"),
+            });
             let _ = action_tx.try_send(stepper_protocol::Action::AttachImage { media_type, data });
         }
         Ok(None) => {}
-        Err(e) => state.notice = Some(format!("clipboard image paste failed: {e}")),
+        Err(e) => {
+            state.notice = Some(crate::state::Notice {
+                level: stepper_protocol::NoticeLevel::Error,
+                text: format!("clipboard image paste failed: {e}"),
+            });
+        }
     }
 }
 

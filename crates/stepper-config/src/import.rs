@@ -33,15 +33,20 @@ use std::path::{Path, PathBuf};
 pub enum ImportFrom {
     Claude,
     Codex,
+    Cursor,
+    Gemini,
     All,
 }
 
 impl ImportFrom {
-    /// Parse the CLI/slash argument (`claude` | `codex` | `all`; empty = `all`).
+    /// Parse the CLI/slash argument (`claude` | `codex` | `cursor` | `gemini` |
+    /// `all`; empty = `all`).
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
+            "cursor" => Some(Self::Cursor),
+            "gemini" => Some(Self::Gemini),
             "all" | "" => Some(Self::All),
             _ => None,
         }
@@ -51,6 +56,12 @@ impl ImportFrom {
     }
     fn wants_codex(self) -> bool {
         matches!(self, Self::Codex | Self::All)
+    }
+    fn wants_cursor(self) -> bool {
+        matches!(self, Self::Cursor | Self::All)
+    }
+    fn wants_gemini(self) -> bool {
+        matches!(self, Self::Gemini | Self::All)
     }
 }
 
@@ -97,6 +108,13 @@ pub struct ImportPlan {
     /// Newly-added MCP servers (name → config), re-applied at write time.
     pub mcp_additions: Vec<(String, Value)>,
     pub mcp_adds: Vec<String>,
+    /// Top-level `defaultModel` derived from an imported config (Codex
+    /// `model`/`model_provider`, Claude `model`); first-writer-wins. Applied
+    /// only when the destination has none (never clobbers a user's).
+    pub default_model: Option<String>,
+    /// Synthesized `providers.<name>` entries (name → ProviderConfig value) for
+    /// the imported model's provider, unioned keep-existing at write time.
+    pub provider_adds: Vec<(String, Value)>,
     pub file_copies: Vec<FileCopy>,
     pub notes: Vec<String>,
 }
@@ -145,6 +163,7 @@ pub fn build_plan(home: &Path, from: ImportFrom) -> io::Result<ImportPlan> {
 
     let existing_md = read_text(&stepper_md_path)?.unwrap_or_default();
     let mut sections = Vec::new();
+    let mut model_import = ModelImport::default();
 
     if from.wants_claude() {
         collect_claude(
@@ -157,6 +176,7 @@ pub fn build_plan(home: &Path, from: ImportFrom) -> io::Result<ImportPlan> {
             &mut mcp_adds,
             &mut mcp_additions,
             &mut file_copies,
+            &mut model_import,
             &mut notes,
         )?;
     }
@@ -169,11 +189,21 @@ pub fn build_plan(home: &Path, from: ImportFrom) -> io::Result<ImportPlan> {
             &mut settings,
             &mut mcp_adds,
             &mut mcp_additions,
+            &mut model_import,
             &mut notes,
         )?;
     }
+    if from.wants_cursor() {
+        collect_cursor(home, &existing_md, &mut sources, &mut sections)?;
+    }
+    if from.wants_gemini() {
+        collect_gemini(home, &existing_md, &mut sources, &mut sections)?;
+    }
 
-    let settings_changed = !permission_adds.is_empty() || !mcp_adds.is_empty();
+    let settings_changed = !permission_adds.is_empty()
+        || !mcp_adds.is_empty()
+        || model_import.default_model.is_some()
+        || !model_import.providers.is_empty();
 
     Ok(ImportPlan {
         home: home.to_path_buf(),
@@ -187,6 +217,8 @@ pub fn build_plan(home: &Path, from: ImportFrom) -> io::Result<ImportPlan> {
         permission_adds,
         mcp_additions,
         mcp_adds,
+        default_model: model_import.default_model,
+        provider_adds: model_import.providers,
         file_copies,
         notes,
     })
@@ -242,6 +274,12 @@ pub fn apply_plan(plan: &ImportPlan) -> io::Result<ImportSummary> {
         for (name, cfg) in &plan.mcp_additions {
             union_mcp(&mut settings, name, cfg.clone());
         }
+        for (name, cfg) in &plan.provider_adds {
+            union_provider(&mut settings, name, cfg.clone());
+        }
+        if let Some(m) = &plan.default_model {
+            set_default_model_if_absent(&mut settings, m);
+        }
         if let Some(parent) = plan.settings_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -276,6 +314,7 @@ fn collect_claude(
     mcp_adds: &mut Vec<String>,
     mcp_additions: &mut Vec<(String, Value)>,
     file_copies: &mut Vec<FileCopy>,
+    model_import: &mut ModelImport,
     notes: &mut Vec<String>,
 ) -> io::Result<()> {
     let claude_dir = home.join(".claude");
@@ -312,6 +351,10 @@ fn collect_claude(
                     permission_adds.push((verdict.to_string(), converted));
                 }
             }
+        }
+        // Claude model ids are bare (no provider prefix) → anthropic.
+        if let Some(model) = value.get("model").and_then(Value::as_str).filter(|m| !m.is_empty()) {
+            record_model(settings, model_import, "anthropic", model, notes);
         }
         if has_nonpermission_keys(&value) {
             notes.push(
@@ -427,6 +470,7 @@ fn collect_codex(
     settings: &mut Value,
     mcp_adds: &mut Vec<String>,
     mcp_additions: &mut Vec<(String, Value)>,
+    model_import: &mut ModelImport,
     notes: &mut Vec<String>,
 ) -> io::Result<()> {
     let codex_dir = home.join(".codex");
@@ -455,10 +499,9 @@ fn collect_codex(
                     add_mcp(settings, name, cfg, "codex", mcp_adds, mcp_additions, notes);
                 }
                 if let Some(model) = config.model.as_deref().filter(|m| !m.is_empty()) {
-                    let provider = config.model_provider.as_deref().unwrap_or("<provider>");
-                    notes.push(format!(
-                        "Codex model '{model}' (provider '{provider}') — set `defaultModel` + a matching provider in setting.json manually"
-                    ));
+                    // Codex omits model_provider for the default OpenAI path.
+                    let provider = config.model_provider.as_deref().unwrap_or("openai");
+                    record_model(settings, model_import, provider, model, notes);
                 }
                 if config.personality.is_some() {
                     notes.push("Codex `personality` is Codex-only — skipped".into());
@@ -495,6 +538,78 @@ fn collect_codex(
         notes.push("Codex memories are stored in sqlite — not migrated".into());
     }
 
+    Ok(())
+}
+
+/// Cursor instructions (global only): the legacy `~/.cursorrules` file plus each
+/// `.md`/`.mdc` rule directly in `~/.cursor/rules/`, one section per file.
+/// Instruction-only — no settings/permissions/MCP.
+fn collect_cursor(
+    home: &Path,
+    existing_md: &str,
+    sources: &mut Vec<DetectedSource>,
+    sections: &mut Vec<InstructionSection>,
+) -> io::Result<()> {
+    let cursorrules = home.join(".cursorrules");
+    if let Some(text) = read_text(&cursorrules)?.filter(|t| !t.trim().is_empty()) {
+        sources.push(DetectedSource {
+            agent: "cursor",
+            description: "instructions (.cursorrules)".into(),
+            path: cursorrules.clone(),
+        });
+        push_section(
+            sections,
+            existing_md,
+            "cursor/.cursorrules",
+            &format!("Imported from Cursor ({})", tilde(&cursorrules, home)),
+            &relocate_imports(&text, home, Some(home)),
+        );
+    }
+
+    let rules_dir = home.join(".cursor").join("rules");
+    for (stem, path) in md_or_mdc_files(&rules_dir) {
+        if let Some(text) = read_text(&path)?.filter(|t| !t.trim().is_empty()) {
+            sources.push(DetectedSource {
+                agent: "cursor",
+                description: format!("rule ({})", tilde(&path, home)),
+                path: path.clone(),
+            });
+            push_section(
+                sections,
+                existing_md,
+                &format!("cursor/rules/{stem}"),
+                &format!("Imported from Cursor ({})", tilde(&path, home)),
+                &relocate_imports(&text, &rules_dir, Some(home)),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Gemini instructions (global only): `~/.gemini/GEMINI.md`. Project-scoped
+/// `./GEMINI.md` is out of scope — import operates on `~/.stepper`, never cwd.
+fn collect_gemini(
+    home: &Path,
+    existing_md: &str,
+    sources: &mut Vec<DetectedSource>,
+    sections: &mut Vec<InstructionSection>,
+) -> io::Result<()> {
+    let gemini_dir = home.join(".gemini");
+    let gemini_md = gemini_dir.join("GEMINI.md");
+    if let Some(text) = read_text(&gemini_md)?.filter(|t| !t.trim().is_empty()) {
+        sources.push(DetectedSource {
+            agent: "gemini",
+            description: "instructions (GEMINI.md)".into(),
+            path: gemini_md.clone(),
+        });
+        push_section(
+            sections,
+            existing_md,
+            "gemini/GEMINI.md",
+            &format!("Imported from Gemini ({})", tilde(&gemini_md, home)),
+            &relocate_imports(&text, &gemini_dir, Some(home)),
+        );
+    }
     Ok(())
 }
 
@@ -618,6 +733,121 @@ fn union_permission(settings: &mut Value, verdict: &str, spec: &str) -> bool {
     true
 }
 
+/// Accumulates the model/provider derived from imported configs across sources.
+/// `default_model` is first-writer-wins (Claude is collected before Codex);
+/// `providers` unions keep-existing per name.
+#[derive(Default)]
+struct ModelImport {
+    default_model: Option<String>,
+    providers: Vec<(String, Value)>,
+}
+
+/// A `providers.<name>` value mirroring the CLI's `convention_provider`
+/// (kind/baseUrl/auth only — the key resolves from `STEPPER_<NAME>_API_KEY` at
+/// load, so no apiKey is written). The bool is whether the name is off-convention
+/// (an `openai-compat`/api.openai.com fallback the caller flags for manual edit).
+fn provider_entry(name: &str) -> (Value, bool) {
+    let mut obj = Map::new();
+    let mut ambiguous = false;
+    let kind = match name {
+        "anthropic" => "anthropic",
+        "codex" => {
+            obj.insert("auth".into(), Value::String("codex-oauth".into()));
+            "openai-responses"
+        }
+        "openai" => {
+            obj.insert("baseUrl".into(), Value::String("https://api.openai.com/v1".into()));
+            "openai-compat"
+        }
+        "ollama-cloud" => {
+            obj.insert("baseUrl".into(), Value::String("https://ollama.com/v1".into()));
+            "openai-compat"
+        }
+        "omlx" | "mlx" => {
+            obj.insert("baseUrl".into(), Value::String("http://localhost:8000/v1".into()));
+            "openai-compat"
+        }
+        _ => {
+            obj.insert("baseUrl".into(), Value::String("https://api.openai.com/v1".into()));
+            ambiguous = true;
+            "openai-compat"
+        }
+    };
+    obj.insert("kind".into(), Value::String(kind.into()));
+    (Value::Object(obj), ambiguous)
+}
+
+/// Record an imported `<provider>/<model>`: synthesize its provider entry and
+/// set `defaultModel`, but only for what the destination `settings` snapshot
+/// doesn't already have — mirroring the mcp/permission union so a re-import is a
+/// no-op. `defaultModel` is first-writer-wins (Claude before Codex).
+fn record_model(
+    settings: &mut Value,
+    mi: &mut ModelImport,
+    provider: &str,
+    model: &str,
+    notes: &mut Vec<String>,
+) {
+    if !mi.providers.iter().any(|(n, _)| n == provider) {
+        let (entry, ambiguous) = provider_entry(provider);
+        if union_provider(settings, provider, entry.clone()) {
+            if ambiguous {
+                notes.push(format!(
+                    "imported model provider '{provider}' is not a known convention — set its base URL / API key in setting.json"
+                ));
+            }
+            mi.providers.push((provider.to_string(), entry));
+        }
+    }
+    let model_ref = format!("{provider}/{model}");
+    if mi.default_model.is_none() {
+        if set_default_model_if_absent(settings, &model_ref) {
+            mi.default_model = Some(model_ref);
+        } else {
+            notes.push(format!(
+                "kept your existing defaultModel — imported '{model_ref}' not applied"
+            ));
+        }
+    } else if mi.default_model.as_deref() != Some(model_ref.as_str()) {
+        notes.push(format!(
+            "kept the first imported defaultModel '{}' — also saw '{model_ref}'",
+            mi.default_model.as_deref().unwrap_or_default()
+        ));
+    }
+}
+
+/// Insert a provider under `settings.providers.<name>` if that name is absent.
+/// Returns whether it was added (keep-existing, total on wrong shapes).
+fn union_provider(settings: &mut Value, name: &str, cfg: Value) -> bool {
+    let Some(obj) = settings.as_object_mut() else {
+        return false;
+    };
+    let providers = obj
+        .entry("providers")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(providers) = providers.as_object_mut() else {
+        return false;
+    };
+    if providers.contains_key(name) {
+        return false;
+    }
+    providers.insert(name.to_string(), cfg);
+    true
+}
+
+/// Set top-level `defaultModel` only when the destination has none (never
+/// clobber a user's). Returns whether it was set. Total on a non-object.
+fn set_default_model_if_absent(settings: &mut Value, model: &str) -> bool {
+    let Some(obj) = settings.as_object_mut() else {
+        return false;
+    };
+    if obj.contains_key("defaultModel") {
+        return false;
+    }
+    obj.insert("defaultModel".into(), Value::String(model.to_string()));
+    true
+}
+
 /// Insert an MCP server under `settings.mcpServers.<name>` if that name is
 /// absent. Returns whether it was added.
 fn union_mcp(settings: &mut Value, name: &str, cfg: Value) -> bool {
@@ -664,12 +894,12 @@ fn add_mcp(
     }
 }
 
-/// Whether a Claude `settings.json` carries keys beyond `permissions` (so the
-/// preview can note they are dropped).
+/// Whether a Claude `settings.json` carries keys beyond `permissions` and the
+/// `model` we migrate (so the preview can note the rest are dropped).
 fn has_nonpermission_keys(value: &Value) -> bool {
     value
         .as_object()
-        .map(|o| o.keys().any(|k| k != "permissions"))
+        .map(|o| o.keys().any(|k| k != "permissions" && k != "model"))
         .unwrap_or(false)
 }
 
@@ -698,6 +928,11 @@ fn validate_destination(settings: &Value) -> Result<(), String> {
         && !servers.is_object()
     {
         return Err("has a non-object `mcpServers`".into());
+    }
+    if let Some(providers) = obj.get("providers")
+        && !providers.is_object()
+    {
+        return Err("has a non-object `providers`".into());
     }
     Ok(())
 }
@@ -863,6 +1098,26 @@ fn md_files(dir: &Path) -> Vec<(String, PathBuf)> {
     found
 }
 
+/// `(stem, path)` for each `*.md`/`*.mdc` directly in `dir`, sorted by stem.
+/// Sibling of `md_files` (Cursor rules use `.mdc`; the commands copy stays
+/// `.md`-only).
+fn md_or_mdc_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if matches!(path.extension().and_then(|x| x.to_str()), Some("md" | "mdc"))
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        {
+            found.push((stem.to_string(), path));
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
 /// Copy `from` to `to` atomically: a directory (`from` is a resolved real path)
 /// is staged into a sibling temp dir and renamed into place (so a failed copy
 /// leaves no half-written destination, and the staging dir is removed on *any*
@@ -965,7 +1220,7 @@ pub fn render_preview(plan: &ImportPlan) -> String {
     ));
 
     if plan.sources.is_empty() {
-        out.push_str("\nNo Claude or Codex config detected (~/.claude, ~/.codex).\n");
+        out.push_str("\nNo agent config detected (~/.claude, ~/.codex, ~/.cursor, ~/.gemini).\n");
         return out;
     }
 
@@ -986,6 +1241,12 @@ pub fn render_preview(plan: &ImportPlan) -> String {
         }
         for name in &plan.mcp_adds {
             out.push_str(&format!("  + mcpServer   {name}\n"));
+        }
+        for (name, _) in &plan.provider_adds {
+            out.push_str(&format!("  + provider    {name}\n"));
+        }
+        if let Some(m) = &plan.default_model {
+            out.push_str(&format!("  + defaultModel {m}\n"));
         }
         for c in &plan.file_copies {
             out.push_str(&format!("  + {}  → {}\n", c.label, tilde(&c.to, &plan.home)));
@@ -1122,7 +1383,9 @@ mod tests {
         assert!(plan.mcp_adds.iter().any(|m| m.starts_with("local")));
         assert_eq!(plan.sections.len(), 1);
         assert!(plan.file_copies.iter().any(|c| c.label.contains("find-skills")));
-        assert!(plan.notes.iter().any(|n| n.contains("Codex model")));
+        // Codex model → defaultModel + a synthesized openai provider.
+        assert_eq!(plan.default_model.as_deref(), Some("openai/gpt-5"));
+        assert!(plan.provider_adds.iter().any(|(n, _)| n == "openai"));
         assert!(plan.notes.iter().any(|n| n.contains("Claude-only")));
 
         let summary = apply_plan(&plan).unwrap();
@@ -1135,6 +1398,8 @@ mod tests {
         assert!(parsed.permissions.allow.contains(&"Mcp(pencil)".to_string()));
         assert!(parsed.mcp_servers.contains_key("pencil"));
         assert!(parsed.mcp_servers.contains_key("local"));
+        assert_eq!(parsed.default_model.as_deref(), Some("openai/gpt-5"));
+        assert_eq!(parsed.providers.get("openai").map(|p| p.kind.as_str()), Some("openai-compat"));
         let md = std::fs::read_to_string(home.join(".stepper/stepper.md")).unwrap();
         assert!(md.contains("Imported from Claude Code"));
         assert!(md.contains("@~/notes.md"));
@@ -1400,7 +1665,7 @@ mod tests {
         let plan = build_plan(dir.path(), ImportFrom::All).unwrap();
         assert!(plan.is_empty());
         assert!(plan.sources.is_empty());
-        assert!(render_preview(&plan).contains("No Claude or Codex config"));
+        assert!(render_preview(&plan).contains("No agent config detected"));
     }
 
     #[test]
@@ -1409,18 +1674,173 @@ mod tests {
         let home = dir.path();
         write(&home.join(".claude/CLAUDE.md"), "rules");
         write(&home.join(".codex/config.toml"), "[mcp_servers.x]\ncommand = \"c\"\n");
+        write(&home.join(".cursorrules"), "cursor rules");
+        write(&home.join(".gemini/GEMINI.md"), "gemini rules");
 
         let claude_only = build_plan(home, ImportFrom::Claude).unwrap();
         assert!(claude_only.sources.iter().all(|s| s.agent == "claude"));
         let codex_only = build_plan(home, ImportFrom::Codex).unwrap();
         assert!(codex_only.sources.iter().all(|s| s.agent == "codex"));
+        let cursor_only = build_plan(home, ImportFrom::Cursor).unwrap();
+        assert!(
+            !cursor_only.sources.is_empty()
+                && cursor_only.sources.iter().all(|s| s.agent == "cursor")
+        );
+        let gemini_only = build_plan(home, ImportFrom::Gemini).unwrap();
+        assert!(
+            !gemini_only.sources.is_empty()
+                && gemini_only.sources.iter().all(|s| s.agent == "gemini")
+        );
+        // `All` includes every detected source.
+        let all = build_plan(home, ImportFrom::All).unwrap();
+        let agents: std::collections::HashSet<_> = all.sources.iter().map(|s| s.agent).collect();
+        assert!(agents.contains("cursor") && agents.contains("gemini"));
+    }
+
+    #[test]
+    fn cursor_import_collects_cursorrules_and_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        write(&home.join(".cursorrules"), "top-level rules");
+        write(&home.join(".cursor/rules/foo.md"), "foo rule");
+        write(&home.join(".cursor/rules/bar.mdc"), "bar rule");
+
+        let plan = build_plan(home, ImportFrom::Cursor).unwrap();
+        let markers: Vec<&str> = plan.sections.iter().map(|s| s.marker.as_str()).collect();
+        assert!(markers.contains(&"<!-- stepper-import:cursor/.cursorrules -->"));
+        assert!(markers.contains(&"<!-- stepper-import:cursor/rules/foo -->"));
+        assert!(markers.contains(&"<!-- stepper-import:cursor/rules/bar -->"), "`.mdc` is included");
+        assert!(plan.sources.iter().all(|s| s.agent == "cursor"));
+
+        apply_plan(&plan).unwrap();
+        let md = std::fs::read_to_string(home.join(".stepper/stepper.md")).unwrap();
+        assert!(md.contains("top-level rules") && md.contains("foo rule") && md.contains("bar rule"));
+        // Second run is a no-op (marker idempotency).
+        let again = build_plan(home, ImportFrom::Cursor).unwrap();
+        assert!(again.sections.is_empty(), "re-import skips already-imported sections");
+    }
+
+    #[test]
+    fn gemini_import_collects_global_gemini_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        write(&home.join(".gemini/GEMINI.md"), "gemini instructions");
+
+        let plan = build_plan(home, ImportFrom::Gemini).unwrap();
+        assert_eq!(plan.sections.len(), 1);
+        assert_eq!(plan.sections[0].marker, "<!-- stepper-import:gemini/GEMINI.md -->");
+        assert!(plan.sources.iter().all(|s| s.agent == "gemini"));
+
+        apply_plan(&plan).unwrap();
+        let md = std::fs::read_to_string(home.join(".stepper/stepper.md")).unwrap();
+        assert!(md.contains("gemini instructions"));
+        let again = build_plan(home, ImportFrom::Gemini).unwrap();
+        assert!(again.sections.is_empty());
     }
 
     #[test]
     fn import_from_parse() {
         assert_eq!(ImportFrom::parse("claude"), Some(ImportFrom::Claude));
         assert_eq!(ImportFrom::parse("CODEX"), Some(ImportFrom::Codex));
+        assert_eq!(ImportFrom::parse("cursor"), Some(ImportFrom::Cursor));
+        assert_eq!(ImportFrom::parse("GEMINI"), Some(ImportFrom::Gemini));
         assert_eq!(ImportFrom::parse(""), Some(ImportFrom::All));
         assert_eq!(ImportFrom::parse("nope"), None);
+    }
+
+    #[test]
+    fn provider_entry_mirrors_convention_provider() {
+        let (openai, amb) = provider_entry("openai");
+        assert_eq!(openai["kind"], "openai-compat");
+        assert_eq!(openai["baseUrl"], "https://api.openai.com/v1");
+        assert!(openai.get("apiKey").is_none(), "key resolves from STEPPER_*_API_KEY");
+        assert!(!amb);
+
+        let (codex, _) = provider_entry("codex");
+        assert_eq!(codex["kind"], "openai-responses");
+        assert_eq!(codex["auth"], "codex-oauth");
+
+        let (anthropic, _) = provider_entry("anthropic");
+        assert_eq!(anthropic["kind"], "anthropic");
+        assert!(anthropic.get("baseUrl").is_none());
+
+        let (other, amb) = provider_entry("my-llm");
+        assert_eq!(other["kind"], "openai-compat");
+        assert!(amb, "an off-convention name is flagged for a manual base URL/key");
+    }
+
+    #[test]
+    fn union_provider_and_default_model_keep_existing_and_are_total() {
+        let mut s = default_settings();
+        assert!(union_provider(&mut s, "openai", serde_json::json!({"kind": "openai-compat"})));
+        assert!(!union_provider(&mut s, "openai", serde_json::json!({"kind": "anthropic"})), "keep-existing");
+        assert_eq!(s["providers"]["openai"]["kind"], "openai-compat");
+        assert!(set_default_model_if_absent(&mut s, "openai/gpt-5"));
+        assert!(!set_default_model_if_absent(&mut s, "anthropic/x"), "never clobbers");
+        assert_eq!(s["defaultModel"], "openai/gpt-5");
+        // Total on a non-object.
+        let mut bad = serde_json::json!([1, 2]);
+        assert!(!union_provider(&mut bad, "x", Value::Null));
+        assert!(!set_default_model_if_absent(&mut bad, "x/y"));
+    }
+
+    #[test]
+    fn claude_model_synthesizes_anthropic_default_and_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        write(
+            &home.join(".claude/settings.json"),
+            r#"{"model":"claude-sonnet-4-6","permissions":{"allow":["Bash(ls)"]}}"#,
+        );
+        let plan = build_plan(home, ImportFrom::Claude).unwrap();
+        assert_eq!(plan.default_model.as_deref(), Some("anthropic/claude-sonnet-4-6"));
+        let (name, cfg) = plan.provider_adds.iter().find(|(n, _)| n == "anthropic").unwrap();
+        assert_eq!(name, "anthropic");
+        assert_eq!(cfg["kind"], "anthropic");
+        // The model key is consumed, so the "Claude-only settings" note must not fire.
+        assert!(!plan.notes.iter().any(|n| n.contains("Claude-only")));
+    }
+
+    #[test]
+    fn existing_default_model_is_not_overwritten_but_provider_is_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        // Pre-existing destination with a user defaultModel and no providers.
+        write(
+            &home.join(".stepper/setting.json"),
+            r#"{"defaultModel":"ollama-cloud/qwen3-coder"}"#,
+        );
+        write(
+            &home.join(".codex/config.toml"),
+            "model = \"gpt-5\"\nmodel_provider = \"openai\"\n",
+        );
+        let plan = build_plan(home, ImportFrom::Codex).unwrap();
+        // defaultModel kept (not applied), but the provider is still synthesized.
+        assert!(plan.default_model.is_none(), "destination defaultModel wins");
+        assert!(plan.provider_adds.iter().any(|(n, _)| n == "openai"));
+        assert!(plan.notes.iter().any(|n| n.contains("kept your existing defaultModel")));
+
+        apply_plan(&plan).unwrap();
+        let parsed: crate::SettingsFile =
+            serde_json::from_str(&std::fs::read_to_string(home.join(".stepper/setting.json")).unwrap()).unwrap();
+        assert_eq!(parsed.default_model.as_deref(), Some("ollama-cloud/qwen3-coder"));
+        assert!(parsed.providers.contains_key("openai"));
+    }
+
+    #[test]
+    fn all_collects_both_models_claude_wins_default_both_providers_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        write(&home.join(".claude/settings.json"), r#"{"model":"claude-opus-4-8"}"#);
+        write(
+            &home.join(".codex/config.toml"),
+            "model = \"gpt-5\"\nmodel_provider = \"openai\"\n",
+        );
+        let plan = build_plan(home, ImportFrom::All).unwrap();
+        // Claude is collected first → first-writer wins the defaultModel.
+        assert_eq!(plan.default_model.as_deref(), Some("anthropic/claude-opus-4-8"));
+        let names: Vec<&str> = plan.provider_adds.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"anthropic") && names.contains(&"openai"), "both providers: {names:?}");
+        assert!(plan.notes.iter().any(|n| n.contains("kept the first imported defaultModel")));
     }
 }

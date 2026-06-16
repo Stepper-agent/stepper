@@ -27,8 +27,26 @@ pub struct TuiInit {
     pub model: ModelView,
     pub mode: Mode,
     pub cwd: PathBuf,
-    /// Known slash-command names for the `/` palette.
-    pub commands: Vec<String>,
+    /// Known slash commands (name + one-line description) for the `/` palette.
+    pub commands: Vec<CommandInfo>,
+}
+
+/// A slash command shown in the `/` palette: its name and a one-line description.
+#[derive(Clone, Debug)]
+pub struct CommandInfo {
+    pub name: String,
+    pub description: String,
+}
+
+#[cfg(test)]
+impl CommandInfo {
+    /// A descriptionless command, for test fixtures.
+    pub fn named(name: &str) -> Self {
+        CommandInfo {
+            name: name.to_string(),
+            description: String::new(),
+        }
+    }
 }
 
 /// Run the interactive inline-viewport TUI until the user quits or `cancel` fires.

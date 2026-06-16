@@ -5,11 +5,11 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use stepper_protocol::{
     Action, AppEvent, ApprovalRequest, CheckpointView, ContextBreakdownView, LayerStatus,
-    LayerView, Mode, ModelChoiceView, ModelView, PermissionsSnapshotView, SessionView,
+    LayerView, Mode, ModelChoiceView, ModelView, NoticeLevel, PermissionsSnapshotView, SessionView,
     TodoItemView, UsageView, WorkerView,
 };
 
-use crate::TuiInit;
+use crate::{CommandInfo, TuiInit};
 
 /// Side effects the event loop must execute after a state transition (state.rs
 /// itself stays IO-free and synchronous, so it's trivially unit-testable).
@@ -57,6 +57,21 @@ impl StreamBuf {
 
     fn is_empty(&self) -> bool {
         self.assistant.is_empty() && self.reasoning.is_empty()
+    }
+}
+
+/// A status notice with its severity, so the render can color it and always show
+/// it (an error must not look like a routine info message, nor vanish mid-turn).
+pub struct Notice {
+    pub level: NoticeLevel,
+    pub text: String,
+}
+
+/// An informational notice (the default severity for internal status messages).
+fn info_notice(text: impl Into<String>) -> Notice {
+    Notice {
+        level: NoticeLevel::Info,
+        text: text.into(),
     }
 }
 
@@ -235,12 +250,15 @@ pub struct AppState {
     /// indicator. Cleared on submit (they ride with that turn).
     pub pending_image_count: usize,
     pub queue: VecDeque<Queued>,
-    pub notice: Option<String>,
+    pub notice: Option<Notice>,
     pub spinner: usize,
+    /// Live-region scrollback offset: rows scrolled UP from the bottom (0 =
+    /// pinned to the latest output). PgUp/PgDn and the mouse wheel adjust it.
+    pub scroll_offset: u16,
     pub turn_active: bool,
     pub cwd: PathBuf,
-    /// Known slash-command names (for the `/` palette), supplied at startup.
-    pub commands: Vec<String>,
+    /// Known slash commands (name + description) for the `/` palette.
+    pub commands: Vec<CommandInfo>,
     pub palette_selected: usize,
     /// A first Esc on empty input arms this; a second Esc (before any other
     /// action/typing) opens the rewind picker (Esc-Esc, Claude-Code-style).
@@ -281,6 +299,7 @@ impl AppState {
             queue: VecDeque::new(),
             notice: None,
             spinner: 0,
+            scroll_offset: 0,
             turn_active: false,
             cwd: init.cwd,
             commands: init.commands,
@@ -299,7 +318,7 @@ impl AppState {
     /// Command names whose prefix matches the `/<partial>` currently typed.
     /// Empty unless the input is a single `/`-prefixed token with no whitespace
     /// yet (and no other overlay is open).
-    pub fn command_matches(&self) -> Vec<String> {
+    pub fn command_matches(&self) -> Vec<&CommandInfo> {
         if self.picker.is_some() || self.overlay.is_some() {
             return Vec::new();
         }
@@ -312,8 +331,7 @@ impl AppState {
         }
         self.commands
             .iter()
-            .filter(|c| c.starts_with(rest))
-            .cloned()
+            .filter(|c| c.name.starts_with(rest))
             .collect()
     }
 
@@ -337,8 +355,9 @@ impl AppState {
             return;
         }
         let idx = self.palette_selected.min(matches.len() - 1);
+        let name = matches[idx].name.clone();
         self.textarea = fresh_textarea();
-        self.textarea.insert_str(format!("/{} ", matches[idx]));
+        self.textarea.insert_str(format!("/{name} "));
         self.palette_selected = 0;
     }
 
@@ -350,7 +369,7 @@ impl AppState {
             return None;
         }
         let idx = self.palette_selected.min(matches.len() - 1);
-        Some(matches[idx].clone())
+        Some(matches[idx].name.clone())
     }
 
     /// Run the highlighted palette command now: clear the typed `/partial`, reset
@@ -568,6 +587,9 @@ impl AppState {
                 self.live.clear();
                 self.tool_lines.clear();
                 self.workers.clear();
+                // Snap back to live output for the new turn (but not on every
+                // token delta — that would fight a user scrolled up to read).
+                self.scroll_offset = 0;
             }
             AppEvent::AssistantTokenDelta(s) => self.live.assistant.push_str(&s),
             AppEvent::ReasoningTokenDelta(s) => self.live.reasoning.push_str(&s),
@@ -646,11 +668,11 @@ impl AppState {
             }
             AppEvent::UsageUpdated(u) => self.usage = u,
             AppEvent::ModelChanged(m) => self.model = m,
-            AppEvent::CompactionStarted => self.notice = Some("compacting context…".into()),
+            AppEvent::CompactionStarted => self.notice = Some(info_notice("compacting context…")),
             AppEvent::CompactionDone { freed_tokens } => {
-                self.notice = Some(format!("compacted (-{freed_tokens} tok)"));
+                self.notice = Some(info_notice(format!("compacted (-{freed_tokens} tok)")));
             }
-            AppEvent::Notice { text, .. } => self.notice = Some(text),
+            AppEvent::Notice { level, text } => self.notice = Some(Notice { level, text }),
             AppEvent::ContextBreakdown(breakdown) => {
                 self.open_overlay(Overlay::Context(breakdown));
             }
@@ -721,10 +743,10 @@ impl AppState {
                 self.todos.clear();
                 self.workers.clear();
                 self.usage = UsageView::default();
-                self.notice = Some(format!(
+                self.notice = Some(info_notice(format!(
                     "resumed session {} ({turns} turn(s))",
                     name.unwrap_or(id)
-                ));
+                )));
             }
             AppEvent::TurnComplete { .. } => {
                 self.turn_active = false;
@@ -742,7 +764,7 @@ impl AppState {
                 self.queue.clear();
                 self.usage = UsageView::default();
                 self.turn_active = false;
-                self.notice = Some("cleared — new session".into());
+                self.notice = Some(info_notice("cleared — new session"));
                 effects.push(Effect::ClearScreen);
             }
             AppEvent::ProcessStarted { id, command } => {
@@ -752,7 +774,7 @@ impl AppState {
                     status: ProcStatus::Running,
                     output: VecDeque::new(),
                 });
-                self.notice = Some("background process started — press ↓ for the shell view".into());
+                self.notice = Some(info_notice("background process started — press ↓ for the shell view"));
             }
             AppEvent::ProcessOutput { id, line } => {
                 if let Some(p) = self.processes.iter_mut().find(|p| p.id == id) {
@@ -767,7 +789,9 @@ impl AppState {
                     p.status = ProcStatus::Exited(code);
                 }
             }
-            AppEvent::Error(text) => self.notice = Some(format!("error: {text}")),
+            AppEvent::Error(text) => {
+                self.notice = Some(Notice { level: NoticeLevel::Error, text: format!("error: {text}") });
+            }
         }
         effects
     }
@@ -831,7 +855,12 @@ impl AppState {
             | Action::AttachImage { .. }) => {
                 effects.push(Effect::Send(other));
             }
-            Action::ScrollUp(_) | Action::ScrollDown(_) | Action::Redraw => {}
+            // TUI-local scrollback: adjust the offset and repaint; never sent to
+            // core. The upper bound is clamped in render_live, where the view
+            // height is known (saturating_sub keeps the raw value recoverable).
+            Action::ScrollUp(n) => self.scroll_offset = self.scroll_offset.saturating_add(n),
+            Action::ScrollDown(n) => self.scroll_offset = self.scroll_offset.saturating_sub(n),
+            Action::Redraw => {}
         }
         effects
     }
@@ -928,7 +957,11 @@ mod tests {
             model: ModelView { provider: "p".into(), model: "m".into() },
             mode: Mode::Auto,
             cwd: PathBuf::from("/tmp"),
-            commands: vec!["review".into(), "rewind".into(), "resume".into()],
+            commands: vec![
+                CommandInfo::named("review"),
+                CommandInfo::named("rewind"),
+                CommandInfo::named("resume"),
+            ],
         })
     }
 
@@ -938,15 +971,14 @@ mod tests {
         assert!(!s.palette_active(), "no `/` typed yet");
 
         s.textarea.insert_str("/re");
-        assert_eq!(
-            s.command_matches(),
-            vec!["review".to_string(), "rewind".into(), "resume".into()]
-        );
+        let names: Vec<&str> = s.command_matches().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["review", "rewind", "resume"]);
         assert!(s.palette_active());
 
         s.textarea = TextArea::default();
         s.textarea.insert_str("/rev");
-        assert_eq!(s.command_matches(), vec!["review".to_string()]);
+        let names: Vec<&str> = s.command_matches().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["review"]);
 
         s.textarea = TextArea::default();
         s.textarea.insert_str("/nope");
@@ -1196,11 +1228,27 @@ mod tests {
     }
 
     #[test]
-    fn scroll_and_redraw_are_local_noops() {
+    fn scroll_actions_move_offset_locally_and_redraw_is_a_noop() {
         let mut s = test_state();
+        // Scroll actions are TUI-local: they move the offset, emit no effects.
         assert!(s.apply_action(Action::ScrollUp(3)).is_empty());
-        assert!(s.apply_action(Action::ScrollDown(3)).is_empty());
+        assert_eq!(s.scroll_offset, 3);
+        assert!(s.apply_action(Action::ScrollDown(1)).is_empty());
+        assert_eq!(s.scroll_offset, 2);
+        // ScrollDown saturates at the bottom (0 = pinned to live).
+        assert!(s.apply_action(Action::ScrollDown(5)).is_empty());
+        assert_eq!(s.scroll_offset, 0);
         assert!(s.apply_action(Action::Redraw).is_empty());
+        assert_eq!(s.scroll_offset, 0, "Redraw leaves the offset untouched");
+    }
+
+    #[test]
+    fn a_new_turn_snaps_scroll_back_to_live() {
+        let mut s = test_state();
+        s.apply_action(Action::ScrollUp(4));
+        assert_eq!(s.scroll_offset, 4);
+        s.apply_event(AppEvent::TurnStarted { turn_id: 1 });
+        assert_eq!(s.scroll_offset, 0, "a new turn jumps back to the latest output");
     }
 
     #[test]
@@ -1344,12 +1392,14 @@ mod tests {
     fn notice_and_error_events_set_notice_text() {
         let mut s = test_state();
         s.apply_event(AppEvent::Notice {
-            level: stepper_protocol::NoticeLevel::Info,
+            level: NoticeLevel::Warn,
             text: "saved".into(),
         });
-        assert_eq!(s.notice.as_deref(), Some("saved"));
+        let n = s.notice.as_ref().unwrap();
+        assert_eq!((n.level, n.text.as_str()), (NoticeLevel::Warn, "saved"), "level is preserved");
         s.apply_event(AppEvent::Error("boom".into()));
-        assert_eq!(s.notice.as_deref(), Some("error: boom"));
+        let n = s.notice.as_ref().unwrap();
+        assert_eq!((n.level, n.text.as_str()), (NoticeLevel::Error, "error: boom"));
     }
 
     #[test]
@@ -1520,7 +1570,7 @@ mod tests {
         let mut s = test_state();
         let effects = s.apply_event(AppEvent::CompactionStarted);
         assert!(effects.is_empty());
-        assert_eq!(s.notice.as_deref(), Some("compacting context…"));
+        assert_eq!(s.notice.as_ref().unwrap().text, "compacting context…");
     }
 
     #[test]
@@ -1529,7 +1579,7 @@ mod tests {
         s.apply_event(AppEvent::CompactionStarted);
         let effects = s.apply_event(AppEvent::CompactionDone { freed_tokens: 4096 });
         assert!(effects.is_empty());
-        assert_eq!(s.notice.as_deref(), Some("compacted (-4096 tok)"));
+        assert_eq!(s.notice.as_ref().unwrap().text, "compacted (-4096 tok)");
     }
 
     fn checkpoint_list() -> AppEvent {
@@ -1801,7 +1851,7 @@ mod tests {
         assert!(s.live.assistant.is_empty());
         assert!(s.todos.is_empty());
         assert_eq!(s.usage.tokens_in, 0, "stale usage cleared");
-        assert_eq!(s.notice.as_deref(), Some("resumed session earlier (3 turn(s))"));
+        assert_eq!(s.notice.as_ref().unwrap().text, "resumed session earlier (3 turn(s))");
     }
 
     #[test]

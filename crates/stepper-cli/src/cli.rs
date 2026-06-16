@@ -86,9 +86,9 @@ pub enum Command {
     },
     /// Write a default plan → implement → review layer pipeline.
     ScaffoldLayer,
-    /// Migrate another agent's global config (Claude Code / Codex) into
-    /// `~/.stepper/`. Shows the plan then asks before writing; `--dry-run`
-    /// previews only, `--yes` skips the prompt.
+    /// Migrate another agent's global config (Claude Code / Codex / Cursor /
+    /// Gemini) into `~/.stepper/`. Shows the plan then asks before writing;
+    /// `--dry-run` previews only, `--yes` skips the prompt.
     Import(ImportArgs),
 }
 
@@ -114,6 +114,8 @@ pub struct ImportArgs {
 pub enum ImportSourceArg {
     Claude,
     Codex,
+    Cursor,
+    Gemini,
     All,
 }
 
@@ -154,12 +156,33 @@ pub struct AuthLoginArgs {
 
 #[derive(Args)]
 pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub action: Option<ConfigAction>,
     /// Print the JSON Schema for `.stepper/setting.json`.
     #[arg(long)]
     pub schema: bool,
     /// Validate the project's `.stepper/setting.json`.
     #[arg(long)]
     pub validate: bool,
+}
+
+/// `stepper config set/get` — edit a scalar `setting.json` key (validated) or
+/// print its resolved value.
+#[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Set a scalar key (e.g. `defaultModel`, `mode`, `limits.turnTimeoutSecs`,
+    /// `dispatch.enabled`) in the project (or `~/.stepper`) setting.json.
+    Set {
+        /// Dotted key.
+        key: String,
+        /// New value (parsed to the key's type and validated before writing).
+        value: String,
+    },
+    /// Print a scalar key's resolved value (`(unset)` when absent).
+    Get {
+        /// Dotted key.
+        key: String,
+    },
 }
 
 /// `--mode` choices. `Bypass` is deliberately absent — it is only reachable via
@@ -242,6 +265,49 @@ mod tests {
             panic!("expected import command");
         };
         assert_eq!(args.resolved_source(), ImportSourceArg::Codex);
+
+        // Cursor / Gemini sources parse too.
+        for (arg, want) in [("cursor", ImportSourceArg::Cursor), ("gemini", ImportSourceArg::Gemini)] {
+            let cli = Cli::try_parse_from(["stepper", "import", arg]).unwrap();
+            let Some(Command::Import(args)) = cli.command else {
+                panic!("expected import command");
+            };
+            assert_eq!(args.resolved_source(), want);
+        }
+    }
+
+    #[test]
+    fn config_set_get_parse() {
+        let cli = Cli::try_parse_from(["stepper", "config", "set", "defaultModel", "openai/gpt-5"]).unwrap();
+        let Some(Command::Config(args)) = cli.command else {
+            panic!("expected config command");
+        };
+        match args.action {
+            Some(ConfigAction::Set { key, value }) => {
+                assert_eq!(key, "defaultModel");
+                assert_eq!(value, "openai/gpt-5");
+            }
+            _ => panic!("expected a set action"),
+        }
+
+        let cli = Cli::try_parse_from(["stepper", "config", "get", "mode"]).unwrap();
+        let Some(Command::Config(args)) = cli.command else {
+            panic!("expected config command");
+        };
+        assert!(matches!(args.action, Some(ConfigAction::Get { key }) if key == "mode"));
+
+        // The existing flags still parse with no action.
+        let cli = Cli::try_parse_from(["stepper", "config", "--validate"]).unwrap();
+        let Some(Command::Config(args)) = cli.command else {
+            panic!("expected config command");
+        };
+        assert!(args.action.is_none() && args.validate);
+
+        let cli = Cli::try_parse_from(["stepper", "config"]).unwrap();
+        let Some(Command::Config(args)) = cli.command else {
+            panic!("expected config command");
+        };
+        assert!(args.action.is_none() && !args.schema && !args.validate);
 
         // Flag form, plus dry-run.
         let cli = Cli::try_parse_from(["stepper", "import", "--from", "claude", "--dry-run"]).unwrap();

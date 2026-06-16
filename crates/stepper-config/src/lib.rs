@@ -24,6 +24,7 @@ pub use frontmatter::{
     LayerFrontmatter, McpAllow, OutputStyleDef, SkillDef, ToolFilter,
 };
 pub use model::ResolvedModel;
+pub use scaffold::{get_scalar, set_scalar};
 pub use schema::{settings_schema, validate_settings, validate_settings_values};
 pub use settings::{
     deep_merge, ApprovalRule, HookEntry, LimitsConfig, McpServerConfig, OrchestratorConfig,
@@ -153,6 +154,36 @@ impl Config {
             }
         }
         names.into_iter().collect()
+    }
+
+    /// `(name, description)` for each user command (project wins on a name clash),
+    /// for the `/` palette. A missing/unparseable file or absent `description`
+    /// yields an empty description (the command still lists).
+    pub fn command_descriptions(&self) -> Vec<(String, String)> {
+        let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        for dir in [self.project_dir.as_ref(), self.user_dir.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let Ok(entries) = std::fs::read_dir(dir.join("commands")) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|x| x.to_str()) == Some("md")
+                    && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                    && !map.contains_key(stem)
+                {
+                    let desc = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|content| parse_command(stem, &content).ok())
+                        .and_then(|def| def.description)
+                        .unwrap_or_default();
+                    map.insert(stem.to_string(), desc);
+                }
+            }
+        }
+        map.into_iter().collect()
     }
 
     /// Load the output styles from `<.stepper>/output-styles/*.md` in the
