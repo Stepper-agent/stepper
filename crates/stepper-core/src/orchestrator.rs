@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use stepper_permission::{PermissionMode, RuleSet};
 use stepper_provider::{ChatRequest, ChatStream, ContentBlock, LlmProvider, Message, ProviderError};
 use stepper_protocol::{AppEvent, EventTx, LayerStatus, ModelView};
@@ -189,8 +189,14 @@ pub struct Orchestrator {
     pub project_root: PathBuf,
     pub cwd: PathBuf,
     pub home: Option<PathBuf>,
-    pub rules: Arc<RuleSet>,
-    pub mode: PermissionMode,
+    /// Live session rules, mutated in place by AlwaysAllow grants and the
+    /// `/allow|/deny|/ask` commands. `run_turn` snapshots it per turn; the
+    /// approver and the slash commands hold a clone of the same cell.
+    pub rules: Arc<RwLock<RuleSet>>,
+    /// Live permission mode, mutated by Shift+Tab (`SetMode`) and the
+    /// `exit_plan_mode` tool. The sequential layer's ToolCx holds a clone so an
+    /// in-turn flip is seen immediately (B6 6b).
+    pub mode: Arc<RwLock<PermissionMode>>,
     pub hooks: Arc<HookHost>,
     /// MCP servers with `alwaysLoad: true` — visible to every layer regardless of
     /// per-layer `mcp.allow`.
@@ -232,6 +238,17 @@ pub struct TurnOutput {
 }
 
 impl Orchestrator {
+    /// A consistent snapshot of the live rules for a turn/layer (so a mid-turn
+    /// AlwaysAllow/`/allow` fold is picked up by the next snapshot, not mid-walk).
+    pub(crate) fn rules_snapshot(&self) -> Arc<RuleSet> {
+        Arc::new(self.rules.read().unwrap().clone())
+    }
+
+    /// The current live permission mode.
+    pub(crate) fn mode_snapshot(&self) -> PermissionMode {
+        *self.mode.read().unwrap()
+    }
+
     pub async fn run_turn(
         &self,
         user_turn: String,
@@ -359,7 +376,7 @@ impl Orchestrator {
             // fallback model ends up serving the layer.
             let mut active_info = model_info;
             let provider = budget_wrap(provider, &budget, model_info);
-            let layer_rules = layer_ruleset(&self.rules, &step.permission);
+            let layer_rules = layer_ruleset(&self.rules_snapshot(), &step.permission);
             let mut tools = self
                 .base_tools
                 .filtered(&step.tool_allow, &step.tool_deny)
@@ -376,7 +393,7 @@ impl Orchestrator {
                     project_root: self.project_root.clone(),
                     home: self.home.clone(),
                     rules: layer_rules.clone(),
-                    mode: self.mode,
+                    mode: self.mode_snapshot(),
                     default_model: step.model_ref.clone(),
                     event_tx: event_tx.clone(),
                     approver: approver.clone(),
@@ -398,6 +415,11 @@ impl Orchestrator {
             if !step.skills.is_empty() {
                 tools.register(Arc::new(crate::skills::SkillTool::new(step.skills.clone())));
             }
+            // In plan mode the model can call `exit_plan_mode` to present its plan
+            // and, on approval, flip the live mode to AcceptEdits this same turn.
+            if self.mode_snapshot() == PermissionMode::Plan {
+                tools.register(Arc::new(crate::exit_plan::ExitPlanTool::new(self.mode.clone())));
+            }
             let system = self.system_for(step);
             let layer_initial = handoff.initial_messages();
             // A resumed session replays the real prior conversation ahead of
@@ -413,7 +435,10 @@ impl Orchestrator {
                     cwd: self.cwd.clone(),
                     project_root: self.project_root.clone(),
                     home: self.home.clone(),
-                    mode: self.mode,
+                    mode: self.mode_snapshot(),
+                    // The sequential layer holds the live mode cell so an in-turn
+                    // exit_plan_mode flip is seen by its own later tool calls.
+                    live_mode: Some(self.mode.clone()),
                     rules: layer_rules.clone(),
                     approver: approver.clone(),
                     cancel: cancel.clone(),
@@ -509,7 +534,8 @@ impl Orchestrator {
                                 cwd: self.cwd.clone(),
                                 project_root: self.project_root.clone(),
                                 home: self.home.clone(),
-                                mode: self.mode,
+                                mode: self.mode_snapshot(),
+                                live_mode: Some(self.mode.clone()),
                                 rules: layer_rules.clone(),
                                 approver: approver.clone(),
                                 cancel: cancel.clone(),
@@ -638,7 +664,7 @@ impl Orchestrator {
                 stepper_provider::Usage::default(),
             );
         }
-        let layer_rules = layer_ruleset(&self.rules, &step.permission);
+        let layer_rules = layer_ruleset(&self.rules_snapshot(), &step.permission);
         // Workers are leaves: the step's tool view, with no `dispatch`/`assign_tasks`,
         // but they may load this layer's skills via the `skill` tool.
         let mut tools = self
@@ -670,7 +696,9 @@ impl Orchestrator {
                             cwd: self.cwd.clone(),
                             project_root: self.project_root.clone(),
                             home: self.home.clone(),
-                            mode: self.mode,
+                            mode: self.mode_snapshot(),
+                            // Workers don't run exit_plan; the static snapshot suffices.
+                            live_mode: None,
                             rules: layer_rules.clone(),
                             approver: approver.clone(),
                             cancel: cancel.clone(),

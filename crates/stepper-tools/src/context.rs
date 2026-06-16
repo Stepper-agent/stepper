@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use stepper_permission::{evaluate_in, Decision, PermissionMode, PermissionRequest, RuleSet};
 use stepper_provider::ToolError;
 use tokio_util::sync::CancellationToken;
@@ -30,6 +30,11 @@ pub struct ToolCx {
     pub project_root: PathBuf,
     pub home: Option<PathBuf>,
     pub mode: PermissionMode,
+    /// An optional handle to the session's live permission mode. When present the
+    /// gate prefers it over the snapshot `mode`, so an in-turn `exit_plan_mode`
+    /// flip (Plan → AcceptEdits) takes effect within the same layer. `None` keeps
+    /// the static `mode` (workers, sub-agents, tests).
+    pub live_mode: Option<Arc<RwLock<PermissionMode>>>,
     pub rules: Arc<RuleSet>,
     pub approver: Arc<dyn Approver>,
     pub cancel: CancellationToken,
@@ -90,13 +95,20 @@ impl ToolCx {
         request: PermissionRequest,
         approval: Approval,
     ) -> Result<(), ToolError> {
+        // Prefer the live mode cell (so an in-turn exit_plan flip is seen) and
+        // fall back to the per-turn snapshot when there is no live handle.
+        let mode = self
+            .live_mode
+            .as_ref()
+            .map(|c| *c.read().unwrap())
+            .unwrap_or(self.mode);
         match evaluate_in(
             &request,
             &self.rules,
             &self.project_root,
             self.home.as_deref(),
             &self.cwd,
-            self.mode,
+            mode,
         ) {
             Decision::Allow => Ok(()),
             Decision::Deny => Err(ToolError::Denied(format!(
@@ -157,6 +169,7 @@ mod tests {
             project_root: PathBuf::from("/project"),
             home: None,
             mode: PermissionMode::Default,
+            live_mode: None,
             rules: Arc::new(RuleSet::from_lists(&[], &[], &[])),
             approver: Arc::new(NeverApprover),
             cancel,

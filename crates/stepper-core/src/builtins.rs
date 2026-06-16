@@ -11,7 +11,7 @@ use crate::error::CoreError;
 use crate::orchestrator::Orchestrator;
 use crate::session::{SessionRecord, SessionStore, TurnRecord};
 use std::path::Path;
-use stepper_permission::PermissionMode;
+use stepper_permission::{PermissionMode, Rule};
 use stepper_protocol::{
     AppEvent, ApprovalRuleView, CheckpointView, ContextBreakdownView, EventTx, ModelView,
     NoticeLevel, PermissionRuleView, PermissionsSnapshotView, SessionView,
@@ -36,6 +36,9 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("model", "[provider/model]", "show or switch"),
     ("models", "", "pick from fetched models"),
     ("permissions", "", "rules & approvals"),
+    ("allow", "<spec>", "add an allow rule (e.g. Bash(cargo *))"),
+    ("ask", "<spec>", "add an ask rule"),
+    ("deny", "<spec>", "add a deny rule"),
     ("resume", "", "pick a session"),
     ("rewind", "", "pick a checkpoint, also Esc-Esc"),
 ];
@@ -145,6 +148,10 @@ pub async fn handle(
         }
         "permissions" => {
             handle_permissions(orchestrator, tx).await;
+            true
+        }
+        verdict @ ("allow" | "ask" | "deny") => {
+            handle_permission_rule(verdict, args.trim(), orchestrator, tx).await;
             true
         }
         "resume" => {
@@ -624,6 +631,60 @@ fn mode_label(mode: PermissionMode) -> &'static str {
 /// `/permissions`: a read-only snapshot of the rules and persisted approvals as
 /// they stand in the settings files right now (user + project scopes read
 /// separately so each rule names its source).
+/// `/allow|/ask|/deny <spec>` — validate the spec, fold it into the live rules
+/// (so it applies immediately), and persist it to setting.json `permissions`.
+async fn handle_permission_rule(verdict: &str, spec: &str, orchestrator: &mut Orchestrator, tx: &EventTx) {
+    if spec.is_empty() {
+        notice(tx, NoticeLevel::Warn, format!("usage: /{verdict} <spec>  (e.g. /{verdict} Bash(cargo *))")).await;
+        return;
+    }
+    if Rule::parse(spec).is_none() {
+        notice(tx, NoticeLevel::Warn, format!("malformed permission spec: {spec}")).await;
+        return;
+    }
+    // Live-fold into the matching bucket so it applies on the next tool call.
+    let specs = [spec.to_string()];
+    {
+        let mut w = orchestrator.rules.write().unwrap();
+        *w = match verdict {
+            "allow" => w.extended(&specs, &[], &[]),
+            "ask" => w.extended(&[], &specs, &[]),
+            _ => w.extended(&[], &[], &specs),
+        };
+    }
+    // Persist to setting.json permissions.{allow|ask|deny} (de-duped).
+    let project = orchestrator.project_root.join(".stepper");
+    let dir = if project.is_dir() {
+        Some(project)
+    } else {
+        orchestrator.home.as_ref().map(|h| h.join(".stepper"))
+    };
+    if let Some(dir) = dir {
+        let bucket = verdict.to_string();
+        let spec_owned = spec.to_string();
+        let result = stepper_config::scaffold::update_settings(&dir, |obj| {
+            let perms = obj
+                .entry("permissions")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(perms) = perms.as_object_mut() {
+                let arr = perms
+                    .entry(bucket)
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                if let Some(arr) = arr.as_array_mut()
+                    && !arr.iter().any(|v| v.as_str() == Some(spec_owned.as_str()))
+                {
+                    arr.push(serde_json::Value::String(spec_owned));
+                }
+            }
+        });
+        if let Err(e) = result {
+            notice(tx, NoticeLevel::Warn, format!("rule applied but not persisted: {e}")).await;
+            return;
+        }
+    }
+    handle_permissions(orchestrator, tx).await;
+}
+
 async fn handle_permissions(orchestrator: &Orchestrator, tx: &EventTx) {
     let mut rules = Vec::new();
     let mut approvals = Vec::new();
@@ -658,7 +719,7 @@ async fn handle_permissions(orchestrator: &Orchestrator, tx: &EventTx) {
         }
     }
     let snapshot = PermissionsSnapshotView {
-        mode: mode_label(orchestrator.mode).into(),
+        mode: mode_label(orchestrator.mode_snapshot()).into(),
         rules,
         approvals,
     };

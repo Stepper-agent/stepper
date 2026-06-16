@@ -120,7 +120,13 @@ pub async fn build_orchestrator_with_fallback(
         .iter()
         .map(|a| a.rule.clone())
         .collect();
-    let rules = Arc::new(checked_rules(&config.settings.permissions, &approvals)?);
+    // Live, mutable session state: AlwaysAllow grants and /allow|/deny|/ask write
+    // `rules`; Shift+Tab and exit_plan_mode write `mode`.
+    let rules = Arc::new(std::sync::RwLock::new(checked_rules(
+        &config.settings.permissions,
+        &approvals,
+    )?));
+    let mode = Arc::new(std::sync::RwLock::new(mode));
 
     let hooks = Arc::new(HookHost::new(config.settings.hooks.clone(), cwd.clone()));
 

@@ -10,6 +10,7 @@ pub mod commands;
 pub mod compaction;
 pub mod dispatch;
 pub mod error;
+pub mod exit_plan;
 pub mod fanout;
 pub mod hooks;
 pub mod layer;
@@ -78,6 +79,9 @@ pub fn spawn_core(
     tokio::spawn(async move {
         let approver = Arc::new(ChannelApprover {
             event_tx: tx.clone(),
+            rules: orchestrator.rules.clone(),
+            project_root: orchestrator.project_root.clone(),
+            home: orchestrator.home.clone(),
         });
         let mut turn_id: u64 = session.turns.len() as u64;
         // Session-level usage/cost, accumulated from each completed turn for
@@ -237,8 +241,8 @@ pub fn spawn_core(
                     let project_root = orchestrator.project_root.clone();
                     let home = orchestrator.home.clone();
                     let cwd = orchestrator.cwd.clone();
-                    let rules = orchestrator.rules.clone();
-                    let mode = orchestrator.mode;
+                    let rules = orchestrator.rules_snapshot();
+                    let mode = orchestrator.mode_snapshot();
                     let (cmd_name, cmd_args) = (name.clone(), args.clone());
                     // Substitution is permission-gated (fail-closed); run it off-thread
                     // since `!`shell`` may block.
@@ -371,7 +375,7 @@ pub fn spawn_core(
                 // without this the orchestrator keeps its startup mode forever and
                 // switching into Auto (etc.) interactively has no effect.
                 Action::SetMode(m) => {
-                    orchestrator.mode = permission_mode(m);
+                    *orchestrator.mode.write().unwrap() = permission_mode(m);
                 }
                 _ => {}
             }
@@ -524,7 +528,10 @@ async fn run_shell(
         // wins in every mode). This does NOT touch the `.stepper/commands` shell
         // gate, which stays rule-only fail-closed (model-plantable, see commands.rs).
         mode: stepper_permission::PermissionMode::Bypass,
-        rules: orchestrator.rules.clone(),
+        // Hard-coded Bypass — no live-mode handle (an interactive !cmd is never
+        // subject to the model's plan-mode flips).
+        live_mode: None,
+        rules: orchestrator.rules_snapshot(),
         approver,
         cancel,
     };

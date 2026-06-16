@@ -116,6 +116,7 @@ mod tests {
             project_root: ".".into(),
             home: None,
             mode: PermissionMode::Auto,
+            live_mode: None,
             rules: Arc::new(RuleSet::default()),
             approver: Arc::new(NoApprover),
             cancel: CancellationToken::new(),

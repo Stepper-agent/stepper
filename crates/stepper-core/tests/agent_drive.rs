@@ -64,6 +64,7 @@ fn make_cx(dir: &std::path::Path) -> ToolCx {
         project_root: dir.to_path_buf(),
         home: None,
         mode: PermissionMode::AcceptEdits,
+        live_mode: None,
         rules: Arc::new(RuleSet::default()),
         approver: Arc::new(AllowAll),
         cancel: CancellationToken::new(),

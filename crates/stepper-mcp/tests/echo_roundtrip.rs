@@ -133,6 +133,7 @@ fn cx(approver: Arc<dyn Approver>) -> ToolCx {
         project_root: cwd,
         home: None,
         mode: PermissionMode::AcceptEdits,
+        live_mode: None,
         rules: Arc::new(RuleSet::default()),
         approver,
         cancel: CancellationToken::new(),

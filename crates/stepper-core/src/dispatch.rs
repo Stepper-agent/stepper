@@ -187,6 +187,8 @@ impl Dispatcher for OrchestratorDispatcher {
                             project_root: self.project_root.clone(),
                             home: self.home.clone(),
                             mode: self.mode,
+                            // Dispatched sub-agents use the static snapshot mode.
+                            live_mode: None,
                             rules: self.rules.clone(),
                             approver: self.approver.clone(),
                             cancel: self.cancel.clone(),

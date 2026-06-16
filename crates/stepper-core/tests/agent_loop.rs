@@ -95,6 +95,7 @@ async fn react_loop_runs_a_tool_then_finishes() {
         project_root: dir.path().to_path_buf(),
         home: None,
         mode: PermissionMode::AcceptEdits,
+        live_mode: None,
         rules: Arc::new(RuleSet::default()),
         approver: Arc::new(AllowAll),
         cancel: CancellationToken::new(),

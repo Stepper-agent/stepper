@@ -96,8 +96,8 @@ fn orchestrator(root: std::path::PathBuf) -> Orchestrator {
         project_root: root.clone(),
         cwd: root.clone(),
         home: None,
-        rules: Arc::new(RuleSet::default()),
-        mode: PermissionMode::AcceptEdits,
+        rules: Arc::new(std::sync::RwLock::new(RuleSet::default())),
+        mode: Arc::new(std::sync::RwLock::new(PermissionMode::AcceptEdits)),
         hooks: Arc::new(HookHost::empty(root)),
         always_load_mcp: Vec::new(),
         compaction_model: None,
@@ -123,6 +123,44 @@ async fn next_context_breakdown(rx: &mut EventRx) -> stepper_protocol::ContextBr
         }
     }
     panic!("event stream ended before a ContextBreakdown");
+}
+
+async fn next_permissions(rx: &mut EventRx) -> stepper_protocol::PermissionsSnapshotView {
+    while let Some(ev) = rx.recv().await {
+        if let AppEvent::PermissionsSnapshot(v) = ev {
+            return v;
+        }
+    }
+    panic!("event stream ended before a PermissionsSnapshot");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slash_allow_adds_persists_and_rejects_malformed() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".stepper")).unwrap();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator(dir.path().to_path_buf()),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+
+    // /allow folds the rule live and persists it; the snapshot reflects it.
+    action_tx.send(slash("allow", "Bash(cargo *)")).await.unwrap();
+    let snap = next_permissions(&mut events).await;
+    assert!(
+        snap.rules.iter().any(|r| r.verdict == "allow" && r.rule == "Bash(cargo *)"),
+        "snapshot shows the new allow rule: {:?}",
+        snap.rules
+    );
+    let written = std::fs::read_to_string(dir.path().join(".stepper/setting.json")).unwrap();
+    assert!(written.contains("Bash(cargo *)"), "persisted: {written}");
+
+    // A malformed spec is rejected with a warning and not written.
+    action_tx.send(slash("deny", "Bash(rm")).await.unwrap();
+    let warn = next_notice(&mut events).await;
+    assert!(warn.contains("malformed"), "got: {warn}");
 }
 
 async fn next_notice(rx: &mut EventRx) -> String {

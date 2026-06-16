@@ -379,7 +379,7 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         global.name.as_deref(),
     );
     // The orchestrator's mode is the resolved one (flag > setting.json > default).
-    let resolved_mode = perm_to_mode(orchestrator.mode);
+    let resolved_mode = perm_to_mode(*orchestrator.mode.read().unwrap());
     // First-run / keyless start: if the active model's provider needs an API key
     // and none is resolvable (env / keyring / config), open the key overlay right
     // away by replaying a `/login <provider>` once the session is up.

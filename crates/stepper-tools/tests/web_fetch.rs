@@ -82,6 +82,7 @@ fn cx_with(mode: PermissionMode, rules: RuleSet, approver: Arc<dyn Approver>) ->
         project_root: dir,
         home: None,
         mode,
+        live_mode: None,
         rules: Arc::new(rules),
         approver,
         cancel: CancellationToken::new(),
