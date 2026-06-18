@@ -24,7 +24,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -58,7 +58,7 @@ jobs:
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -91,7 +91,7 @@ jobs:
           Compress-Archive -Path "$dist/*" -DestinationPath "$dist.zip"
           "ASSET=$dist.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: stepper-${{ matrix.target }}
           path: ${{ env.ASSET }}
@@ -102,7 +102,7 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Point the version tag at this commit
         run: |
@@ -110,14 +110,12 @@ jobs:
           git tag -f "$tag"
           git push -f origin "$tag"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true
 
       # Version-less copies for static hosting (e.g. a Vercel install-files/
-      # folder the curl|bash installer downloads from). `stepper-<target>.<ext>`
-      # always points at the latest release.
       - name: Add version-less asset copies
         run: |
           cd dist

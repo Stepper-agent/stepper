@@ -263,6 +263,46 @@ async fn a_live_session_remembers_prior_turns_without_resume() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_live_session_remembers_a_prior_turn_that_used_a_tool() {
+    // Turn 1 issues a `list_dir` tool call then ends; turn 2 must carry turn 1's
+    // FULL transcript (user + tool call + tool result + reply) before the new
+    // prompt. This is the every-turn-uses-a-tool case the screenshot hit.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let seen_messages: Arc<Mutex<Vec<Vec<Message>>>> = Arc::default();
+    let resolver = Arc::new(RecordingResolver {
+        tool_first: true,
+        calls: Arc::default(),
+        seen_messages: seen_messages.clone(),
+        seen_systems: Arc::default(),
+    });
+    let orch = orchestrator(resolver, root.clone());
+
+    let (action_tx, action_rx) = mpsc::channel(16);
+    let mut events = spawn_core(orch, SessionRecord::fresh(), action_rx, CancellationToken::new());
+
+    action_tx
+        .send(Action::SubmitInput("collect EVERYTHING_ABOUT_STOCKS".into()))
+        .await
+        .unwrap();
+    drive_turn(&mut events).await;
+    action_tx
+        .send(Action::SubmitInput("go ahead".into()))
+        .await
+        .unwrap();
+    drive_turn(&mut events).await;
+
+    let requests = seen_messages.lock().unwrap();
+    // turn 1: call 0 (user only) then call 1 (after the tool result, mid-turn).
+    let last = requests.last().expect("turn 2 made a request");
+    assert!(
+        last.iter().any(|m| m.text().contains("EVERYTHING_ABOUT_STOCKS")),
+        "turn 2 must remember turn 1 even though turn 1 used a tool: {last:#?}"
+    );
+    assert!(last.last().unwrap().text().contains("go ahead"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn resume_seeds_the_real_prior_messages_into_the_next_request() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();

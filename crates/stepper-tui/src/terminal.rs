@@ -2,8 +2,8 @@ use std::io::stdout;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::supports_keyboard_enhancement;
@@ -50,9 +50,10 @@ impl TerminalGuard {
         let terminal = ratatui::init_with_options(TerminalOptions {
             viewport: Viewport::Inline(inline_height),
         });
-        // Capture the mouse wheel so PgUp/PgDn-style scrollback also works by
-        // scrolling (best-effort — a terminal without mouse support just ignores it).
-        let _ = execute!(stdout(), EnableMouseCapture);
+        // Deliberately DO NOT enable mouse capture: with the inline viewport the
+        // native terminal keeps its own scrollback and text selection, and
+        // capturing the mouse would steal the wheel (no native scroll) and drag
+        // (no select-to-copy). In-app live-region scrolling stays on PgUp/PgDn.
         if supports_keyboard_enhancement().unwrap_or(false)
             && execute!(
                 stdout(),

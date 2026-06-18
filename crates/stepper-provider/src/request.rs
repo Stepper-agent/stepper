@@ -56,6 +56,13 @@ pub struct ChatRequest {
     /// Responses cache by prefix automatically and ignore this.
     #[serde(default)]
     pub cache: bool,
+    /// The model's full context window in tokens, when known. Only the Ollama
+    /// adapter uses it (as `num_ctx`); Ollama otherwise caps the runtime context
+    /// at its own default (~4096) and silently truncates the oldest tokens — the
+    /// system prompt and prior turns — so a multi-turn agent appears to forget
+    /// everything. The other dialects ignore this.
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 
 impl ChatRequest {

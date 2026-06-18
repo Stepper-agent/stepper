@@ -153,6 +153,10 @@ impl AgentLoop<'_> {
                 // The per-layer system + tools prefix is stable across every ReAct
                 // step, so cache it (Anthropic; no-op for the other dialects).
                 cache: true,
+                // Ollama needs this as `num_ctx` or it truncates to ~4096 and the
+                // agent forgets prior turns (no-op for the other dialects).
+                context_window: (self.model_info.context_window > 0)
+                    .then_some(self.model_info.context_window as u32),
             };
 
             let (response, step_usage) = self.stream_once(request, &mut total).await?;

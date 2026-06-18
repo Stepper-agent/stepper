@@ -15,6 +15,10 @@ pub struct OpenAiCompatAdapter {
     base_url: String,
     model: String,
     auth: AuthSource,
+    /// Ollama truncates the prompt to its default `num_ctx` (~4096) and silently
+    /// drops the oldest tokens — system prompt + prior turns — unless `num_ctx` is
+    /// sent in the request. Set for Ollama endpoints so the request carries it.
+    is_ollama: bool,
 }
 
 impl OpenAiCompatAdapter {
@@ -25,14 +29,26 @@ impl OpenAiCompatAdapter {
         model: impl Into<String>,
         auth: AuthSource,
     ) -> Self {
+        let provider_name = provider_name.into();
+        let base_url = base_url.into();
+        let is_ollama = is_ollama_endpoint(&provider_name, &base_url);
         OpenAiCompatAdapter {
             client,
-            provider_name: provider_name.into(),
-            base_url: base_url.into(),
+            provider_name,
+            base_url,
             model: model.into(),
             auth,
+            is_ollama,
         }
     }
+}
+
+/// Whether this endpoint is Ollama (local or cloud), by provider name or URL.
+/// Only Ollama reads `num_ctx`; oMLX/vLLM/OpenAI must not receive it.
+fn is_ollama_endpoint(provider_name: &str, base_url: &str) -> bool {
+    provider_name.contains("ollama")
+        || base_url.contains("ollama")
+        || base_url.contains(":11434")
 }
 
 #[async_trait]
@@ -50,7 +66,17 @@ impl LlmProvider for OpenAiCompatAdapter {
         request: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<ChatStream, ProviderError> {
-        let body = wire::openai::build_request_body(&request, &self.model, true);
+        let mut body = wire::openai::build_request_body(&request, &self.model, true);
+        // Ollama caps the runtime context at its default (~4096) and silently
+        // truncates the oldest tokens unless `num_ctx` is sent — without this the
+        // system prompt and prior turns fall out of the window and the agent
+        // forgets the conversation. Align it with the window stepper plans against.
+        if self.is_ollama
+            && let Some(ctx) = request.context_window
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("num_ctx".into(), serde_json::json!(ctx));
+        }
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         let mut rb = self.client.post(url).json(&body);
@@ -67,5 +93,21 @@ impl LlmProvider for OpenAiCompatAdapter {
                 wire::openai::parse_chunk(&frame.data).map(Some)
             }
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_ollama_endpoint;
+
+    #[test]
+    fn detects_ollama_by_name_or_url_but_not_other_openai_compat() {
+        assert!(is_ollama_endpoint("ollama", "http://localhost:11434/v1"));
+        assert!(is_ollama_endpoint("my-llm", "http://localhost:11434/v1"));
+        assert!(is_ollama_endpoint("ollama-cloud", "https://ollama.com/v1"));
+        // oMLX / vLLM / OpenAI must NOT be treated as Ollama (they reject num_ctx).
+        assert!(!is_ollama_endpoint("omlx", "http://localhost:8000/v1"));
+        assert!(!is_ollama_endpoint("openai", "https://api.openai.com/v1"));
+        assert!(!is_ollama_endpoint("vllm", "https://vllm.internal/v1"));
     }
 }
