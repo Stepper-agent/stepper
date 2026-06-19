@@ -77,8 +77,9 @@ impl AgentLoop<'_> {
             self.model_info.max_output_tokens,
         );
         // `last_context` is the provider-reported size of the last request
-        // (input + output) and `accounted` is how many leading messages it
-        // covers; everything appended since is estimated at chars/4. The plan
+        // (`context_tokens()` = uncached input + cache_read + cache_write +
+        // output) and `accounted` is how many leading messages it covers;
+        // everything appended since is estimated at chars/4. The plan
         // therefore sees the CURRENT request — the overflowing step compacts
         // itself instead of running one step late — and a seeded first step
         // (accounted = 0) is estimated in full.
@@ -178,7 +179,10 @@ impl AgentLoop<'_> {
             // The usage frame covers the request plus this assistant reply, so it
             // accounts for the list up to and including the message just pushed.
             // A provider that reports no usage keeps the chars/4 estimate live.
-            let observed = step_usage.input + step_usage.output;
+            // Use the full footprint (incl. cached prompt) — otherwise a cached
+            // Anthropic request collapses to the uncached delta and compaction
+            // never fires before the real prompt overflows the window.
+            let observed = step_usage.context_tokens();
             if observed > 0 {
                 last_context = observed;
                 accounted = messages.len();
@@ -214,8 +218,22 @@ impl AgentLoop<'_> {
                     produced.push(nudge);
                     continue;
                 }
+                // The handoff to the next layer is this layer's free text. If the
+                // final message had none (it ended on a non-text block, or empty),
+                // fall back to the last non-empty assistant text so the next layer
+                // is not handed an empty summary.
+                let mut summary = response.text();
+                if summary.trim().is_empty() {
+                    summary = produced
+                        .iter()
+                        .rev()
+                        .filter(|m| matches!(m.role, Role::Assistant))
+                        .map(|m| m.text())
+                        .find(|t| !t.trim().is_empty())
+                        .unwrap_or_else(|| "(layer produced no summary text)".to_string());
+                }
                 return Ok(LayerOutcome {
-                    summary: response.text(),
+                    summary,
                     usage: total,
                     tasks: captured_tasks,
                     messages: produced,
@@ -374,13 +392,13 @@ impl AgentLoop<'_> {
                 .event_tx
                 .send(AppEvent::WorkerActivity {
                     index,
-                    tokens: Some(cumulative.input + cumulative.output),
+                    tokens: Some(cumulative.context_tokens()),
                     tool: None,
                 })
                 .await;
             return;
         }
-        let context_used = step_usage.input + step_usage.output;
+        let context_used = step_usage.context_tokens();
         let view = UsageView {
             tokens_in: cumulative.input,
             tokens_out: cumulative.output,

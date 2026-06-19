@@ -301,10 +301,17 @@ fn render_palette(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         } else {
             Style::default().fg(theme.muted)
         };
+        // `argument-hint` (e.g. `<pr-number>`) is shown right after the name so
+        // the user sees what the command expects before invoking it.
+        let hint = cmd
+            .argument_hint
+            .as_deref()
+            .map(|h| format!(" {h}"))
+            .unwrap_or_default();
         let label = if cmd.description.is_empty() {
-            format!("/{}", cmd.name)
+            format!("/{}{hint}", cmd.name)
         } else {
-            format!("/{} — {}", cmd.name, cmd.description)
+            format!("/{}{hint} — {}", cmd.name, cmd.description)
         };
         lines.push(Line::from(Span::styled(
             format!("  {}", truncate(&label, inner.width.saturating_sub(2) as usize)),
@@ -915,7 +922,11 @@ mod tests {
             mode: Mode::Plan,
             cwd: PathBuf::from("/tmp/work"),
             commands: vec![
-                crate::CommandInfo { name: "review".into(), description: "review the diff".into() },
+                crate::CommandInfo {
+                    name: "review".into(),
+                    description: "review the diff".into(),
+                    argument_hint: Some("<pr-number>".into()),
+                },
                 crate::CommandInfo::named("rewind"),
                 crate::CommandInfo::named("resume"),
             ],
@@ -933,6 +944,15 @@ mod tests {
             "palette lists matches: {out}"
         );
         assert!(out.contains("review the diff"), "palette shows the description: {out}");
+    }
+
+    #[test]
+    fn command_palette_shows_argument_hints() {
+        let mut s = base_state();
+        s.textarea.insert_str("/rev");
+        let out = render_to_string(&s, 100, 12);
+        assert!(out.contains("/review"), "command listed: {out}");
+        assert!(out.contains("<pr-number>"), "argument hint shown next to it: {out}");
     }
 
     #[test]

@@ -73,6 +73,41 @@ data: [DONE]\n\n";
 }
 
 #[tokio::test]
+async fn openai_compat_excludes_cached_tokens_from_input() {
+    // OpenAI reports cached tokens as a SUBSET of prompt_tokens; the adapter must
+    // split them so `input` is the uncached prompt only (prompt 100, cached 80 =>
+    // input 20, cache_read 80) — otherwise cached tokens are double-counted in
+    // both cost and the context gauge.
+    let server = MockServer::start().await;
+    let body = "\
+data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"index\":0}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":80}}}\n\n\
+data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(body))
+        .mount(&server)
+        .await;
+
+    let adapter = OpenAiCompatAdapter::new(
+        reqwest::Client::new(),
+        "openai",
+        format!("{}/v1", server.uri()),
+        "test-model",
+        AuthSource::None,
+    );
+    let events = collect(adapter_stream(&adapter, req()).await).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            ChatEvent::Usage(u) if u.input == 20 && u.cache_read == 80 && u.output == 5
+        )),
+        "input is the uncached remainder, cache_read holds the cached subset: {events:#?}"
+    );
+}
+
+#[tokio::test]
 async fn openai_compat_accumulates_fragmented_tool_call() {
     let server = MockServer::start().await;
     let body = "\
@@ -200,6 +235,38 @@ data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"fun
     assert!(events
         .iter()
         .any(|e| matches!(e, ChatEvent::Done(StopReason::ToolUse))));
+}
+
+#[tokio::test]
+async fn responses_excludes_cached_tokens_from_input() {
+    // The Responses dialect (like Chat Completions) reports cached tokens as a
+    // SUBSET of input_tokens; the adapter must split them so `input` is the
+    // uncached prompt only (input_tokens 100, cached 80 => input 20, cache_read 80).
+    let server = MockServer::start().await;
+    let body = "\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":100,\"output_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":80}}}}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(sse(body))
+        .mount(&server)
+        .await;
+
+    let adapter = OpenAiResponsesAdapter::new(
+        reqwest::Client::new(),
+        "openai",
+        format!("{}/v1", server.uri()),
+        "gpt-x",
+        AuthSource::ApiKey("secret".into()),
+    );
+    let events = collect(adapter_stream(&adapter, req()).await).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            ChatEvent::Usage(u) if u.input == 20 && u.cache_read == 80 && u.output == 5
+        )),
+        "input is the uncached remainder, cache_read holds the cached subset: {events:#?}"
+    );
 }
 
 #[tokio::test]

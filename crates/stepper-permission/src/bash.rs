@@ -142,6 +142,25 @@ fn scan(command: &str, out: &mut Vec<BashAtom>, depth: usize) -> Option<()> {
                 finish_atom(&mut text, &mut masked, out)?;
                 i += 1;
             }
+            // Subshell `( … )` and brace-group `{ …; }` delimiters split commands
+            // like `;` does, so a deny such as `Bash(rm -rf *)` cannot be evaded by
+            // wrapping the command in a group. `$( )`, `` ` ` ``, `<( )`, `>( )` are
+            // consumed by their own arms above, so a bare `(`/`)` here is grouping.
+            // Brace expansion (`{1..5}`, `a.{x,y}`) is preserved: `{` only splits
+            // when followed by whitespace (group syntax) and `}` only when it
+            // stands alone (preceded by whitespace).
+            '(' | ')' => {
+                finish_atom(&mut text, &mut masked, out)?;
+                i += 1;
+            }
+            '{' if chars.get(i + 1).is_some_and(|c| c.is_whitespace()) => {
+                finish_atom(&mut text, &mut masked, out)?;
+                i += 1;
+            }
+            '}' if text.chars().last().is_none_or(char::is_whitespace) => {
+                finish_atom(&mut text, &mut masked, out)?;
+                i += 1;
+            }
             _ => {
                 text.push(c);
                 masked.push(c);
@@ -155,8 +174,53 @@ fn scan(command: &str, out: &mut Vec<BashAtom>, depth: usize) -> Option<()> {
     finish_atom(&mut text, &mut masked, out)
 }
 
+/// Collapse runs of unquoted whitespace to a single space so command rules match
+/// regardless of incidental spacing (`rm   -rf  x` == `rm -rf x`). Quoted and
+/// escaped runs are preserved verbatim.
+fn normalize_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut quote: Option<char> = None;
+    let mut prev_ws = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            out.push(c);
+            if c == q {
+                quote = None;
+            }
+            prev_ws = false;
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                out.push(c);
+                prev_ws = false;
+            }
+            '\\' => {
+                out.push(c);
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+                prev_ws = false;
+            }
+            w if w.is_whitespace() => {
+                if !prev_ws {
+                    out.push(' ');
+                    prev_ws = true;
+                }
+            }
+            _ => {
+                out.push(c);
+                prev_ws = false;
+            }
+        }
+    }
+    out.trim().to_string()
+}
+
 fn finish_atom(text: &mut String, masked: &mut String, out: &mut Vec<BashAtom>) -> Option<()> {
-    let command = text.trim().to_string();
+    let command = normalize_ws(text);
     let masked_atom = masked.trim().to_string();
     text.clear();
     masked.clear();
@@ -499,6 +563,28 @@ mod tests {
         assert!(herestring[0].reads.is_empty() && !herestring[0].escalate);
         let dup = decompose("cmd >&2").unwrap();
         assert!(dup[0].writes.is_empty() && !dup[0].escalate);
+    }
+
+    #[test]
+    fn splits_subshell_and_brace_groups() {
+        assert_eq!(commands("(rm -rf /)"), vec!["rm -rf /"]);
+        assert_eq!(commands("{ rm -rf /; }"), vec!["rm -rf /"]);
+        assert_eq!(
+            commands("( cargo build && rm -rf / )"),
+            vec!["cargo build", "rm -rf /"]
+        );
+    }
+
+    #[test]
+    fn preserves_brace_expansion() {
+        assert_eq!(commands("echo {1..5}"), vec!["echo {1..5}"]);
+        assert_eq!(commands("mv a.{txt,bak} dir"), vec!["mv a.{txt,bak} dir"]);
+    }
+
+    #[test]
+    fn collapses_incidental_whitespace_outside_quotes() {
+        assert_eq!(commands("rm   -rf   x"), vec!["rm -rf x"]);
+        assert_eq!(commands("echo 'a  b'"), vec!["echo 'a  b'"]);
     }
 
     #[test]

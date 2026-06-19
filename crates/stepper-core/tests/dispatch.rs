@@ -187,6 +187,8 @@ fn orchestrator_dispatcher(
         concurrency: 4,
         step_cap: 4,
         sandbox_writable_roots: None,
+        budget: None,
+        base_context: String::new(),
     }
 }
 

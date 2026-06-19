@@ -94,23 +94,34 @@ impl Tool for ReadFile {
         let raw = tokio::fs::read(&path)
             .await
             .map_err(|e| ToolError::Execution(format!("read {}: {e}", path.display())))?;
-        if raw.len() > MAX_READ_BYTES {
-            return Err(ToolError::Execution(format!(
-                "file is {} bytes (> {MAX_READ_BYTES} limit)",
-                raw.len()
-            )));
-        }
         let text = String::from_utf8_lossy(&raw);
 
         let body = match (a.offset, a.limit) {
-            (None, None) => text.into_owned(),
+            // A whole-file read of a large file is rejected (it would blow the
+            // context window), but `offset`/`limit` slice FIRST so a window of a
+            // big file is still readable; only the slice is size-capped.
+            (None, None) => {
+                if raw.len() > MAX_READ_BYTES {
+                    return Err(ToolError::Execution(format!(
+                        "file is {} bytes (> {MAX_READ_BYTES} limit); pass offset/limit to read a slice",
+                        raw.len()
+                    )));
+                }
+                text.into_owned()
+            }
             (offset, limit) => {
                 let start = offset.unwrap_or(1).saturating_sub(1);
-                text.lines()
+                let mut sliced = text
+                    .lines()
                     .skip(start)
                     .take(limit.unwrap_or(usize::MAX))
                     .collect::<Vec<_>>()
-                    .join("\n")
+                    .join("\n");
+                if sliced.len() > MAX_READ_BYTES {
+                    crate::truncate_on_char_boundary(&mut sliced, MAX_READ_BYTES);
+                    sliced.push_str("\n… [truncated at the read-size limit — narrow the offset/limit]");
+                }
+                sliced
             }
         };
         Ok(ToolResult::text(body))

@@ -85,12 +85,23 @@ impl HookHost {
             .kill_on_drop(true)
             .spawn()?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(payload.to_string().as_bytes()).await;
-            drop(stdin);
-        }
-
-        let output = match tokio::time::timeout(HOOK_TIMEOUT, child.wait_with_output()).await {
+        // Write stdin while draining stdout/stderr CONCURRENTLY, all under the
+        // timeout: a hook that fills its stdout without reading stdin would
+        // otherwise deadlock the blocking write (which the timeout never covered).
+        let stdin = child.stdin.take();
+        let payload_bytes = payload.to_string().into_bytes();
+        let writer = async move {
+            if let Some(mut s) = stdin {
+                let _ = s.write_all(&payload_bytes).await;
+                // dropping `s` closes the pipe so the hook sees EOF
+            }
+        };
+        let output = match tokio::time::timeout(HOOK_TIMEOUT, async {
+            let (_, out) = tokio::join!(writer, child.wait_with_output());
+            out
+        })
+        .await
+        {
             Ok(Ok(output)) => output,
             _ => return Ok((1, "hook timed out".into())),
         };
@@ -105,7 +116,32 @@ fn matcher_matches(matcher: &str, target: Option<&str>) -> bool {
     if matcher == "*" || matcher.is_empty() {
         return true;
     }
-    // Exact (case-insensitive) match only — a `bash` matcher must not catch
-    // `bash_profile`. Use `*` for match-all.
-    target.is_some_and(|t| t.eq_ignore_ascii_case(matcher))
+    match target {
+        // Tool events: exact (case-insensitive) match only — a `bash` matcher
+        // must not catch `bash_profile`. Use `*` for match-all.
+        Some(t) => t.eq_ignore_ascii_case(matcher),
+        // Lifecycle events (SessionStart/Stop) have no tool to match against, so a
+        // matcher is meaningless there — the hook fires regardless (a stray
+        // non-`*` matcher used to silently disable the hook).
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matcher_matches;
+
+    #[test]
+    fn matcher_gates_tool_events_but_not_lifecycle_events() {
+        // Tool events: exact (case-insensitive) match.
+        assert!(matcher_matches("bash", Some("bash")));
+        assert!(matcher_matches("Bash", Some("bash")));
+        assert!(!matcher_matches("bash", Some("bash_profile")));
+        assert!(matcher_matches("*", Some("anything")));
+        // Lifecycle events have no tool target — a stray matcher must not silently
+        // disable the hook.
+        assert!(matcher_matches("anything", None));
+        assert!(matcher_matches("*", None));
+        assert!(matcher_matches("", None));
+    }
 }

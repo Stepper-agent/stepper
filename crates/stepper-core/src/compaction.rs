@@ -138,21 +138,62 @@ pub async fn summarize_with_model(
     if text.is_empty() { None } else { Some(text) }
 }
 
-/// Render dropped messages into a plain transcript for the summarizer.
+/// Render dropped messages into a transcript for the summarizer. Tool calls and
+/// their results are the actual work of a coding session, so they are kept
+/// (briefly) rather than dropped — `Message::text()` alone would summarize a
+/// tool-heavy turn as a blank line. Reasoning/image blocks are omitted.
 fn render(dropped: &[Message]) -> String {
-    dropped
-        .iter()
-        .map(|m| {
-            let role = match m.role {
-                Role::User => "User",
-                Role::Assistant => "Assistant",
-                Role::Tool => "Tool",
-                Role::System => "System",
+    let mut out = String::new();
+    for m in dropped {
+        let role = match m.role {
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            Role::Tool => "Tool",
+            Role::System => "System",
+        };
+        for block in &m.content {
+            let line = match block {
+                ContentBlock::Text(t) => t.trim().to_string(),
+                ContentBlock::ToolUse { name, input, .. } => {
+                    format!("[called {name} {}]", brief(&input.to_string()))
+                }
+                ContentBlock::ToolResult { content, is_error, .. } => {
+                    let text = content
+                        .iter()
+                        .map(|c| match c {
+                            ToolContent::Text { text } => text.clone(),
+                            ToolContent::Json { json } => json.to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!("[tool{} → {}]", if *is_error { " error" } else { "" }, brief(&text))
+                }
+                ContentBlock::Thinking { .. } | ContentBlock::Image { .. } => continue,
             };
-            format!("{role}: {}", m.text())
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+            if line.is_empty() {
+                continue;
+            }
+            out.push_str(role);
+            out.push_str(": ");
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Trim a value to a short, char-boundary-safe preview for the summary transcript.
+fn brief(s: &str) -> String {
+    const MAX: usize = 200;
+    let s = s.trim();
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    let mut end = MAX;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 pub(crate) fn heuristic_summary(dropped: &[Message]) -> String {
@@ -409,5 +450,48 @@ mod tests {
             Role::Assistant,
             "the message right after the summary is the Assistant tool_use, not its result"
         );
+    }
+
+    #[test]
+    fn render_keeps_tool_calls_and_results_not_just_text() {
+        let dropped = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({ "path": "a.rs" }),
+                }],
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    tool_call_id: "1".into(),
+                    content: vec![ToolContent::Text { text: "wrote a.rs".into() }],
+                    is_error: false,
+                }],
+            },
+        ];
+        let rendered = render(&dropped);
+        assert!(rendered.contains("write_file"), "tool call is kept: {rendered}");
+        assert!(rendered.contains("wrote a.rs"), "tool result is kept: {rendered}");
+    }
+
+    #[test]
+    fn brief_truncates_a_long_value_on_a_char_boundary() {
+        // A tool result longer than the cap, with a multibyte char straddling the
+        // 200-byte mark, must be truncated safely (no panic) and marked with `…`.
+        let long = "é".repeat(500); // 1000 bytes, 2-byte chars across byte 200
+        let dropped = vec![Message {
+            role: Role::Tool,
+            content: vec![ContentBlock::ToolResult {
+                tool_call_id: "1".into(),
+                content: vec![ToolContent::Text { text: long.clone() }],
+                is_error: false,
+            }],
+        }];
+        let rendered = render(&dropped);
+        assert!(rendered.contains('…'), "long value is truncated with a marker");
+        assert!(rendered.len() < long.len(), "the rendered transcript is shorter than the raw value");
     }
 }

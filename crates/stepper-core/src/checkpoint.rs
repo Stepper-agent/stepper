@@ -28,6 +28,11 @@ impl Snapshotter {
 
     pub fn snapshot(&self, id: &str) -> Result<(), CoreError> {
         let dest = self.store.join(id);
+        // Clear any prior occupant so a reused id (after `/compact` reset the turn
+        // counter) never merges a stale tree into this checkpoint.
+        if dest.exists() {
+            std::fs::remove_dir_all(&dest).map_err(io)?;
+        }
         // Create the checkpoint dir up front so an *empty* working tree still
         // produces a real (restorable) snapshot. Otherwise the dir would only
         // appear as a side effect of copying a file, and a first turn in a fresh
@@ -50,9 +55,12 @@ impl Snapshotter {
             return Err(CoreError::Session(format!("no checkpoint '{id}'")));
         }
 
-        // Files captured in the snapshot.
+        // Copy the snapshot back verbatim. `standard_filters(false)` disables
+        // every ignore rule (gitignore + hidden) so the checkpoint's own contents
+        // restore exactly — a `.gitignore` added since the snapshot must never
+        // hide a file we deliberately captured.
         let mut snapshot: HashSet<PathBuf> = HashSet::new();
-        for entry in WalkBuilder::new(&src).hidden(false).build().flatten() {
+        for entry in WalkBuilder::new(&src).standard_filters(false).build().flatten() {
             let path = entry.path();
             if !path.is_file() {
                 continue;
@@ -102,10 +110,29 @@ impl Snapshotter {
         }
         turns.sort_by_key(|(n, _)| *n);
         let remove = turns.len() - retain;
-        for (_, path) in turns.into_iter().take(remove) {
+        for (n, path) in turns.into_iter().take(remove) {
             std::fs::remove_dir_all(&path).map_err(io)?;
+            // Drop the turn-count sidecar alongside its snapshot dir.
+            let _ = std::fs::remove_file(self.meta_path(&format!("turn-{n}")));
         }
         Ok(())
+    }
+
+    /// Record how many session turns were complete when `id` was taken, so a
+    /// later rewind truncates the session exactly — the turn-id counter can drift
+    /// past the real turn count (failed turns, `/compact`), so the count is stored
+    /// rather than parsed back out of the id.
+    pub fn record_turns(&self, id: &str, turns_completed: usize) {
+        let _ = std::fs::write(self.meta_path(id), turns_completed.to_string());
+    }
+
+    /// The turn count recorded with `id`, if any.
+    pub fn checkpoint_turns(&self, id: &str) -> Option<usize> {
+        std::fs::read_to_string(self.meta_path(id)).ok()?.trim().parse().ok()
+    }
+
+    fn meta_path(&self, id: &str) -> PathBuf {
+        self.store.join(format!("{id}.meta"))
     }
 
     /// Drop the entire checkpoint store (used by `/clear`, which begins a fresh
@@ -119,8 +146,27 @@ impl Snapshotter {
     }
 
     fn tracked_files(&self) -> Result<Vec<PathBuf>, CoreError> {
+        let root = self.project_root.clone();
         let mut files = Vec::new();
-        for entry in WalkBuilder::new(&self.project_root).build().flatten() {
+        // `hidden(false)` so dotfiles (`.github`, `.gitignore`, …) are captured;
+        // `require_git(false)` so `.gitignore` is honored even in a non-git
+        // project (otherwise `target/`, `node_modules/` get full-copied every
+        // turn). `.git` and our own runtime state are pruned at traversal so the
+        // large dirs are never walked.
+        for entry in WalkBuilder::new(&self.project_root)
+            .hidden(false)
+            .require_git(false)
+            .filter_entry(move |e| match e.path().strip_prefix(&root) {
+                Ok(rel) => {
+                    !(rel.starts_with(".git")
+                        || rel.starts_with(Path::new(".stepper/checkpoints"))
+                        || rel.starts_with(Path::new(".stepper/sessions")))
+                }
+                Err(_) => true,
+            })
+            .build()
+            .flatten()
+        {
             let path = entry.path();
             if !path.is_file() {
                 continue;
@@ -128,13 +174,6 @@ impl Snapshotter {
             let rel = path
                 .strip_prefix(&self.project_root)
                 .map_err(|e| CoreError::Io(e.to_string()))?;
-            // Never snapshot our own runtime state (checkpoints, session
-            // history) — only project files + authored `.stepper/` config.
-            if rel.starts_with(Path::new(".stepper/checkpoints"))
-                || rel.starts_with(Path::new(".stepper/sessions"))
-            {
-                continue;
-            }
             files.push(rel.to_path_buf());
         }
         Ok(files)
@@ -237,6 +276,38 @@ mod tests {
         snap.snapshot("turn-1").unwrap();
         snap.prune(20).unwrap();
         assert!(dir.path().join(".stepper/checkpoints/turn-1").exists());
+    }
+
+    #[test]
+    fn records_and_reads_the_turn_count() {
+        // The recorded turn-count is what /rewind truncates the session by, so it
+        // must survive a drifted turn-id (the id counter can move past the real
+        // turn count after failed turns or /compact).
+        let dir = tempfile::tempdir().unwrap();
+        let snap = Snapshotter::new(dir.path().to_path_buf());
+        snap.snapshot("turn-3").unwrap();
+        snap.record_turns("turn-3", 2);
+        assert_eq!(snap.checkpoint_turns("turn-3"), Some(2));
+        assert_eq!(snap.checkpoint_turns("turn-9"), None);
+    }
+
+    #[test]
+    fn prune_drops_the_turn_count_sidecar_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        let snap = Snapshotter::new(root.clone());
+        for n in 1..=25 {
+            snap.snapshot(&format!("turn-{n}")).unwrap();
+            snap.record_turns(&format!("turn-{n}"), n);
+        }
+        snap.prune(20).unwrap();
+        let store = root.join(".stepper/checkpoints");
+        // pruned turns lose both their dir and their .meta sidecar
+        assert!(!store.join("turn-1.meta").exists(), "pruned turn-1 sidecar removed");
+        assert_eq!(snap.checkpoint_turns("turn-1"), None);
+        // kept turns retain their recorded count
+        assert_eq!(snap.checkpoint_turns("turn-25"), Some(25));
     }
 
     #[test]

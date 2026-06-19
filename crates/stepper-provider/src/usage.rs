@@ -3,6 +3,12 @@ use serde::{Deserialize, Serialize};
 /// Normalized token accounting, unified across the OpenAI single-usage shape and
 /// the Anthropic split-usage shape (input/cache arrive in `message_start`, the
 /// final output count arrives in `message_delta`).
+///
+/// The four fields are **mutually exclusive**: `input` is the *uncached* prompt
+/// tokens only (dialects that fold cached tokens into their prompt count, like
+/// OpenAI, subtract them out at the wire), so the full prompt is
+/// `input + cache_read + cache_write` and the conversation footprint is
+/// `context_tokens()`. Cost can therefore price each field independently.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input: u64,
@@ -35,11 +41,35 @@ impl Usage {
     pub fn total(&self) -> u64 {
         self.input + self.output
     }
+
+    /// Total tokens this exchange occupies in the context window: the full prompt
+    /// (uncached `input` + cached `cache_read` + freshly cached `cache_write`)
+    /// plus the reply. Unlike `total()` this includes cached prompt tokens, so a
+    /// heavily-cached request (Anthropic) is measured at its real size rather than
+    /// collapsing to just the uncached delta — which is what lets compaction fire
+    /// before the real prompt overflows the window.
+    pub fn context_tokens(&self) -> u64 {
+        self.input
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+            .saturating_add(self.output)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::Usage;
+
+    #[test]
+    fn context_tokens_counts_the_full_cached_prompt_not_just_the_uncached_delta() {
+        // A heavily-cached Anthropic request: 50 uncached + 40_000 cached prompt,
+        // 20 output. `total()` (input+output) collapses to 70 — which would make
+        // compaction think the window is nearly empty. `context_tokens()` sees the
+        // real ~40_070 footprint.
+        let u = Usage { input: 50, output: 20, cache_read: 40_000, cache_write: 0 };
+        assert_eq!(u.total(), 70);
+        assert_eq!(u.context_tokens(), 40_070);
+    }
 
     #[test]
     fn add_sums_fields_across_calls_unlike_merge_which_takes_max() {

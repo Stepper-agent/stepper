@@ -118,6 +118,99 @@ async fn write_read_edit_grep_lifecycle() {
 }
 
 #[tokio::test]
+async fn search_sees_dotfiles_but_prunes_the_git_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+    std::fs::write(root.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
+    std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join(".git/config"), "secret = 1\n").unwrap();
+    std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+
+    let reg = ToolRegistry::builtins();
+    let cx = cx_with(root, PermissionMode::AcceptEdits, Arc::new(AllowAll));
+
+    // glob descends into dotfile dirs like `.github/`...
+    let glob = reg
+        .get("glob")
+        .unwrap()
+        .call(json!({"pattern": "**/*.yml"}), &cx)
+        .await
+        .unwrap();
+    assert!(
+        glob.content_text().contains("ci.yml"),
+        "glob sees files under .github/: {}",
+        glob.content_text()
+    );
+
+    // ...list_dir shows dotfiles at the root but never the `.git` dir...
+    let list = reg.get("list_dir").unwrap().call(json!({}), &cx).await.unwrap();
+    let text = list.content_text();
+    assert!(text.contains(".gitignore"), "dotfiles are listed: {text}");
+    assert!(text.contains(".github"), "dot-dirs are listed: {text}");
+    assert!(!text.contains(".git/"), ".git dir is pruned from listings: {text}");
+
+    // ...and grep can search dotfile dirs but not the pruned `.git` internals.
+    let grep = reg
+        .get("grep")
+        .unwrap()
+        .call(json!({"pattern": "secret"}), &cx)
+        .await
+        .unwrap();
+    assert!(
+        !grep.content_text().contains(".git/config"),
+        "grep does not descend into .git: {}",
+        grep.content_text()
+    );
+}
+
+#[tokio::test]
+async fn read_with_offset_limit_slices_a_large_file_instead_of_rejecting() {
+    let dir = tempfile::tempdir().unwrap();
+    let big: String = (0..40_000).map(|i| format!("line {i}\n")).collect();
+    assert!(big.len() > 256 * 1024, "the fixture must exceed the whole-file cap");
+    std::fs::write(dir.path().join("big.txt"), &big).unwrap();
+
+    let reg = ToolRegistry::builtins();
+    let cx = cx_with(dir.path(), PermissionMode::AcceptEdits, Arc::new(AllowAll));
+    let out = reg
+        .get("read_file")
+        .unwrap()
+        .call(json!({"path": "big.txt", "offset": 1, "limit": 3}), &cx)
+        .await
+        .unwrap();
+    let text = out.content_text();
+    assert!(
+        text.contains("line 0") && text.contains("line 2"),
+        "offset/limit reads a slice of a file too big to read whole: {text}"
+    );
+    assert!(!text.contains("line 100"), "the limit is honored");
+}
+
+#[tokio::test]
+async fn read_slice_larger_than_the_cap_is_truncated_on_a_char_boundary() {
+    // A slice that itself exceeds 256KB (and straddles a multibyte char at the cap)
+    // must be truncated safely (no panic) with a marker, not returned whole.
+    let dir = tempfile::tempdir().unwrap();
+    let line = format!("{}\n", "é".repeat(300_000)); // multibyte, one huge line > 256KB
+    assert!(line.len() > 256 * 1024);
+    std::fs::write(dir.path().join("huge.txt"), &line).unwrap();
+
+    let reg = ToolRegistry::builtins();
+    let cx = cx_with(dir.path(), PermissionMode::AcceptEdits, Arc::new(AllowAll));
+    let out = reg
+        .get("read_file")
+        .unwrap()
+        .call(json!({"path": "huge.txt", "offset": 1}), &cx)
+        .await
+        .unwrap();
+    let text = out.content_text();
+    assert!(text.len() < line.len(), "the oversized slice is capped");
+    assert!(text.contains("truncated at the read-size limit"), "marker present: end={:?}", &text[text.len().saturating_sub(80)..]);
+}
+
+#[tokio::test]
 async fn enumerators_skip_deny_listed_subpaths() {
     // A `deny Read(/secret/**)` rule must fence grep/glob/list_dir out of that
     // subtree even though the search root (the project) is allowed.

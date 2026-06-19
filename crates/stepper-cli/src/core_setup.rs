@@ -120,18 +120,31 @@ pub async fn build_orchestrator_with_fallback(
         .iter()
         .map(|a| a.rule.clone())
         .collect();
+    // `additionalDirectories` (relative entries resolve against project_root):
+    // they extend the in-project set for the permission engine AND, when the OS
+    // sandbox is enabled, the bash writable roots.
+    let additional_dirs: Vec<PathBuf> = config
+        .settings
+        .permissions
+        .additional_directories
+        .iter()
+        .map(|d| {
+            let p = PathBuf::from(d);
+            if p.is_absolute() { p } else { project_root.join(p) }
+        })
+        .collect();
+
     // Live, mutable session state: AlwaysAllow grants and /allow|/deny|/ask write
     // `rules`; Shift+Tab and exit_plan_mode write `mode`.
-    let rules = Arc::new(std::sync::RwLock::new(checked_rules(
-        &config.settings.permissions,
-        &approvals,
-    )?));
+    let rules = Arc::new(std::sync::RwLock::new(
+        checked_rules(&config.settings.permissions, &approvals)?
+            .with_additional_dirs(additional_dirs.clone()),
+    ));
     let mode = Arc::new(std::sync::RwLock::new(mode));
 
     // Opt-in OS bash sandbox: when `sandbox.enabled`, confine `bash` writes to the
-    // project root + `permissions.additionalDirectories` (resolved absolute).
-    // `None` keeps today's unconfined behavior. Read before `config` moves into
-    // the resolver below.
+    // project root + `permissions.additionalDirectories`. `None` keeps today's
+    // unconfined behavior. Read before `config` moves into the resolver below.
     let sandbox_writable_roots = config
         .settings
         .sandbox
@@ -139,10 +152,7 @@ pub async fn build_orchestrator_with_fallback(
         .filter(|s| s.enabled)
         .map(|_| {
             let mut roots = vec![project_root.clone()];
-            for dir in &config.settings.permissions.additional_directories {
-                let p = PathBuf::from(dir);
-                roots.push(if p.is_absolute() { p } else { project_root.join(p) });
-            }
+            roots.extend(additional_dirs.clone());
             roots
         });
 
@@ -238,13 +248,15 @@ fn ensure_provider(config: &mut Config, model_ref: &str) {
     if config.settings.providers.contains_key(name) {
         return;
     }
-    config
-        .settings
-        .providers
-        .insert(name.to_string(), convention_provider(name));
+    // Only synthesize for the known convention providers. An unknown name is left
+    // unconfigured so it surfaces a clear `UnknownProvider` error — never silently
+    // routed to api.openai.com (which would also pop a wrong-host key prompt).
+    if let Some(pc) = convention_provider(name) {
+        config.settings.providers.insert(name.to_string(), pc);
+    }
 }
 
-fn convention_provider(name: &str) -> ProviderConfig {
+fn convention_provider(name: &str) -> Option<ProviderConfig> {
     let mut pc = ProviderConfig {
         kind: "openai-compat".into(),
         base_url: None,
@@ -262,14 +274,30 @@ fn convention_provider(name: &str) -> ProviderConfig {
             pc.kind = "openai-responses".into();
             pc.auth = Some("codex-oauth".into());
         }
-        _ => pc.base_url = Some("https://api.openai.com/v1".into()),
+        // An unknown provider must be configured explicitly (with a baseUrl) in
+        // `.stepper/setting.json`; we do not guess a host for it.
+        _ => return None,
     }
-    pc
+    Some(pc)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn convention_provider_does_not_route_unknown_names_to_openai() {
+        // Known providers are synthesized with their real host...
+        assert_eq!(
+            convention_provider("openai").and_then(|p| p.base_url).as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(convention_provider("anthropic").map(|p| p.kind), Some("anthropic".into()));
+        // ...but an unknown name is NOT guessed (no silent api.openai.com fallback),
+        // so it surfaces a clear UnknownProvider error instead of a misroute.
+        assert!(convention_provider("groq").is_none());
+        assert!(convention_provider("openrouter").is_none());
+    }
 
     #[test]
     fn merge_limits_prefers_cli_then_config_then_none() {

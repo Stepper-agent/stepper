@@ -400,15 +400,23 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         .map(|(name, description)| CommandInfo {
             name: name.to_string(),
             description: description.to_string(),
+            argument_hint: None,
         })
         .collect();
-    commands.extend(
-        stepper_config::Config::load(&cwd)
-            .map(|c| c.command_descriptions())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(name, description)| CommandInfo { name, description }),
-    );
+    if let Ok(cfg) = stepper_config::Config::load(&cwd) {
+        // `argument-hint` is keyed by command name; attach it to each user command.
+        let hints: std::collections::BTreeMap<String, String> =
+            cfg.command_hints().into_iter().collect();
+        commands.extend(
+            cfg.command_descriptions()
+                .into_iter()
+                .map(|(name, description)| CommandInfo {
+                    argument_hint: hints.get(&name).cloned(),
+                    name,
+                    description,
+                }),
+        );
+    }
 
     // `_mcp` keeps the MCP server connections open for the whole TUI session.
     let init = TuiInit {

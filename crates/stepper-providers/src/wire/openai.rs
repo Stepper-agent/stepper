@@ -303,14 +303,19 @@ pub fn parse_chunk(data: &str) -> Result<Vec<WireDelta>, ProviderError> {
     }
 
     if let Some(u) = &chunk.usage {
+        // OpenAI's `prompt_tokens` already includes the cached portion; subtract
+        // it so `input` stays the uncached prompt only (the `Usage` invariant:
+        // input / cache_read / cache_write are disjoint, so cost prices each once
+        // and context measurement doesn't double-count the cached prefix).
+        let cached = u
+            .prompt_tokens_details
+            .as_ref()
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0);
         out.push(WireDelta::Usage(stepper_provider::Usage {
-            input: u.prompt_tokens,
+            input: u.prompt_tokens.saturating_sub(cached),
             output: u.completion_tokens,
-            cache_read: u
-                .prompt_tokens_details
-                .as_ref()
-                .map(|d| d.cached_tokens)
-                .unwrap_or(0),
+            cache_read: cached,
             cache_write: 0,
         }));
     }

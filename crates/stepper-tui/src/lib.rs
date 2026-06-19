@@ -31,11 +31,13 @@ pub struct TuiInit {
     pub commands: Vec<CommandInfo>,
 }
 
-/// A slash command shown in the `/` palette: its name and a one-line description.
+/// A slash command shown in the `/` palette: its name, a one-line description,
+/// and an optional `argument-hint` (e.g. `<pr-number>`) rendered next to the name.
 #[derive(Clone, Debug)]
 pub struct CommandInfo {
     pub name: String,
     pub description: String,
+    pub argument_hint: Option<String>,
 }
 
 #[cfg(test)]
@@ -45,6 +47,7 @@ impl CommandInfo {
         CommandInfo {
             name: name.to_string(),
             description: String::new(),
+            argument_hint: None,
         }
     }
 }

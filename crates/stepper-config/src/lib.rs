@@ -186,6 +186,27 @@ impl Config {
         map.into_iter().collect()
     }
 
+    /// `(name, argument-hint)` for commands that declare an `argument-hint` in
+    /// their frontmatter — shown next to the name in the `/` palette. Project
+    /// wins over user on a name collision.
+    pub fn command_hints(&self) -> Vec<(String, String)> {
+        let mut hints = std::collections::BTreeMap::new();
+        for dir in [self.project_dir.as_ref(), self.user_dir.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            for (stem, content) in read_md_files(&dir.join("commands")) {
+                if let Ok(def) = parse_command(&stem, &content)
+                    && let Some(hint) = def.argument_hint
+                    && !hints.contains_key(&stem)
+                {
+                    hints.insert(stem, hint);
+                }
+            }
+        }
+        hints.into_iter().collect()
+    }
+
     /// Load the output styles from `<.stepper>/output-styles/*.md` in the
     /// project and user dirs (project wins on a name collision), sorted by
     /// name. Unreadable or bodiless files are skipped (`validate_values`
@@ -268,7 +289,21 @@ impl Config {
     /// Resolve a `provider/model-id` reference into a concrete provider
     /// descriptor, applying api-key precedence (env override > config template).
     pub fn resolve_provider(&self, model_ref: &str) -> Result<ResolvedProvider, ConfigError> {
-        let resolved = ResolvedModel::parse(model_ref)
+        // A provider-only ref (`anthropic`, no `/model`) resolves through that
+        // provider's configured `defaultModel`, if any.
+        let normalized = if model_ref.contains('/') {
+            model_ref.to_string()
+        } else if let Some(dm) = self
+            .settings
+            .providers
+            .get(model_ref)
+            .and_then(|p| p.default_model.clone())
+        {
+            format!("{model_ref}/{dm}")
+        } else {
+            model_ref.to_string()
+        };
+        let resolved = ResolvedModel::parse(&normalized)
             .ok_or_else(|| ConfigError::InvalidModel(model_ref.to_string()))?;
         let provider = self
             .settings
@@ -492,6 +527,25 @@ mod tests {
         let rp = cfg.resolve_provider("acme/m").unwrap();
         assert_eq!(rp.api_key.as_deref(), Some("sk-literal"));
         assert_eq!(rp.name, "acme");
+    }
+
+    #[test]
+    fn resolve_provider_only_ref_uses_provider_default_model() {
+        let settings: SettingsFile = serde_json::from_value(serde_json::json!({
+            "providers": { "anthropic": { "kind": "anthropic", "defaultModel": "claude-sonnet-4" } }
+        }))
+        .unwrap();
+        let cfg = Config::from_settings(settings);
+        let rp = cfg.resolve_provider("anthropic").unwrap();
+        assert_eq!(rp.name, "anthropic");
+        assert_eq!(rp.model, "claude-sonnet-4");
+
+        // A provider-only ref with no configured defaultModel is still rejected.
+        let bare: SettingsFile = serde_json::from_value(serde_json::json!({
+            "providers": { "x": { "kind": "openai-compat" } }
+        }))
+        .unwrap();
+        assert!(Config::from_settings(bare).resolve_provider("x").is_err());
     }
 
     #[test]

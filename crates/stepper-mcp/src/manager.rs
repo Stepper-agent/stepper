@@ -221,10 +221,9 @@ async fn connect_http(
         .map_err(|e| McpError::Connect(e.to_string()))
 }
 
-/// Split configured headers into rmcp's `auth_header` (the `Authorization`
-/// value, which rmcp sends specially) and `custom_headers` (everything else).
-/// An invalid name/value is logged and skipped so one bad entry never drops the
-/// whole connection.
+/// Split configured headers into rmcp's `auth_header` (the bearer TOKEN) and
+/// `custom_headers` (everything else). An invalid name/value is logged and
+/// skipped so one bad entry never drops the whole connection.
 fn split_headers(
     headers: &BTreeMap<String, String>,
 ) -> (Option<String>, HashMap<HeaderName, HeaderValue>) {
@@ -232,8 +231,19 @@ fn split_headers(
     let mut custom = HashMap::new();
     for (key, value) in headers {
         if key.eq_ignore_ascii_case("authorization") {
-            match HeaderValue::from_str(value) {
-                Ok(_) => auth = Some(value.clone()),
+            // rmcp applies `auth_header` via reqwest `.bearer_auth()`, which
+            // prepends "Bearer ", so a configured `Bearer <token>` value must
+            // have its scheme stripped first — otherwise the wire carries
+            // "Bearer Bearer <token>" and auth fails. A bare token is passed
+            // through (rmcp adds the scheme). The HTTP auth scheme is
+            // case-insensitive (RFC 7235), so match any casing of "bearer ".
+            let token = match value.split_at_checked(7) {
+                Some((head, rest)) if head.eq_ignore_ascii_case("bearer ") => rest,
+                _ => value,
+            }
+            .trim();
+            match HeaderValue::from_str(token) {
+                Ok(_) => auth = Some(token.to_string()),
                 Err(_) => eprintln!("mcp: skipping invalid http header '{key}'"),
             }
             continue;
@@ -261,12 +271,34 @@ mod tests {
         headers.insert("Authorization".into(), "Bearer secret".into());
         headers.insert("X-Tenant".into(), "acme".into());
         let (auth, custom) = split_headers(&headers);
-        assert_eq!(auth.as_deref(), Some("Bearer secret"));
+        // The "Bearer " scheme is stripped — rmcp re-adds it via bearer_auth, so
+        // storing the full value would double-prefix the wire header.
+        assert_eq!(auth.as_deref(), Some("secret"));
         assert_eq!(
             custom.get(&HeaderName::from_static("x-tenant")).map(|v| v.to_str().unwrap()),
             Some("acme")
         );
         assert!(!custom.contains_key(&HeaderName::from_static("authorization")));
+    }
+
+    #[test]
+    fn split_headers_keeps_a_bare_token_for_rmcp_to_add_the_scheme() {
+        let mut headers = BTreeMap::new();
+        headers.insert("authorization".into(), "sk-raw-token".into());
+        let (auth, _) = split_headers(&headers);
+        assert_eq!(auth.as_deref(), Some("sk-raw-token"));
+    }
+
+    #[test]
+    fn split_headers_strips_the_bearer_scheme_case_insensitively() {
+        // The HTTP auth scheme is case-insensitive (RFC 7235); every casing must
+        // be stripped so rmcp's bearer_auth does not produce a double prefix.
+        for raw in ["Bearer tok", "bearer tok", "BEARER tok", "bEaReR tok"] {
+            let mut headers = BTreeMap::new();
+            headers.insert("Authorization".into(), raw.to_string());
+            let (auth, _) = split_headers(&headers);
+            assert_eq!(auth.as_deref(), Some("tok"), "stripped scheme from {raw:?}");
+        }
     }
 
     #[test]

@@ -120,11 +120,18 @@ pub fn parse_all_checked(specs: &[String]) -> (Vec<Rule>, Vec<String>) {
 /// anything". A mid-pattern `:` stays literal so `curl http://host:*/path`
 /// cannot collapse into `http://host*` and over-match other hosts.
 fn command_glob(pattern: &str, command: &str) -> bool {
-    let normalized = match pattern.strip_suffix(":*") {
-        Some(prefix) => format!("{prefix}*"),
-        None => pattern.to_string(),
-    };
-    glob_eq(&normalized, command.trim())
+    let command = command.trim();
+    match pattern.strip_suffix(":*") {
+        // Arg-prefix form: the prefix exactly, or the prefix followed by
+        // whitespace then anything — NOT an open-ended substring, so
+        // `git push:*` matches `git push origin` but not `git pushx`.
+        Some(prefix) => {
+            let parts: Vec<String> = prefix.split('*').map(regex::escape).collect();
+            let re = format!("^{}(\\s.*)?$", parts.join(".*"));
+            Regex::new(&re).map(|r| r.is_match(command)).unwrap_or(false)
+        }
+        None => glob_eq(pattern, command),
+    }
 }
 
 fn glob_eq(pattern: &str, value: &str) -> bool {
@@ -161,6 +168,10 @@ mod tests {
         let push = Rule::parse("Bash(git push:*)").unwrap();
         assert!(push.matches("Bash", &MatchTarget::Command("git push origin"), &root, None));
         assert!(push.matches("Bash", &MatchTarget::Command("git push"), &root, None));
+        // The arg-prefix form requires a word boundary: it must not over-match an
+        // adjacent token like `git pushx` / `git push-all`.
+        assert!(!push.matches("Bash", &MatchTarget::Command("git pushx"), &root, None));
+        assert!(!push.matches("Bash", &MatchTarget::Command("git push-all"), &root, None));
     }
 
     #[test]

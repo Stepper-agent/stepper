@@ -8,7 +8,7 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::Path;
 use stepper_permission::PermissionRequest;
 use stepper_provider::{ToolError, ToolResult, ToolSpec};
 
@@ -95,9 +95,18 @@ impl Tool for Grep {
     }
 }
 
-fn grep_walk(base: &PathBuf, regex: &Regex, gate: &ReadGate) -> String {
+/// The grep/glob/list walk: gitignore-aware (build dirs like `target/` stay out)
+/// but dotfiles such as `.github/` or `.gitignore` are visible to the agent;
+/// only the `.git` dir itself is pruned. Secret files are filtered by callers.
+fn project_walker(base: &Path) -> WalkBuilder {
+    let mut w = WalkBuilder::new(base);
+    w.hidden(false).filter_entry(|e| e.file_name() != ".git");
+    w
+}
+
+fn grep_walk(base: &Path, regex: &Regex, gate: &ReadGate) -> String {
     let mut out = Vec::new();
-    for entry in WalkBuilder::new(base).build().flatten() {
+    for entry in project_walker(base).build().flatten() {
         if out.len() >= MAX_MATCHES {
             out.push("… [more matches truncated]".to_string());
             break;
@@ -170,7 +179,7 @@ impl Tool for GlobTool {
         let gate = cx.read_gate();
         let result = tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();
-            for entry in WalkBuilder::new(&base).build().flatten() {
+            for entry in project_walker(&base).build().flatten() {
                 let path = entry.path();
                 if is_secret_path_resolved(path) || gate.denies(path) {
                     continue;
@@ -233,7 +242,7 @@ impl Tool for ListDir {
         let gate = cx.read_gate();
         let result = tokio::task::spawn_blocking(move || {
             let mut entries = Vec::new();
-            for entry in WalkBuilder::new(&base)
+            for entry in project_walker(&base)
                 .max_depth(Some(1))
                 .build()
                 .flatten()

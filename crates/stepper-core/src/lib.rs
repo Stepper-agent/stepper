@@ -110,7 +110,7 @@ pub fn spawn_core(
                 Action::SubmitInput(prompt) => {
                     turn_id += 1;
                     let _ = tx.send(AppEvent::TurnStarted { turn_id }).await;
-                    checkpoint_turn(&snapshotter, turn_id, &tx).await;
+                    checkpoint_turn(&snapshotter, turn_id, session.turns.len(), &tx).await;
                     // Attach (and clear) any images pasted since the last prompt.
                     let images = std::mem::take(&mut pending_images);
                     // A per-turn child token lets `Interrupt` cancel just this turn
@@ -166,14 +166,22 @@ pub fn spawn_core(
                             // A `turn-N` checkpoint is the tree *before* turn N —
                             // drop turn N onward from the session and reset the
                             // counter so later turns/checkpoints stay consistent.
-                            if let Some(n) = checkpoint_id
-                                .strip_prefix("turn-")
-                                .and_then(|s| s.parse::<usize>().ok())
-                            {
-                                let keep = n.saturating_sub(1);
+                            // Prefer the turn-count recorded with the checkpoint
+                            // (robust to a drifted turn-id after failed turns or
+                            // /compact); fall back to parsing N-1 from the id.
+                            let keep = snapshotter.checkpoint_turns(&checkpoint_id).or_else(|| {
+                                checkpoint_id
+                                    .strip_prefix("turn-")
+                                    .and_then(|s| s.parse::<usize>().ok())
+                                    .map(|n| n.saturating_sub(1))
+                            });
+                            if let Some(keep) = keep {
                                 session.turns.truncate(keep);
                                 turn_id = keep as u64;
                                 let _ = store.save(&session);
+                                // Reseed the live conversation to the rewound point
+                                // so the next turn's context matches the tree.
+                                orchestrator.resume_seed = session.seed_messages();
                             }
                             (NoticeLevel::Info, format!("rewound to {checkpoint_id}"))
                         }
@@ -224,9 +232,13 @@ pub fn spawn_core(
                     )
                     .await
                     {
-                        // /clear begins a fresh session, so its checkpoints are
-                        // no longer reachable — drop the store too.
-                        if name == "clear"
+                        // /clear begins a fresh session and /compact collapses the
+                        // turns to one synthetic turn (resetting turn_id) — in both
+                        // cases the prior `turn-N` checkpoints are no longer
+                        // reachable by their old count, so leaving them on disk lets
+                        // /rewind restore a stale tree while the session/turn_id have
+                        // moved on (a desync). Drop the store in both.
+                        if (name == "clear" || name == "compact")
                             && let Err(e) = snapshotter.clear()
                         {
                             let _ = tx
@@ -257,7 +269,7 @@ pub fn spawn_core(
                         Some(prompt) => {
                             turn_id += 1;
                             let _ = tx.send(AppEvent::TurnStarted { turn_id }).await;
-                            checkpoint_turn(&snapshotter, turn_id, &tx).await;
+                            checkpoint_turn(&snapshotter, turn_id, session.turns.len(), &tx).await;
                             let images = std::mem::take(&mut pending_images);
                             let turn_cancel = cancel.child_token();
                             let mut result = None;
@@ -483,15 +495,23 @@ fn fmt_secs(secs: u64) -> String {
 async fn checkpoint_turn(
     snapshotter: &Snapshotter,
     turn_id: u64,
+    turns_completed: usize,
     tx: &mpsc::Sender<AppEvent>,
 ) {
-    if let Err(e) = snapshotter.snapshot(&format!("turn-{turn_id}")) {
+    let id = format!("turn-{turn_id}");
+    if let Err(e) = snapshotter.snapshot(&id) {
         let _ = tx
             .send(AppEvent::Notice {
                 level: NoticeLevel::Warn,
                 text: format!("checkpoint failed (rewind unavailable): {e}"),
             })
             .await;
+    } else {
+        // Record how many session turns were complete at snapshot time so a later
+        // `/rewind` truncates by this count rather than parsing N from the id —
+        // the turn-id counter can drift past the real turn count (failed turns,
+        // `/compact`), which would desync the session from the restored tree.
+        snapshotter.record_turns(&id, turns_completed);
     }
     // Bound the store: every turn full-copies the tree, so cap retained
     // snapshots. A prune failure must not fail the turn.

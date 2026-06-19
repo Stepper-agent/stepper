@@ -31,6 +31,10 @@ pub struct RuleSet {
     pub allow: Vec<Rule>,
     pub ask: Vec<Rule>,
     pub deny: Vec<Rule>,
+    /// Extra roots (config `permissions.additionalDirectories`) treated as
+    /// in-project for mode defaults, so reads/writes under them are not
+    /// escalated as out-of-project.
+    pub additional_dirs: Vec<std::path::PathBuf>,
 }
 
 impl RuleSet {
@@ -39,7 +43,14 @@ impl RuleSet {
             allow: rule::parse_all(allow),
             ask: rule::parse_all(ask),
             deny: rule::parse_all(deny),
+            additional_dirs: Vec::new(),
         }
+    }
+
+    /// Set the extra in-project roots (`additionalDirectories`).
+    pub fn with_additional_dirs(mut self, dirs: Vec<std::path::PathBuf>) -> Self {
+        self.additional_dirs = dirs;
+        self
     }
 
     /// Like `from_lists`, but malformed specs are surfaced instead of silently
@@ -64,6 +75,7 @@ impl RuleSet {
                 allow: allow_rules,
                 ask: ask_rules,
                 deny: deny_rules,
+                additional_dirs: Vec::new(),
             },
             dropped,
         ))
@@ -195,7 +207,14 @@ fn evaluate_inner(
             // matching, so `> out.txt` from a subdir is judged there; rule
             // patterns stay project_root-anchored inside `decide`/`is_in_project`.
             let anchored = path::anchor_at_cwd(p, cwd);
-            let in_project = path::is_in_project(&anchored, project_root);
+            // `additionalDirectories` count as in-project for mode defaults, so a
+            // read/write under a configured extra root is not escalated as
+            // out-of-project.
+            let in_project = path::is_in_project(&anchored, project_root)
+                || rules
+                    .additional_dirs
+                    .iter()
+                    .any(|d| path::is_in_project(&anchored, d));
             let decision = decide(
                 request.tool(),
                 &MatchTarget::Path(&anchored),
@@ -206,13 +225,23 @@ fn evaluate_inner(
             );
             // The `.stepper/` config dir (commands, hooks, settings) gates the
             // agent's own security — a write/edit there must be explicitly
-            // confirmed, never silently auto-allowed by mode or a broad rule. An
-            // explicit `deny` still wins (it was checked first inside `decide`).
-            if decision == Decision::Allow
-                && !request.is_read_only()
+            // confirmed, never silently auto-allowed by mode OR a broad rule. This
+            // fires for any non-deny decision (an `Allow` from a broad rule, or an
+            // `Ask` from the mode default), because in Bypass the top-level
+            // transform would otherwise turn that `Ask` straight back into
+            // `Allow`. An explicit `deny` still wins (checked first in `decide`).
+            if !request.is_read_only()
+                && decision != Decision::Deny
                 && path::is_protected(&anchored, project_root)
             {
-                Decision::Ask
+                // Bypass has no human to confirm — fail closed (Deny) rather than
+                // auto-allow a write to the agent's own security config. Other
+                // modes escalate to an explicit prompt (which DontAsk then denies).
+                if mode == PermissionMode::Bypass {
+                    Decision::Deny
+                } else {
+                    Decision::Ask
+                }
             } else {
                 decision
             }
@@ -528,6 +557,53 @@ mod tests {
                 PermissionMode::AcceptEdits,
             ),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn dot_stepper_write_is_denied_in_bypass_not_auto_allowed() {
+        // Bypass has no human to confirm, and the top-level (Bypass, Ask) => Allow
+        // transform would otherwise auto-allow a `.stepper/` write. It must fail
+        // closed (Deny) — both with a broad allow rule AND with no rule at all
+        // (the realistic default, where the write arrives as the mode's `Ask`).
+        let p = PathBuf::from("/project/.stepper/setting.json");
+        for rules in [
+            RuleSet::from_lists(&["Write(/**)".into()], &[], &[]),
+            RuleSet::default(),
+        ] {
+            assert_eq!(
+                evaluate(&PermissionRequest::Write(p.clone()), &rules, &root(), None, PermissionMode::Bypass),
+                Decision::Deny,
+                "protected .stepper write must fail closed in Bypass",
+            );
+            // A mode with a human still escalates to an explicit prompt.
+            assert_eq!(
+                evaluate(&PermissionRequest::Write(p.clone()), &rules, &root(), None, PermissionMode::AcceptEdits),
+                Decision::Ask,
+            );
+        }
+    }
+
+    #[test]
+    fn additional_directories_count_as_in_project_for_mode_defaults() {
+        let extra = PathBuf::from("/extra");
+        let rules = RuleSet::default().with_additional_dirs(vec![extra.clone()]);
+        // In Auto an in-project write auto-allows; an `additionalDirectories` entry
+        // gets the same treatment instead of escalating as out-of-project.
+        assert_eq!(
+            evaluate(&PermissionRequest::Write(extra.join("a.txt")), &rules, &root(), None, PermissionMode::Auto),
+            Decision::Allow,
+        );
+        // A path in neither the project nor an additional dir still prompts.
+        assert_eq!(
+            evaluate(
+                &PermissionRequest::Write("/elsewhere/a.txt".into()),
+                &rules,
+                &root(),
+                None,
+                PermissionMode::Auto,
+            ),
+            Decision::Ask,
         );
     }
 

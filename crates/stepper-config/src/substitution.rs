@@ -93,7 +93,11 @@ fn expand_args(text: &str, args: &CommandArgs) -> String {
         protect(args.positional.get(i).cloned().unwrap_or_default())
     });
 
-    let all = text.replace("$ARGUMENTS", &protect(args.positional.join(" ")));
+    // Word-boundary match so `$ARGUMENTS` does not also consume the prefix of a
+    // named arg like `$ARGUMENTS_EXTRA` (which `str::replace` would mangle).
+    let arguments = Regex::new(r"\$ARGUMENTS\b").unwrap();
+    let joined = protect(args.positional.join(" "));
+    let all = arguments.replace_all(&text, |_: &Captures| joined.clone());
 
     let positional = Regex::new(r"\$(\d+)").unwrap();
     let text = positional.replace_all(&all, |c: &Captures| {
@@ -108,7 +112,12 @@ fn expand_args(text: &str, args: &CommandArgs) -> String {
 
     let named_dollar = Regex::new(r"\$([A-Za-z_][A-Za-z0-9_]*)").unwrap();
     let text = named_dollar.replace_all(&text, |c: &Captures| {
-        protect(args.named.get(&c[1]).cloned().unwrap_or_default())
+        // An unknown `$WORD` is left literal (not deleted) — it is almost always a
+        // shell variable like `$PATH`/`$HOME` the command means to expand itself.
+        match args.named.get(&c[1]) {
+            Some(v) => protect(v.clone()),
+            None => c[0].to_string(),
+        }
     });
 
     // {arg:name} and bare {name} (colon-free, so {file:..}/{env:..} are skipped).
@@ -313,6 +322,31 @@ mod tests {
         };
         let out = substitute("on $BRANCH", &args, &FakeIo).unwrap();
         assert_eq!(out, "on main");
+    }
+
+    #[test]
+    fn arguments_does_not_consume_a_named_arg_prefix() {
+        let mut named = BTreeMap::new();
+        named.insert("ARGUMENTS_EXTRA".to_string(), "X".to_string());
+        let args = CommandArgs {
+            positional: vec!["a".to_string(), "b".to_string()],
+            named,
+        };
+        let out = substitute("$ARGUMENTS and $ARGUMENTS_EXTRA", &args, &FakeIo).unwrap();
+        assert_eq!(out, "a b and X");
+    }
+
+    #[test]
+    fn unknown_dollar_word_is_left_literal_not_deleted() {
+        // A `$WORD` with no matching named arg stays literal (it is almost always
+        // a shell variable the command expects to expand itself), never deleted.
+        let out = substitute(
+            "export PATH=$PATH:/x and $HOME",
+            &CommandArgs::default(),
+            &FakeIo,
+        )
+        .unwrap();
+        assert_eq!(out, "export PATH=$PATH:/x and $HOME");
     }
 
     #[test]

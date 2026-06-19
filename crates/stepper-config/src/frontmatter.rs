@@ -91,7 +91,7 @@ pub struct CommandDef {
 
 /// `description` is required (it is both the human label and the routing signal).
 pub fn parse_layer(name: &str, content: &str) -> Result<LayerDef, ConfigError> {
-    let (data, body) = split_frontmatter(content);
+    let (data, body) = split_frontmatter(content, &format!("layer/{name}"))?;
     let frontmatter: LayerFrontmatter = serde_json::from_value(data).map_err(|e| {
         ConfigError::Frontmatter {
             which: format!("layer/{name}"),
@@ -118,7 +118,7 @@ pub fn parse_layer(name: &str, content: &str) -> Result<LayerDef, ConfigError> {
 }
 
 pub fn parse_skill(content: &str) -> Result<SkillDef, ConfigError> {
-    let (data, body) = split_frontmatter(content);
+    let (data, body) = split_frontmatter(content, "skill")?;
     let name = data
         .get("name")
         .and_then(Value::as_str)
@@ -160,7 +160,7 @@ pub struct OutputStyleDef {
 /// `name` falls back to the file stem; `description` is optional; the body must
 /// be non-empty (an empty style would silently blank the system prompt).
 pub fn parse_output_style(stem: &str, content: &str) -> Result<OutputStyleDef, ConfigError> {
-    let (data, body) = split_frontmatter(content);
+    let (data, body) = split_frontmatter(content, "output-style")?;
     let name = data
         .get("name")
         .and_then(Value::as_str)
@@ -185,7 +185,7 @@ pub fn parse_output_style(stem: &str, content: &str) -> Result<OutputStyleDef, C
 }
 
 pub fn parse_command(name: &str, content: &str) -> Result<CommandDef, ConfigError> {
-    let (data, body) = split_frontmatter(content);
+    let (data, body) = split_frontmatter(content, "command")?;
     Ok(CommandDef {
         name: name.to_string(),
         description: data
@@ -207,14 +207,24 @@ pub fn parse_command(name: &str, content: &str) -> Result<CommandDef, ConfigErro
     })
 }
 
-fn split_frontmatter(content: &str) -> (Value, String) {
+fn split_frontmatter(content: &str, which: &str) -> Result<(Value, String), ConfigError> {
     let matter = Matter::<YAML>::new();
     let entity = matter.parse(content);
-    let data = entity
-        .data
-        .map(Into::into)
-        .unwrap_or_else(|| Value::Object(Default::default()));
-    (data, entity.content)
+    let data = match entity.data {
+        // A present-but-Null block is malformed (or empty) YAML. gray_matter
+        // swallows the parse error into `Null`; surface it instead of silently
+        // dropping every declared field (which would, e.g., strip a layer's
+        // tool/permission restrictions or a command's `allowed-tools`).
+        Some(pod) => {
+            let value: Value = pod.into();
+            if value.is_null() {
+                return Err(frontmatter_err(which, "malformed YAML frontmatter"));
+            }
+            value
+        }
+        None => Value::Object(Default::default()),
+    };
+    Ok((data, entity.content))
 }
 
 fn validate_skill_name(name: &str) -> Result<(), ConfigError> {
@@ -416,6 +426,16 @@ Review {arg:path}.\n";
         let doc = "---\nallowed-tools: Read Grep Edit\n---\nbody";
         let cmd = parse_command("x", doc).unwrap();
         assert_eq!(cmd.allowed_tools, vec!["Read", "Grep", "Edit"]);
+    }
+
+    #[test]
+    fn malformed_frontmatter_is_an_error_not_silently_dropped() {
+        // A broken YAML block must error rather than parse as "no frontmatter"
+        // (which would silently strip a command's allowed-tools or a layer's
+        // tool/permission restrictions) — uniformly across all document types.
+        assert!(parse_command("c", "---\nallowed-tools: [Read\n---\nbody").is_err());
+        assert!(parse_skill("---\nname: [oops\n---\nb").is_err());
+        assert!(parse_layer("l", "---\nkey: \"unterminated\n---\nbody").is_err());
     }
 
     #[test]

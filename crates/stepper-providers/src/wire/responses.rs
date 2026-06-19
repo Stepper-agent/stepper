@@ -244,14 +244,17 @@ pub fn parse_event(event: &str, data: &str) -> Result<Vec<WireDelta>, ProviderEr
             let c: Completed = serde_json::from_str(data).map_err(error::decode)?;
             let mut out = Vec::new();
             if let Some(u) = &c.response.usage {
+                // `input_tokens` includes the cached portion; subtract it so
+                // `input` stays the uncached prompt only (disjoint from cache_read).
+                let cached = u
+                    .input_tokens_details
+                    .as_ref()
+                    .map(|d| d.cached_tokens)
+                    .unwrap_or(0);
                 out.push(WireDelta::Usage(Usage {
-                    input: u.input_tokens,
+                    input: u.input_tokens.saturating_sub(cached),
                     output: u.output_tokens,
-                    cache_read: u
-                        .input_tokens_details
-                        .as_ref()
-                        .map(|d| d.cached_tokens)
-                        .unwrap_or(0),
+                    cache_read: cached,
                     cache_write: 0,
                 }));
             }

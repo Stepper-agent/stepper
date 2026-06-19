@@ -72,10 +72,14 @@ impl ToolRegistry {
         if allowed_servers.is_empty() {
             return self.clone();
         }
+        // MCP tools are namespaced with the SANITIZED server name (stepper-mcp
+        // `bridge::sanitize`), so the scope prefix must sanitize identically —
+        // otherwise a server name with `.`/space/`:` never matches and its tools
+        // are silently scoped out (or, for a disallowed name, leak in).
         let prefixes: Vec<String> = allowed_servers
             .iter()
             .chain(always_load_servers.iter())
-            .map(|s| format!("mcp__{s}__"))
+            .map(|s| format!("mcp__{}__", sanitize_mcp_segment(s)))
             .collect();
         let tools = self
             .tools
@@ -87,6 +91,22 @@ impl ToolRegistry {
             .collect();
         ToolRegistry { tools }
     }
+}
+
+/// Mirror of the MCP tool-name sanitizer (stepper-mcp `bridge::sanitize`): a
+/// server name is namespaced into tool names with every non-[A-Za-z0-9_-] char
+/// replaced by `_`. Kept here (not imported) because stepper-mcp depends on
+/// stepper-tools, not the reverse.
+fn sanitize_mcp_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -138,6 +158,20 @@ mod tests {
         assert!(names.contains(&"read_file".to_string()), "non-mcp tools always kept");
         assert!(names.contains(&"mcp__alpha__x".to_string()));
         assert!(!names.contains(&"mcp__beta__y".to_string()), "beta is not allowed");
+    }
+
+    #[test]
+    fn filter_mcp_scopes_special_char_server_via_sanitized_prefix() {
+        // A server keyed "my.server" namespaces its tools as `mcp__my_server__*`;
+        // the allow-list must sanitize identically or the match silently fails.
+        let names = registry_with(&["read_file", "mcp__my_server__x", "mcp__other__y"])
+            .filter_mcp(&["my.server".into()], &[])
+            .names();
+        assert!(
+            names.contains(&"mcp__my_server__x".to_string()),
+            "allowed special-char server matches via sanitized prefix"
+        );
+        assert!(!names.contains(&"mcp__other__y".to_string()));
     }
 
     #[test]

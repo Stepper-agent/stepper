@@ -61,7 +61,7 @@ const TRIPPED_BUDGET: u8 = 2;
 /// Per-turn enforcement state for `SessionLimits`. Each provider request is one
 /// ReAct step; `admit_step` gates it and `cap_error` reports which cap tripped
 /// so `run_turn` can convert the resulting stop into a clear error.
-struct TurnBudget {
+pub struct TurnBudget {
     max_steps: Option<u32>,
     max_budget_microusd: Option<u64>,
     steps: AtomicU32,
@@ -70,7 +70,7 @@ struct TurnBudget {
 }
 
 impl TurnBudget {
-    fn new(limits: &SessionLimits) -> Self {
+    pub(crate) fn new(limits: &SessionLimits) -> Self {
         TurnBudget {
             max_steps: limits.max_turns,
             max_budget_microusd: limits.max_budget_usd.map(|b| (b * 1_000_000.0) as u64),
@@ -96,7 +96,7 @@ impl TurnBudget {
         true
     }
 
-    fn record_spend(&self, delta_microusd: u64) {
+    pub(crate) fn record_spend(&self, delta_microusd: u64) {
         self.spent_microusd
             .fetch_add(delta_microusd, Ordering::SeqCst);
     }
@@ -164,7 +164,7 @@ impl LlmProvider for BudgetedProvider {
     }
 }
 
-fn budget_wrap(
+pub(crate) fn budget_wrap(
     provider: Box<dyn LlmProvider>,
     budget: &Option<Arc<TurnBudget>>,
     info: ModelInfo,
@@ -409,6 +409,11 @@ impl Orchestrator {
                     // starved relative to the main loop.
                     step_cap: self.dispatch_step_cap.unwrap_or(step.step_cap),
                     sandbox_writable_roots: self.sandbox_writable_roots.clone(),
+                    // Gate sub-agents against this turn's budget (they cannot
+                    // bypass --max-turns/--max-budget-usd) and hand them the
+                    // project context so they aren't blind to the repo.
+                    budget: budget.clone(),
+                    base_context: self.base_context.clone(),
                 });
                 tools.register(Arc::new(crate::dispatch::DispatchTool::new(dispatcher)));
             }

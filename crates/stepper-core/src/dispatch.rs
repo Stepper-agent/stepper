@@ -158,6 +158,24 @@ pub struct OrchestratorDispatcher {
     pub concurrency: usize,
     pub step_cap: usize,
     pub sandbox_writable_roots: Option<Vec<PathBuf>>,
+    /// The calling turn's safety budget. Dispatched sub-agents are admitted
+    /// against it just like the main layer, so they cannot bypass the caps.
+    pub budget: Option<Arc<crate::orchestrator::TurnBudget>>,
+    /// Project context (`stepper.md`, `@import`s) prepended to each sub-agent's
+    /// system prompt — without it sub-agents run blind to the repo.
+    pub base_context: String,
+}
+
+impl OrchestratorDispatcher {
+    const SUBAGENT_ROLE: &'static str =
+        "You are a dispatched sub-agent. Complete the subtask and end with a concise summary of what you did.";
+
+    /// Sub-agent system prompt: the project context (mirroring the main layers
+    /// via `compose_system`) plus the sub-agent role, so dispatched work is not
+    /// blind to the repo.
+    fn subagent_system(&self) -> String {
+        crate::setup::compose_system(&self.base_context, Self::SUBAGENT_ROLE)
+    }
 }
 
 #[async_trait]
@@ -176,6 +194,9 @@ impl Dispatcher for OrchestratorDispatcher {
             match self.resolver.resolve(&model_ref) {
                 Ok(provider) => {
                     let model_info = self.resolver.model_info(&model_ref);
+                    // Gate sub-agent steps/spend against the shared turn budget.
+                    let provider =
+                        crate::orchestrator::budget_wrap(provider, &self.budget, model_info);
                     let worker_index = next_index;
                     next_index += 1;
                     tasks.push(FanoutTask {
@@ -199,11 +220,7 @@ impl Dispatcher for OrchestratorDispatcher {
                         step_cap: self.step_cap,
                         hooks: self.hooks.clone(),
                         compaction_provider: self.compaction_provider.clone(),
-                        system: crate::setup::compose_system(
-                            "",
-                            "You are a dispatched sub-agent. Complete the subtask and end with a \
-                             concise summary of what you did.",
-                        ),
+                        system: self.subagent_system(),
                         messages: vec![Message::user(req.prompt)],
                     });
                 }
@@ -234,5 +251,129 @@ impl Dispatcher for OrchestratorDispatcher {
                 .collect();
         results.extend(failed);
         results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ModelInfo;
+    use crate::orchestrator::TurnBudget;
+    use crate::{CoreError, SessionLimits};
+    use stepper_permission::Decision;
+    use stepper_protocol::AppEvent;
+    use stepper_provider::{ChatEvent, ChatRequest, ChatStream, ProviderError, StopReason};
+    use stepper_tools::Approval;
+
+    struct TextProvider;
+    #[async_trait]
+    impl LlmProvider for TextProvider {
+        fn provider(&self) -> &str {
+            "fake"
+        }
+        fn model(&self) -> &str {
+            "m"
+        }
+        async fn chat_stream(
+            &self,
+            _req: ChatRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ChatStream, ProviderError> {
+            Ok(Box::pin(futures::stream::iter(vec![Ok(ChatEvent::Done(
+                StopReason::EndTurn,
+            ))])))
+        }
+    }
+
+    struct OneResolver;
+    impl ProviderResolver for OneResolver {
+        fn resolve(&self, _model_ref: &str) -> Result<Box<dyn LlmProvider>, CoreError> {
+            Ok(Box::new(TextProvider))
+        }
+        fn model_info(&self, _model_ref: &str) -> ModelInfo {
+            ModelInfo {
+                context_window: 1000,
+                max_output_tokens: 0,
+                input_per_mtok: 1.0,
+                output_per_mtok: 1.0,
+                cache_read_per_mtok: 0.0,
+                cache_write_per_mtok: 0.0,
+                estimated: false,
+            }
+        }
+    }
+
+    struct AllowAll;
+    #[async_trait]
+    impl Approver for AllowAll {
+        async fn request(&self, _approval: Approval) -> Decision {
+            Decision::Allow
+        }
+    }
+
+    fn dispatcher(
+        budget: Option<Arc<TurnBudget>>,
+        base_context: &str,
+        tx: EventTx,
+        root: PathBuf,
+    ) -> OrchestratorDispatcher {
+        OrchestratorDispatcher {
+            resolver: Arc::new(OneResolver),
+            base_tools: ToolRegistry::builtins(),
+            hooks: Arc::new(HookHost::empty(root.clone())),
+            cwd: root.clone(),
+            project_root: root,
+            home: None,
+            rules: Arc::new(RuleSet::default()),
+            mode: PermissionMode::AcceptEdits,
+            default_model: "fake/m".into(),
+            event_tx: tx,
+            approver: Arc::new(AllowAll),
+            cancel: CancellationToken::new(),
+            compaction_provider: None,
+            concurrency: 2,
+            step_cap: 4,
+            sandbox_writable_roots: None,
+            budget,
+            base_context: base_context.to_string(),
+        }
+    }
+
+    /// A dispatched sub-agent is admitted against the turn budget like any other
+    /// layer: once the session budget is spent, dispatch cannot run more work
+    /// (regression — sub-agents previously used the raw, unbudgeted provider).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatched_subagents_are_gated_by_the_turn_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = SessionLimits::new(None, Some(0.001), None);
+        let budget = Arc::new(TurnBudget::new(&limits));
+        budget.record_spend(2_000); // already past the 1_000 microusd ($0.001) cap
+        let (tx, _rx) = tokio::sync::mpsc::channel::<AppEvent>(64);
+
+        let dispatcher = dispatcher(Some(budget), "", tx, dir.path().to_path_buf());
+        let results = dispatcher
+            .dispatch(vec![DispatchRequest {
+                label: "blocked".into(),
+                prompt: "do work".into(),
+                model_ref: None,
+            }])
+            .await;
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            !results[0].ok,
+            "a spent budget must block the dispatched sub-agent: {:?}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn subagent_system_prepends_project_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<AppEvent>(8);
+        let d = dispatcher(None, "PROJECT_CONTEXT_MARKER", tx, dir.path().to_path_buf());
+        let sys = d.subagent_system();
+        assert!(sys.contains("PROJECT_CONTEXT_MARKER"), "project context is included");
+        assert!(sys.contains("dispatched sub-agent"), "the role is included");
     }
 }
