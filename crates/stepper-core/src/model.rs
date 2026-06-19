@@ -40,7 +40,7 @@ impl ModelInfo {
             self.context_window = ctx;
             applied = true;
         }
-        if let Some(out) = meta.max_output_tokens {
+        if let Some(out) = meta.max_output_tokens.filter(|&o| o > 0) {
             self.max_output_tokens = out;
         }
         if let Some(input) = meta.input_per_mtok {
@@ -53,6 +53,16 @@ impl ModelInfo {
         }
         if applied {
             self.estimated = false;
+        }
+        // A catalog output cap that meets or exceeds the context window is bogus —
+        // a reply can never fill the entire window (the prompt occupies part of
+        // it). models.dev has ~900 such entries (e.g. ollama-cloud/deepseek-v4-flash
+        // lists output == context == 1048576), and forwarding that as `max_tokens`
+        // makes the provider 400 ("max_tokens exceeds the model's output limit").
+        // Drop it (0 = "use the provider/Anthropic default") so a bad catalog
+        // figure never reaches the wire.
+        if self.context_window > 0 && self.max_output_tokens >= self.context_window {
+            self.max_output_tokens = 0;
         }
         self
     }
@@ -156,4 +166,57 @@ impl ModelRegistry {
 
 fn is_local(provider: &str) -> bool {
     matches!(provider, "omlx" | "mlx" | "ollama" | "ollama-cloud" | "local")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stepper_providers::CatalogMeta;
+
+    fn base() -> ModelInfo {
+        ModelInfo {
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            input_per_mtok: 1.0,
+            output_per_mtok: 1.0,
+            cache_read_per_mtok: 0.0,
+            cache_write_per_mtok: 0.0,
+            estimated: true,
+        }
+    }
+
+    #[test]
+    fn overlay_drops_a_bogus_output_cap_that_meets_or_exceeds_the_context() {
+        // models.dev ships ~900 entries with output == context (e.g.
+        // ollama-cloud/deepseek-v4-flash: output == context == 1048576).
+        // Forwarding that as max_tokens makes the provider 400, so it must be
+        // dropped to 0 (use provider default) rather than sent.
+        let info = base().overlaid_with(&CatalogMeta {
+            context_window: Some(1_048_576),
+            max_output_tokens: Some(1_048_576),
+            ..Default::default()
+        });
+        assert_eq!(info.context_window, 1_048_576);
+        assert_eq!(info.max_output_tokens, 0, "an output cap >= context is dropped");
+    }
+
+    #[test]
+    fn overlay_keeps_a_sane_output_cap_below_the_context() {
+        let info = base().overlaid_with(&CatalogMeta {
+            context_window: Some(200_000),
+            max_output_tokens: Some(64_000),
+            ..Default::default()
+        });
+        assert_eq!(info.max_output_tokens, 64_000, "a real output cap is kept");
+        assert!(!info.estimated);
+    }
+
+    #[test]
+    fn overlay_with_zero_output_keeps_the_existing_value() {
+        let info = base().overlaid_with(&CatalogMeta {
+            max_output_tokens: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(info.max_output_tokens, 8_192, "a 0 output cap does not clobber the fallback");
+    }
 }

@@ -61,10 +61,25 @@ pub struct CatalogMeta {
     pub release_date: Option<String>,
 }
 
-/// The parsed models.dev catalog: `provider id -> (model id -> metadata)`.
+/// Provider-level metadata from the catalog (the fields `/connect` seeds from):
+/// the id/display name plus the hints that map onto a `setting.json` provider —
+/// `npm` (the SDK package, which tells us the wire dialect), `api` (the base
+/// URL), and `env` (the API-key environment variable name(s)).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProviderMeta {
+    pub id: String,
+    pub name: String,
+    pub npm: Option<String>,
+    pub api: Option<String>,
+    pub env: Vec<String>,
+}
+
+/// The parsed models.dev catalog: per-model metadata keyed by provider, plus the
+/// provider-level metadata (`/connect` seed).
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     by_provider: HashMap<String, HashMap<String, CatalogMeta>>,
+    providers: HashMap<String, ProviderMeta>,
 }
 
 impl Catalog {
@@ -80,6 +95,19 @@ impl Catalog {
     /// the provider or model id is not in the catalog.
     pub fn meta(&self, provider: &str, model_id: &str) -> Option<&CatalogMeta> {
         self.models_for(provider).and_then(|m| m.get(model_id))
+    }
+
+    /// Provider-level metadata for `id` (exact, no aliasing — `/connect` writes
+    /// the catalog's own id). `None` when the catalog has no such provider.
+    pub fn provider_meta(&self, id: &str) -> Option<&ProviderMeta> {
+        self.providers.get(id)
+    }
+
+    /// Every catalog provider, sorted by id — the `/connect` picker seed.
+    pub fn provider_seeds(&self) -> Vec<&ProviderMeta> {
+        let mut seeds: Vec<&ProviderMeta> = self.providers.values().collect();
+        seeds.sort_by(|a, b| a.id.cmp(&b.id));
+        seeds
     }
 }
 
@@ -113,8 +141,9 @@ pub async fn fetch_catalog(client: &reqwest::Client) -> Result<Catalog, Provider
 /// `{ "<provider>": { "models": { "<id>": { name, limit:{context,output}, cost:{input,output} } } } }`.
 pub fn parse_catalog(root: &serde_json::Value) -> Catalog {
     let mut by_provider = HashMap::new();
+    let mut providers_meta = HashMap::new();
     let Some(providers) = root.as_object() else {
-        return Catalog { by_provider };
+        return Catalog { by_provider, providers: providers_meta };
     };
     for (provider_id, provider) in providers {
         let Some(models) = provider.get("models").and_then(|m| m.as_object()) else {
@@ -126,9 +155,26 @@ pub fn parse_catalog(root: &serde_json::Value) -> Catalog {
         }
         if !entries.is_empty() {
             by_provider.insert(provider_id.clone(), entries);
+            providers_meta.insert(provider_id.clone(), parse_provider_meta(provider_id, provider));
         }
     }
-    Catalog { by_provider }
+    Catalog { by_provider, providers: providers_meta }
+}
+
+/// Pull the provider-level fields off one models.dev provider object. Falls back
+/// to the map key for the id/name when the object omits them.
+fn parse_provider_meta(provider_id: &str, provider: &serde_json::Value) -> ProviderMeta {
+    ProviderMeta {
+        id: provider.get("id").and_then(|v| v.as_str()).unwrap_or(provider_id).to_string(),
+        name: provider.get("name").and_then(|v| v.as_str()).unwrap_or(provider_id).to_string(),
+        npm: provider.get("npm").and_then(|v| v.as_str()).map(String::from),
+        api: provider.get("api").and_then(|v| v.as_str()).map(String::from),
+        env: provider
+            .get("env")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default(),
+    }
 }
 
 fn parse_catalog_meta(model: &serde_json::Value) -> CatalogMeta {
@@ -289,7 +335,7 @@ mod tests {
         anthropic.insert("claude-old".to_string(), CatalogMeta { tool_call: true, release_date: Some("2024-01-01".into()), ..Default::default() });
         anthropic.insert("embed-1".to_string(), CatalogMeta { tool_call: false, ..Default::default() });
         by_provider.insert("anthropic".to_string(), anthropic);
-        let catalog = Catalog { by_provider };
+        let catalog = Catalog { by_provider, providers: HashMap::new() };
 
         let got = onboarding_models(&catalog, "anthropic");
         assert_eq!(got.len(), 2, "the non-tool_call model is excluded");
@@ -323,6 +369,35 @@ mod tests {
         assert_eq!(meta.max_output_tokens, Some(64000));
         assert_eq!(meta.input_per_mtok, Some(5.0));
         assert!(catalog.models_for("novendor").is_none(), "no models => skipped");
+    }
+
+    #[test]
+    fn parse_catalog_seeds_provider_meta_for_connect() {
+        let root = serde_json::json!({
+            "anthropic": {
+                "id": "anthropic", "name": "Anthropic", "npm": "@ai-sdk/anthropic",
+                "api": "https://api.anthropic.com", "env": ["ANTHROPIC_API_KEY"],
+                "models": { "claude-x": { "name": "Claude X" } }
+            },
+            "acme": {
+                "name": "Acme AI", "npm": "@ai-sdk/openai-compatible",
+                "api": "https://api.acme.ai/v1", "env": ["ACME_API_KEY", "ACME_TOKEN"],
+                "models": { "acme-1": { "name": "Acme One" } }
+            },
+            "novendor": { "doc": "no models => not seeded" }
+        });
+        let catalog = parse_catalog(&root);
+        // Sorted by id, model-less providers excluded.
+        let seeds: Vec<&str> = catalog.provider_seeds().iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(seeds, vec!["acme", "anthropic"]);
+        let acme = catalog.provider_meta("acme").unwrap();
+        // `id` falls back to the map key when the object omits it.
+        assert_eq!(acme.id, "acme");
+        assert_eq!(acme.name, "Acme AI");
+        assert_eq!(acme.npm.as_deref(), Some("@ai-sdk/openai-compatible"));
+        assert_eq!(acme.api.as_deref(), Some("https://api.acme.ai/v1"));
+        assert_eq!(acme.env, vec!["ACME_API_KEY".to_string(), "ACME_TOKEN".to_string()]);
+        assert!(catalog.provider_meta("novendor").is_none());
     }
 
     #[test]

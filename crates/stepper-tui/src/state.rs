@@ -5,8 +5,8 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use stepper_protocol::{
     Action, AppEvent, ApprovalRequest, CheckpointView, ContextBreakdownView, LayerStatus,
-    LayerView, Mode, ModelChoiceView, ModelView, NoticeLevel, PermissionsSnapshotView, SessionView,
-    TodoItemView, UsageView, WorkerView,
+    LayerView, Mode, ModelChoiceView, ModelView, NoticeLevel, PermissionsSnapshotView,
+    ProviderChoiceView, SessionView, TodoItemView, UsageView, WorkerView,
 };
 
 use crate::{CommandInfo, TuiInit};
@@ -89,6 +89,120 @@ pub enum Overlay {
     /// The background-process "shell view" (Down key): up/down selects a process,
     /// `k` kills it, Esc/q closes.
     Shell(ShellView),
+    /// `/theme` — the color-theme editor: row 0 cycles the preset (←/→), the
+    /// rest edit each color role's hex/name inline. Enter saves, Esc cancels.
+    Theme(ThemeState),
+}
+
+/// Color-theme editor state. Row 0 is the preset selector; rows `1..=colors.len`
+/// edit each color role's value string. The live theme is derived from this.
+pub struct ThemeState {
+    presets: Vec<String>,
+    pub preset_idx: usize,
+    /// `(role name, editable color string)` per editable color, in display order.
+    pub colors: Vec<(String, String)>,
+    /// 0 = preset row; `1..=colors.len()` = color rows.
+    pub selected: usize,
+    /// True until the first keystroke after (re)selecting a color row, so typing
+    /// replaces the existing value instead of appending to it.
+    fresh: bool,
+    /// The theme at open time, restored on cancel (Esc).
+    saved: crate::theme::Theme,
+}
+
+impl ThemeState {
+    /// Seed the editor from the current preset name + live theme colors.
+    pub fn new(preset: &str, theme: &crate::theme::Theme) -> Self {
+        let presets: Vec<String> = crate::theme::PRESET_NAMES.iter().map(|s| s.to_string()).collect();
+        let preset_idx = presets.iter().position(|p| p == preset).unwrap_or(0);
+        let colors = theme
+            .color_fields()
+            .iter()
+            .map(|(name, c)| (name.to_string(), crate::theme::Theme::color_to_string(*c)))
+            .collect();
+        ThemeState { presets, preset_idx, colors, selected: 0, fresh: true, saved: theme.clone() }
+    }
+
+    pub fn preset_name(&self) -> &str {
+        &self.presets[self.preset_idx]
+    }
+
+    /// Total rows: the preset selector plus one per color.
+    pub fn rows(&self) -> usize {
+        1 + self.colors.len()
+    }
+
+    pub fn move_sel(&mut self, delta: i32) {
+        let n = self.rows() as i32;
+        self.selected = (((self.selected as i32 + delta) % n + n) % n) as usize;
+        self.fresh = true;
+    }
+
+    /// On the preset row, cycle the preset and reset the colors to its palette so
+    /// the editor reflects the chosen base.
+    pub fn cycle_preset(&mut self, delta: i32) {
+        if self.selected != 0 {
+            return;
+        }
+        let n = self.presets.len() as i32;
+        self.preset_idx = (((self.preset_idx as i32 + delta) % n + n) % n) as usize;
+        if let Some(theme) = crate::theme::Theme::preset(self.preset_name()) {
+            self.colors = theme
+                .color_fields()
+                .iter()
+                .map(|(name, c)| (name.to_string(), crate::theme::Theme::color_to_string(*c)))
+                .collect();
+        }
+    }
+
+    /// Edit the selected color row's value (no-op on the preset row). The first
+    /// keystroke after selecting a row replaces the existing value.
+    pub fn push_char(&mut self, c: char) {
+        let fresh = self.fresh;
+        if let Some(row) = self.selected.checked_sub(1)
+            && let Some(entry) = self.colors.get_mut(row)
+        {
+            if fresh {
+                entry.1.clear();
+            }
+            entry.1.push(c);
+            self.fresh = false;
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        if let Some(row) = self.selected.checked_sub(1)
+            && let Some(entry) = self.colors.get_mut(row)
+        {
+            entry.1.pop();
+            self.fresh = false;
+        }
+    }
+
+    /// The live theme described by the editor (edited values win over the preset).
+    pub fn build_theme(&self) -> crate::theme::Theme {
+        crate::theme::Theme::resolve(Some(self.preset_name()), &self.colors)
+    }
+
+    /// Persistable per-role overrides: only the colors that differ from the
+    /// chosen preset's value (keeps `setting.json` minimal).
+    pub fn overrides(&self) -> Vec<(String, String)> {
+        let preset = crate::theme::Theme::preset(self.preset_name()).unwrap_or_default();
+        let base: std::collections::HashMap<&str, String> = preset
+            .color_fields()
+            .iter()
+            .map(|(n, c)| (*n, crate::theme::Theme::color_to_string(*c)))
+            .collect();
+        self.colors
+            .iter()
+            .filter(|(name, value)| {
+                // Keep an override only when it parses AND differs from the preset.
+                crate::theme::Theme::parse_color(value).is_some()
+                    && base.get(name.as_str()).map(|b| b != value).unwrap_or(true)
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 /// Shell-view overlay state: which process row is highlighted.
@@ -128,6 +242,7 @@ pub enum PickerKind {
     Rewind,
     Resume,
     Model,
+    Connect,
 }
 
 /// The generic list-picker overlay shared by `/rewind` (checkpoints) and
@@ -136,6 +251,10 @@ pub enum PickerKind {
 pub struct ListPicker {
     pub kind: PickerKind,
     pub items: Vec<ListPickerItem>,
+    /// Type-to-filter query (searchable kinds only). `matches` indexes `items`.
+    pub query: String,
+    pub matches: Vec<usize>,
+    /// Index into `matches` (the filtered view), not `items`.
     pub selected: usize,
 }
 
@@ -147,24 +266,73 @@ pub struct ListPickerItem {
 }
 
 impl ListPicker {
+    pub fn new(kind: PickerKind, items: Vec<ListPickerItem>) -> Self {
+        let matches = (0..items.len()).collect();
+        ListPicker {
+            kind,
+            items,
+            query: String::new(),
+            matches,
+            selected: 0,
+        }
+    }
+
     pub fn title(&self) -> &'static str {
         match self.kind {
             PickerKind::Rewind => " rewind ",
             PickerKind::Resume => " resume ",
             PickerKind::Model => " models ",
+            PickerKind::Connect => " connect ",
+        }
+    }
+
+    /// Whether typing filters this picker. The model and provider lists are large,
+    /// so they are type-to-filter; the rewind/resume lists are short and strict.
+    pub fn searchable(&self) -> bool {
+        matches!(self.kind, PickerKind::Model | PickerKind::Connect)
+    }
+
+    /// Append a char to the filter query and re-filter (searchable kinds only).
+    pub fn push_query(&mut self, c: char) {
+        if self.searchable() {
+            self.query.push(c);
+            self.update_filter();
+        }
+    }
+
+    /// Drop the last query char and re-filter. Returns whether anything changed.
+    pub fn pop_query(&mut self) -> bool {
+        if self.searchable() && self.query.pop().is_some() {
+            self.update_filter();
+            return true;
+        }
+        false
+    }
+
+    fn update_filter(&mut self) {
+        let needle = self.query.to_lowercase();
+        self.matches = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| needle.is_empty() || it.label.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect();
+        if self.selected >= self.matches.len() {
+            self.selected = 0;
         }
     }
 
     fn move_sel(&mut self, delta: i32) {
-        if self.items.is_empty() {
+        if self.matches.is_empty() {
             return;
         }
-        let n = self.items.len() as i32;
+        let n = self.matches.len() as i32;
         self.selected = (((self.selected as i32 + delta) % n + n) % n) as usize;
     }
 
     fn selection(&self) -> Option<Action> {
-        let item = self.items.get(self.selected)?;
+        let item = self.items.get(*self.matches.get(self.selected)?)?;
         Some(match self.kind {
             PickerKind::Rewind => Action::Rewind {
                 checkpoint_id: item.id.clone(),
@@ -176,6 +344,12 @@ impl ListPicker {
             // ModelChanged); the item id is the `provider/model-id` ref.
             PickerKind::Model => Action::SlashCommand {
                 name: "model".into(),
+                args: item.id.clone(),
+            },
+            // Route back through `/connect <id>` (register + prompt for the key);
+            // the item id is the catalog provider id.
+            PickerKind::Connect => Action::SlashCommand {
+                name: "connect".into(),
                 args: item.id.clone(),
             },
         })
@@ -264,6 +438,13 @@ pub struct AppState {
     /// action/typing) opens the rewind picker (Esc-Esc, Claude-Code-style).
     pub esc_armed: bool,
     pub should_quit: bool,
+    /// The live color theme (rendered everywhere) and the preset it derives from.
+    /// The `/theme` editor mutates these; persistence rides an `Action::SetTheme`.
+    pub theme: crate::theme::Theme,
+    pub theme_preset: String,
+    /// Session reasoning-effort level (`None` = off), shown in the status footer;
+    /// updated by `AppEvent::EffortChanged` from `/effort`.
+    pub effort: Option<String>,
 }
 
 /// A blank input textarea configured the way every fresh prompt needs it:
@@ -302,11 +483,78 @@ impl AppState {
             scroll_offset: 0,
             turn_active: false,
             cwd: init.cwd,
+            theme: crate::theme::Theme::resolve(init.theme_preset.as_deref(), &init.theme_colors),
+            theme_preset: init.theme_preset.unwrap_or_else(|| "dark".to_string()),
+            effort: init.effort,
             commands: init.commands,
             palette_selected: 0,
             esc_armed: false,
             should_quit: false,
         }
+    }
+
+    /// Open the `/theme` color editor seeded from the live theme.
+    pub fn open_theme_editor(&mut self) {
+        let editor = ThemeState::new(&self.theme_preset, &self.theme);
+        self.open_overlay(Overlay::Theme(editor));
+    }
+
+    /// Move the editor cursor and refresh the live preview.
+    pub fn theme_editor_move(&mut self, delta: i32) {
+        if let Some(Overlay::Theme(ts)) = &mut self.overlay {
+            ts.move_sel(delta);
+        }
+    }
+
+    /// Cycle the preset (preset row only) and refresh the live preview.
+    pub fn theme_editor_cycle(&mut self, delta: i32) {
+        let preview = if let Some(Overlay::Theme(ts)) = &mut self.overlay {
+            ts.cycle_preset(delta);
+            ts.build_theme()
+        } else {
+            return;
+        };
+        self.theme = preview;
+    }
+
+    /// Type into / edit the selected color row and refresh the live preview.
+    pub fn theme_editor_edit(&mut self, c: Option<char>) {
+        let preview = if let Some(Overlay::Theme(ts)) = &mut self.overlay {
+            match c {
+                Some(ch) => ts.push_char(ch),
+                None => ts.backspace(),
+            }
+            ts.build_theme()
+        } else {
+            return;
+        };
+        self.theme = preview;
+    }
+
+    /// Commit the edited theme: apply it live and return the `Action::SetTheme`
+    /// to persist (preset + minimal overrides). Closes the editor.
+    pub fn theme_editor_save(&mut self) -> Option<Action> {
+        let (preset, overrides, built) = if let Some(Overlay::Theme(ts)) = &self.overlay {
+            (ts.preset_name().to_string(), ts.overrides(), ts.build_theme())
+        } else {
+            return None;
+        };
+        self.theme = built;
+        self.theme_preset = preset.clone();
+        self.overlay_close();
+        Some(Action::SetTheme { preset: Some(preset), colors: overrides })
+    }
+
+    /// Abandon the edits, restoring the theme that was live when the editor opened.
+    pub fn theme_editor_cancel(&mut self) {
+        let saved = match &self.overlay {
+            Some(Overlay::Theme(ts)) => Some(ts.saved.clone()),
+            _ => None,
+        };
+        if let Some(theme) = saved {
+            self.theme = theme;
+        }
+        self.overlay_close();
     }
 
     pub fn input_text(&self) -> String {
@@ -464,6 +712,7 @@ impl AppState {
                     | Overlay::Picker(_)
                     | Overlay::ApiKey(_)
                     | Overlay::Shell(_)
+                    | Overlay::Theme(_)
             )
         )
     }
@@ -552,6 +801,25 @@ impl AppState {
     pub fn overlay_picker_move(&mut self, delta: i32) {
         if let Some(Overlay::Picker(p)) = &mut self.overlay {
             p.move_sel(delta);
+        }
+    }
+
+    /// Whether the open picker filters on typed input (the model list).
+    pub fn overlay_picker_searchable(&self) -> bool {
+        matches!(&self.overlay, Some(Overlay::Picker(p)) if p.searchable())
+    }
+
+    /// Append a char to a searchable picker's filter query.
+    pub fn overlay_picker_push(&mut self, c: char) {
+        if let Some(Overlay::Picker(p)) = &mut self.overlay {
+            p.push_query(c);
+        }
+    }
+
+    /// Drop the last char of a searchable picker's filter query.
+    pub fn overlay_picker_backspace(&mut self) {
+        if let Some(Overlay::Picker(p)) = &mut self.overlay {
+            p.pop_query();
         }
     }
 
@@ -687,11 +955,7 @@ impl AppState {
                         id: c.id,
                     })
                     .collect();
-                self.open_overlay(Overlay::Picker(ListPicker {
-                    kind: PickerKind::Rewind,
-                    items,
-                    selected: 0,
-                }));
+                self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Rewind, items)));
             }
             AppEvent::SessionList(sessions) => {
                 let items = sessions
@@ -707,11 +971,7 @@ impl AppState {
                         id: s.id,
                     })
                     .collect();
-                self.open_overlay(Overlay::Picker(ListPicker {
-                    kind: PickerKind::Resume,
-                    items,
-                    selected: 0,
-                }));
+                self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Resume, items)));
             }
             AppEvent::ModelList(models) => {
                 let items = models
@@ -721,12 +981,17 @@ impl AppState {
                         id: m.model_ref,
                     })
                     .collect();
-                self.open_overlay(Overlay::Picker(ListPicker {
-                    kind: PickerKind::Model,
-                    items,
-                    selected: 0,
-                }));
+                self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Model, items)));
             }
+            AppEvent::ProviderList(providers) => {
+                let items = providers
+                    .into_iter()
+                    .map(|p: ProviderChoiceView| ListPickerItem { label: p.label, id: p.id })
+                    .collect();
+                self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Connect, items)));
+            }
+            AppEvent::OpenThemeEditor => self.open_theme_editor(),
+            AppEvent::EffortChanged(level) => self.effort = level,
             AppEvent::ApiKeyPrompt { provider } => {
                 // Never clobber a live overlay (esp. an approval's oneshot) and
                 // never drop the prompt — queue it if something is on screen.
@@ -851,6 +1116,7 @@ impl AppState {
             | Action::Rewind { .. }
             | Action::Resume { .. }
             | Action::SetApiKey { .. }
+            | Action::SetTheme { .. }
             | Action::KillProcess(_)
             | Action::AttachImage { .. }) => {
                 effects.push(Effect::Send(other));
@@ -937,11 +1203,15 @@ impl Queued {
     }
 
     /// The chat-style transcript line committed to scrollback when this item is
-    /// sent, so the user's own prompt is visible above the assistant's reply.
+    /// sent, so the user's own prompt is visible above the assistant's reply. A
+    /// leading `❯` prompt glyph marks it as input — no redundant role label like
+    /// "you", and distinct from both the label-less assistant reply and the
+    /// model's reasoning (which renders as a blockquote). The glyph also keeps the
+    /// text from being reinterpreted as a markdown heading/list.
     fn echo_md(&self) -> String {
         match self {
-            Queued::Chat(t) => format!("**❯ you**\n\n{t}"),
-            Queued::Shell(c) => format!("**❯ !{c}**"),
+            Queued::Chat(t) => format!("❯ {t}"),
+            Queued::Shell(c) => format!("❯ `!{c}`"),
         }
     }
 }
@@ -962,6 +1232,9 @@ mod tests {
                 CommandInfo::named("rewind"),
                 CommandInfo::named("resume"),
             ],
+            theme_preset: None,
+            theme_colors: Vec::new(),
+            effort: None,
         })
     }
 
@@ -1093,8 +1366,9 @@ mod tests {
         // The prompt is echoed to scrollback first, then sent — chat-style trace.
         match effects.as_slice() {
             [Effect::CommitToScrollback(md), Effect::Send(Action::SubmitInput(t))] => {
-                assert!(md.contains("hi"), "echo carries the prompt: {md}");
-                assert!(md.contains("you"), "echo is labelled: {md}");
+                // A `❯ ` prompt glyph marks input — no "you" role label.
+                assert_eq!(md, "❯ hi", "echo is the prompt glyph + text, no 'you' label");
+                assert!(!md.to_lowercase().contains("you"), "no role label");
                 assert_eq!(t.as_str(), "hi");
             }
             _ => panic!("expected an echo commit then an immediate send"),
@@ -1692,6 +1966,116 @@ mod tests {
             _ => panic!("expected a /model SlashCommand send"),
         }
         assert!(s.overlay.is_none(), "selection closes the picker");
+    }
+
+    #[test]
+    fn model_picker_filters_on_typed_query_and_selects_the_match() {
+        let mut s = test_state();
+        s.apply_event(AppEvent::ModelList(vec![
+            ModelChoiceView {
+                model_ref: "anthropic/claude-opus-4-8".into(),
+                label: "anthropic/claude-opus-4-8".into(),
+            },
+            ModelChoiceView { model_ref: "openai/gpt-5".into(), label: "openai/gpt-5".into() },
+            ModelChoiceView { model_ref: "openai/gpt-5-mini".into(), label: "openai/gpt-5-mini".into() },
+        ]));
+        assert!(s.overlay_picker_searchable(), "the model picker is searchable");
+        // Type "gpt" → only the two gpt rows remain.
+        for c in "gpt".chars() {
+            s.overlay_picker_push(c);
+        }
+        match &s.overlay {
+            Some(Overlay::Picker(p)) => {
+                assert_eq!(p.query, "gpt");
+                assert_eq!(p.matches.len(), 2, "filtered to gpt-* rows");
+                assert_eq!(p.items.len(), 3, "the full candidate list is retained");
+            }
+            _ => panic!("picker expected"),
+        }
+        // Selecting the first match sends the right ref through the /model path.
+        let effects = s.overlay_picker_select();
+        match effects.as_slice() {
+            [Effect::Send(Action::SlashCommand { name, args })] => {
+                assert_eq!(name, "model");
+                assert_eq!(args, "openai/gpt-5");
+            }
+            _ => panic!("expected a /model send for the filtered selection"),
+        }
+    }
+
+    #[test]
+    fn provider_picker_filters_on_query_and_selects_via_connect() {
+        let mut s = test_state();
+        s.apply_event(AppEvent::ProviderList(vec![
+            ProviderChoiceView { id: "anthropic".into(), label: "anthropic  ·  Anthropic".into() },
+            ProviderChoiceView { id: "openai".into(), label: "openai  ·  OpenAI".into() },
+            ProviderChoiceView { id: "openrouter".into(), label: "openrouter  ·  OpenRouter".into() },
+        ]));
+        assert!(s.overlay_picker_searchable(), "the connect picker is searchable");
+        // Type "openr" → only openrouter remains.
+        for c in "openr".chars() {
+            s.overlay_picker_push(c);
+        }
+        match &s.overlay {
+            Some(Overlay::Picker(p)) => {
+                assert_eq!(p.kind, PickerKind::Connect);
+                assert_eq!(p.matches.len(), 1, "filtered to openrouter");
+                assert_eq!(p.items.len(), 3, "the full provider seed is retained");
+            }
+            _ => panic!("connect picker expected"),
+        }
+        // Selecting routes back through `/connect <id>` (register + key prompt).
+        let effects = s.overlay_picker_select();
+        match effects.as_slice() {
+            [Effect::Send(Action::SlashCommand { name, args })] => {
+                assert_eq!(name, "connect");
+                assert_eq!(args, "openrouter");
+            }
+            _ => panic!("expected a /connect send for the filtered selection"),
+        }
+    }
+
+    #[test]
+    fn theme_editor_cycles_preset_edits_color_and_saves_set_theme() {
+        let mut s = test_state();
+        s.open_theme_editor();
+        assert!(matches!(s.overlay, Some(Overlay::Theme(_))), "editor opens");
+
+        // Cycle the preset (row 0) to `light` and apply it live.
+        s.theme_editor_cycle(1);
+        assert_eq!(s.theme.accent, crate::theme::Theme::preset("light").unwrap().accent);
+
+        // Select the first color row (accent) and type a fresh value (replaces).
+        s.theme_editor_move(1);
+        for c in "#ff0000".chars() {
+            s.theme_editor_edit(Some(c));
+        }
+        assert_eq!(s.theme.accent, ratatui::style::Color::Rgb(0xff, 0, 0), "live preview");
+
+        // Save → applies + returns the persist action; overlay closes.
+        let action = s.theme_editor_save().expect("save yields a SetTheme");
+        match action {
+            Action::SetTheme { preset, colors } => {
+                assert_eq!(preset.as_deref(), Some("light"));
+                // ONLY the changed role is persisted (minimal overrides), not all 11.
+                assert_eq!(colors, vec![("accent".to_string(), "#ff0000".to_string())]);
+            }
+            _ => panic!("expected SetTheme"),
+        }
+        assert!(s.overlay.is_none(), "save closes the editor");
+        assert_eq!(s.theme_preset, "light");
+    }
+
+    #[test]
+    fn theme_editor_cancel_reverts_the_live_preview() {
+        let mut s = test_state();
+        let original = s.theme.accent;
+        s.open_theme_editor();
+        s.theme_editor_cycle(1); // changes the live theme
+        assert_ne!(s.theme.accent, original, "preview changed");
+        s.theme_editor_cancel();
+        assert_eq!(s.theme.accent, original, "cancel restores the original theme");
+        assert!(s.overlay.is_none());
     }
 
     #[test]

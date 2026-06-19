@@ -14,7 +14,6 @@ use crate::input::{Lowered, lower_event};
 use crate::render::draw;
 use crate::state::{AppState, Effect, Selection};
 use crate::terminal::TerminalGuard;
-use crate::theme::Theme;
 
 /// The single `tokio::select!` event loop. Multiplexes terminal input, a render
 /// tick, the core->TUI `AppEvent` channel, and a cancellation token. Rendering
@@ -33,7 +32,7 @@ pub async fn run(
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut guard = TerminalGuard::new(init.inline_height);
-    let theme = Theme::default();
+    // The live theme lives in AppState (the `/theme` editor mutates it).
     let mut state = AppState::new(init);
 
     let running = Arc::new(AtomicBool::new(true));
@@ -67,7 +66,7 @@ pub async fn run(
     // there's no flicker) and after a scrollback commit.
     let mut force_clear = false;
     let mut last_input_w = 0usize;
-    draw(&mut guard.terminal, &state, &theme)?;
+    draw(&mut guard.terminal, &state, &state.theme)?;
 
     loop {
         if state.should_quit {
@@ -103,7 +102,7 @@ pub async fn run(
                         let _ = guard.terminal.clear();
                         force_clear = false;
                     }
-                    draw(&mut guard.terminal, &state, &theme)?;
+                    draw(&mut guard.terminal, &state, &state.theme)?;
                     dirty = false;
                 }
             }
@@ -285,6 +284,25 @@ fn handle_overlay_key(state: &mut AppState, action_tx: &ActionTx, ev: &Event) {
         return;
     }
     if matches!(state.overlay, Some(Overlay::Picker(_))) {
+        // Searchable pickers (models): a printable char types into the filter and
+        // Backspace edits it; arrows/Enter/Esc still navigate via lower_picker_nav.
+        if state.overlay_picker_searchable()
+            && let Event::Key(k) = ev
+        {
+            match k.code {
+                KeyCode::Char(c)
+                    if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    state.overlay_picker_push(c);
+                    return;
+                }
+                KeyCode::Backspace => {
+                    state.overlay_picker_backspace();
+                    return;
+                }
+                _ => {}
+            }
+        }
         match lower_picker_nav(ev) {
             Some(PickerNav::Up) => state.overlay_picker_move(-1),
             Some(PickerNav::Down) => state.overlay_picker_move(1),
@@ -314,6 +332,32 @@ fn handle_overlay_key(state: &mut AppState, action_tx: &ActionTx, ev: &Event) {
                     }
                 }
                 KeyCode::Esc | KeyCode::Char('q') => state.overlay_close(),
+                _ => {}
+            }
+        }
+        return;
+    }
+    // The `/theme` editor: ↑↓ move rows, ←/→ cycle preset, type a color on a
+    // color row, Enter saves (+ persists via SetTheme), Esc reverts.
+    if matches!(state.overlay, Some(Overlay::Theme(_))) {
+        if let Event::Key(k) = ev {
+            match k.code {
+                KeyCode::Up => state.theme_editor_move(-1),
+                KeyCode::Down => state.theme_editor_move(1),
+                KeyCode::Left => state.theme_editor_cycle(-1),
+                KeyCode::Right => state.theme_editor_cycle(1),
+                KeyCode::Backspace => state.theme_editor_edit(None),
+                KeyCode::Char(c)
+                    if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    state.theme_editor_edit(Some(c))
+                }
+                KeyCode::Enter => {
+                    if let Some(action) = state.theme_editor_save() {
+                        let _ = action_tx.try_send(action);
+                    }
+                }
+                KeyCode::Esc => state.theme_editor_cancel(),
                 _ => {}
             }
         }
@@ -512,6 +556,9 @@ mod tests {
             mode: Mode::Auto,
             cwd: PathBuf::from("/tmp"),
             commands: vec![],
+            theme_preset: None,
+            theme_colors: Vec::new(),
+            effort: None,
         });
         s.overlay = Some(Overlay::ApiKey(ApiKeyOverlay {
             provider: "anthropic".into(),

@@ -9,6 +9,7 @@
 use crate::compaction::{estimate_tokens, Compactor};
 use crate::error::CoreError;
 use crate::orchestrator::Orchestrator;
+use crate::ports::ConnectedProvider;
 use crate::session::{SessionRecord, SessionStore, TurnRecord};
 use std::path::Path;
 use stepper_permission::{PermissionMode, Rule};
@@ -32,9 +33,12 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("layer", "<name>", "new layer"),
     ("command", "<name>", "new slash command"),
     ("import", "[claude|codex|cursor|gemini|all] [apply]", "migrate another agent's config"),
+    ("connect", "", "add a provider from models.dev"),
     ("login", "[provider]", "set an API key"),
     ("model", "[provider/model]", "show or switch"),
     ("models", "", "pick from fetched models"),
+    ("theme", "", "edit the TUI color theme"),
+    ("effort", "[off|low|medium|high]", "reasoning effort"),
     ("permissions", "", "rules & approvals"),
     ("allow", "<spec>", "add an allow rule (e.g. Bash(cargo *))"),
     ("ask", "<spec>", "add an ask rule"),
@@ -134,6 +138,10 @@ pub async fn handle(
             handle_import(args.trim(), orchestrator.home.as_deref(), tx).await;
             true
         }
+        "connect" => {
+            handle_connect(args.trim(), orchestrator, tx).await;
+            true
+        }
         "login" => {
             handle_login(args.trim(), orchestrator, tx).await;
             true
@@ -144,6 +152,16 @@ pub async fn handle(
         }
         "models" => {
             handle_models(orchestrator, tx).await;
+            true
+        }
+        "theme" => {
+            // Colors live TUI-side, so just ask the TUI to open its editor; the
+            // chosen theme comes back as `Action::SetTheme` for persistence.
+            let _ = tx.send(AppEvent::OpenThemeEditor).await;
+            true
+        }
+        "effort" => {
+            handle_effort(args.trim(), orchestrator, tx).await;
             true
         }
         "permissions" => {
@@ -458,6 +476,66 @@ fn persist_default_model(orchestrator: &Orchestrator, model: &str) -> std::io::R
     Ok(true)
 }
 
+/// `/effort [off|low|medium|high]` — show or set the session reasoning effort. An
+/// explicit set applies to every step (overriding per-layer frontmatter for this
+/// session) and persists as the project default.
+async fn handle_effort(arg: &str, orchestrator: &mut Orchestrator, tx: &EventTx) {
+    if arg.is_empty() {
+        let current = orchestrator
+            .steps
+            .first()
+            .and_then(|s| s.reasoning_effort.clone())
+            .unwrap_or_else(|| "off".into());
+        notice(
+            tx,
+            NoticeLevel::Info,
+            format!("reasoning effort: {current} — set with /effort <off|low|medium|high>"),
+        )
+        .await;
+        return;
+    }
+    let level = arg.to_ascii_lowercase();
+    if !matches!(level.as_str(), "off" | "low" | "medium" | "high") {
+        notice(
+            tx,
+            NoticeLevel::Warn,
+            format!("unknown effort '{arg}' — use off | low | medium | high"),
+        )
+        .await;
+        return;
+    }
+    // An explicit /effort overrides every step's reasoning controls this session.
+    let (re, tb) = crate::setup::effort_controls(&level);
+    for step in &mut orchestrator.steps {
+        step.reasoning_effort = re.clone();
+        step.thinking_budget = tb;
+    }
+    let persisted = persist_effort(orchestrator, &level);
+    let _ = tx
+        .send(AppEvent::EffortChanged((level != "off").then(|| level.clone())))
+        .await;
+    let suffix = match persisted {
+        Ok(true) => "",
+        _ => " (not persisted — no .stepper/)",
+    };
+    notice(tx, NoticeLevel::Info, format!("reasoning effort → {level}{suffix}")).await;
+}
+
+fn persist_effort(orchestrator: &Orchestrator, level: &str) -> std::io::Result<bool> {
+    let project = orchestrator.project_root.join(".stepper");
+    let dir = if project.is_dir() {
+        project
+    } else if let Some(home) = orchestrator.home.as_ref() {
+        home.join(".stepper")
+    } else {
+        return Ok(false);
+    };
+    stepper_config::scaffold::update_settings(&dir, |obj| {
+        obj.insert("reasoningEffort".into(), serde_json::Value::String(level.to_string()));
+    })?;
+    Ok(true)
+}
+
 async fn handle_model(arg: &str, orchestrator: &mut Orchestrator, tx: &EventTx) {
     if arg.is_empty() {
         let current = orchestrator
@@ -552,6 +630,85 @@ async fn handle_models(orchestrator: &Orchestrator, tx: &EventTx) {
         return;
     }
     let _ = tx.send(AppEvent::ModelList(models)).await;
+}
+
+/// `/connect [provider]`: with no arg, fetch the models.dev provider seed and
+/// open the picker; with a provider id, register it (wire kind + base URL derived
+/// from the catalog) into the live config *and* `setting.json`, then prompt for
+/// its API key (which the existing `/login` overlay stores in the OS keyring).
+async fn handle_connect(arg: &str, orchestrator: &Orchestrator, tx: &EventTx) {
+    if arg.is_empty() {
+        notice(tx, NoticeLevel::Info, "fetching providers…".into()).await;
+        let providers = orchestrator.resolver.list_providers().await;
+        if providers.is_empty() {
+            notice(
+                tx,
+                NoticeLevel::Warn,
+                "no providers found (models.dev unreachable?) — or use /login <provider>".into(),
+            )
+            .await;
+            return;
+        }
+        let _ = tx.send(AppEvent::ProviderList(providers)).await;
+        return;
+    }
+    match orchestrator.resolver.connect_provider(arg).await {
+        Ok(connected) => {
+            let suffix = match persist_provider(orchestrator, arg, &connected) {
+                Ok(true) => "",
+                _ => " (not persisted — no .stepper/)",
+            };
+            notice(
+                tx,
+                NoticeLevel::Info,
+                format!("added provider '{arg}'{suffix} — enter its API key"),
+            )
+            .await;
+            // Reuse the `/login` key overlay; the key lands in the OS keyring and
+            // the next resolve picks it up (no restart).
+            let _ = tx.send(AppEvent::ApiKeyPrompt { provider: arg.to_string() }).await;
+        }
+        Err(e) => notice(tx, NoticeLevel::Warn, format!("cannot connect '{arg}': {e}")).await,
+    }
+}
+
+/// Merge a freshly connected provider into `setting.json` `providers` (project
+/// `.stepper/` wins, else user `~/.stepper/`) without clobbering existing ones.
+/// `Ok(false)` when there is nowhere to persist (no `.stepper/`, no home).
+fn persist_provider(
+    orchestrator: &Orchestrator,
+    id: &str,
+    connected: &ConnectedProvider,
+) -> std::io::Result<bool> {
+    let project = orchestrator.project_root.join(".stepper");
+    let dir = if project.is_dir() {
+        project
+    } else if let Some(home) = orchestrator.home.as_ref() {
+        home.join(".stepper")
+    } else {
+        return Ok(false);
+    };
+    stepper_config::scaffold::update_settings(&dir, |obj| {
+        let providers = obj
+            .entry("providers")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(map) = providers.as_object_mut() {
+            // Merge into the existing entry (if any): refresh the wire `kind` and
+            // fill `baseUrl` only when absent, preserving any apiKey/defaultModel/
+            // auth/contextWindow the user already had — never a whole-object replace.
+            let entry = map
+                .entry(id.to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("kind".into(), serde_json::Value::String(connected.kind.clone()));
+                if let Some(base) = &connected.base_url {
+                    obj.entry("baseUrl".to_string())
+                        .or_insert_with(|| serde_json::Value::String(base.clone()));
+                }
+            }
+        }
+    })?;
+    Ok(true)
 }
 
 /// chars/4, the same estimator the compactor uses for free text.

@@ -1,7 +1,8 @@
 use crate::approval::ApprovalRequest;
 use crate::view::{
     CheckpointView, ContextBreakdownView, DiffView, LayerStatus, ModelChoiceView, ModelView,
-    NoticeLevel, PermissionsSnapshotView, SessionView, TodoItemView, ToolCallView, UsageView,
+    NoticeLevel, PermissionsSnapshotView, ProviderChoiceView, SessionView, TodoItemView,
+    ToolCallView, UsageView,
 };
 
 /// Everything core tells the TUI. The single item type of the core->TUI mpsc
@@ -88,6 +89,17 @@ pub enum AppEvent {
     /// opens a picker whose selection comes back as `Action::SlashCommand`
     /// `/model <ref>` (reusing the existing switch path).
     ModelList(Vec<ModelChoiceView>),
+    /// `/connect` (no arg) — the models.dev provider seed; the TUI opens a
+    /// searchable picker whose selection comes back as `Action::SlashCommand`
+    /// `/connect <id>` (registers the provider, then prompts for its key).
+    ProviderList(Vec<ProviderChoiceView>),
+    /// `/theme` (no preset arg) — ask the TUI to open its color-theme editor. The
+    /// TUI fills the editor from its own current theme (colors live TUI-side); a
+    /// save comes back as `Action::SetTheme`.
+    OpenThemeEditor,
+    /// The session reasoning-effort level changed (`/effort`); `None` = off. The
+    /// TUI shows it in the status footer.
+    EffortChanged(Option<String>),
     /// Ask the TUI to open the API-key entry overlay for `provider` (from
     /// `/login`, or when a model switch failed for lack of a key). The entered
     /// key comes back as `Action::SetApiKey`.

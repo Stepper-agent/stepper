@@ -34,10 +34,15 @@ pub async fn build_orchestrator_with_fallback(
     model: Option<&str>,
     fallback_model: Option<&str>,
     cli_mode: Option<PermissionMode>,
+    cli_effort: Option<String>,
     cwd: PathBuf,
     limits: SessionLimits,
 ) -> anyhow::Result<(Orchestrator, McpManager)> {
     let mut config = Config::load(&cwd)?;
+    // `--effort` wins over `setting.json` `reasoningEffort` for this run.
+    if cli_effort.is_some() {
+        config.settings.reasoning_effort = cli_effort;
+    }
     // Effective limits: a CLI flag wins; otherwise fall back to `setting.json`
     // `limits`; otherwise no limit. (Set at first-run setup, per project.)
     let limits = merge_limits(limits, config.settings.limits.as_ref());

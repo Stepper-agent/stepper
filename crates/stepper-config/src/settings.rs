@@ -48,6 +48,12 @@ pub struct SettingsFile {
     /// body swaps into the system prompt — consumed by the orchestrator).
     #[serde(default)]
     pub output_style: Option<String>,
+    /// Global reasoning effort (`off|low|medium|high`) applied to every layer
+    /// that doesn't set its own `reasoning-effort`/`thinking-budget` frontmatter.
+    /// Set via `/effort` or `--effort`. Maps to OpenAI `reasoning_effort` +
+    /// Anthropic extended-thinking budget.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Optional per-turn runaway guards. All `None` (the default) means no
     /// limit — a turn runs until the agent finishes. A matching CLI flag
     /// (`--turn-timeout` / `--max-budget-usd` / `--max-turns`) overrides these.
@@ -59,6 +65,10 @@ pub struct SettingsFile {
     /// the permission engine and a no-op on unsupported platforms.
     #[serde(default)]
     pub sandbox: Option<SandboxConfig>,
+    /// TUI color theme (set via the `/theme` editor). `preset` names a built-in
+    /// palette; `colors` are per-role `name → color` overrides applied on top.
+    #[serde(default)]
+    pub theme: Option<ThemeConfig>,
 }
 
 /// Opt-in OS-level sandbox for the `bash` tool. A best-effort defense-in-depth
@@ -69,6 +79,17 @@ pub struct SettingsFile {
 pub struct SandboxConfig {
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// TUI color theme: a built-in `preset` palette plus per-role color overrides.
+/// Color strings are `#RRGGBB`, a named color (e.g. `cyan`), or a 0–255 index.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemeConfig {
+    #[serde(default)]
+    pub preset: Option<String>,
+    #[serde(default)]
+    pub colors: BTreeMap<String, String>,
 }
 
 /// Per-turn safety limits. Each field is opt-in; omit it (or set `null`) for no
@@ -243,6 +264,23 @@ mod tests {
         let d = s.dispatch.unwrap();
         assert_eq!(d.concurrency, None);
         assert_eq!(d.step_cap, None);
+    }
+
+    #[test]
+    fn theme_config_parses_preset_and_color_overrides() {
+        let s: SettingsFile = serde_json::from_str(
+            r##"{"theme":{"preset":"dracula","colors":{"accent":"#ff0000","error":"red"}}}"##,
+        )
+        .unwrap();
+        let t = s.theme.unwrap();
+        assert_eq!(t.preset.as_deref(), Some("dracula"));
+        assert_eq!(t.colors.get("accent").map(String::as_str), Some("#ff0000"));
+        assert_eq!(t.colors.get("error").map(String::as_str), Some("red"));
+        // Absent by default; an empty block parses to no preset/overrides.
+        assert!(serde_json::from_str::<SettingsFile>("{}").unwrap().theme.is_none());
+        let empty: SettingsFile = serde_json::from_str(r#"{"theme":{}}"#).unwrap();
+        let t = empty.theme.unwrap();
+        assert!(t.preset.is_none() && t.colors.is_empty());
     }
 
     #[test]

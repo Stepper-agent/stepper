@@ -9,7 +9,9 @@ use stepper_protocol::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::state::{ApiKeyOverlay, AppState, FilePicker, ListPicker, Overlay, ProcStatus, ShellView};
+use crate::state::{
+    ApiKeyOverlay, AppState, FilePicker, ListPicker, Overlay, ProcStatus, ShellView, ThemeState,
+};
 use crate::theme::Theme;
 
 pub fn draw(terminal: &mut DefaultTerminal, state: &AppState, theme: &Theme) -> anyhow::Result<()> {
@@ -63,6 +65,7 @@ fn ui(frame: &mut Frame, state: &AppState, theme: &Theme) {
             Overlay::Picker(picker) => render_list_picker(frame, rows[0], picker, theme),
             Overlay::ApiKey(o) => render_api_key(frame, rows[0], o, theme),
             Overlay::Shell(s) => render_shell(frame, rows[0], state, s, theme),
+            Overlay::Theme(ts) => render_theme(frame, rows[0], ts, theme),
         }
     } else if state.palette_active() {
         render_palette(frame, rows[0], state, theme);
@@ -331,22 +334,76 @@ fn render_list_picker(frame: &mut Frame, area: Rect, picker: &ListPicker, theme:
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let mut lines = vec![Line::from(Span::styled(
-        "   ↑↓ select · Enter choose · Esc cancel",
-        Style::default().fg(theme.muted),
-    ))];
+    // Searchable pickers (models) show the live filter query; type to narrow.
+    let hint = if picker.searchable() {
+        format!("   filter: {}▏  ↑↓ select · Enter choose · Esc cancel", picker.query)
+    } else {
+        "   ↑↓ select · Enter choose · Esc cancel".to_string()
+    };
+    let mut lines = vec![Line::from(Span::styled(hint, Style::default().fg(theme.muted)))];
     let rows = (inner.height as usize).saturating_sub(1);
-    let offset = scroll_offset(picker.selected, picker.items.len(), rows);
-    for (i, item) in picker.items.iter().enumerate().skip(offset).take(rows) {
-        let style = if i == picker.selected {
+    let offset = scroll_offset(picker.selected, picker.matches.len(), rows);
+    for (row, &idx) in picker.matches.iter().enumerate().skip(offset).take(rows) {
+        let style = if row == picker.selected {
             Style::default().fg(theme.accent).add_modifier(Modifier::REVERSED)
         } else {
             Style::default().fg(theme.muted)
         };
         lines.push(Line::from(Span::styled(
-            format!("  {}", truncate(&item.label, inner.width.saturating_sub(2) as usize)),
+            format!("  {}", truncate(&picker.items[idx].label, inner.width.saturating_sub(2) as usize)),
             style,
         )));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// The `/theme` color editor: a preset selector row plus one editable row per
+/// color role, each showing a live swatch of its current (typed) value.
+fn render_theme(frame: &mut Frame, area: Rect, ts: &ThemeState, theme: &Theme) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" theme editor ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![Line::from(Span::styled(
+        "   ↑↓ select · ←→ preset · type hex/name · Enter save · Esc cancel",
+        Style::default().fg(theme.muted),
+    ))];
+
+    // Row 0: preset selector.
+    let preset_style = if ts.selected == 0 {
+        Style::default().fg(theme.accent).add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default().fg(theme.accent)
+    };
+    lines.push(Line::from(Span::styled(
+        format!("  preset:  ‹ {} ›", ts.preset_name()),
+        preset_style,
+    )));
+
+    // Color rows (scroll to keep the selected one visible).
+    let rows = (inner.height as usize).saturating_sub(2);
+    let offset = scroll_offset(ts.selected.saturating_sub(1), ts.colors.len(), rows);
+    for (i, (name, value)) in ts.colors.iter().enumerate().skip(offset).take(rows) {
+        let selected = ts.selected == i + 1;
+        let label_style = if selected {
+            Style::default().fg(theme.accent).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        // A live swatch of the typed value; invalid values show a red marker.
+        let swatch = match Theme::parse_color(value) {
+            Some(c) => Span::styled("██", Style::default().fg(c)),
+            None => Span::styled("✗ ", Style::default().fg(theme.error)),
+        };
+        let caret = if selected { "›" } else { " " };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {caret} {name:<14} "), label_style),
+            swatch,
+            Span::styled(format!("  {value}"), label_style),
+        ]));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
@@ -719,6 +776,11 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         format!("{}/{}", state.model.provider, state.model.model),
         Style::default().fg(theme.muted),
     ));
+    // Reasoning effort, shown only when set (low/medium/high) — off = absent.
+    if let Some(effort) = &state.effort {
+        right.push(sep(theme));
+        right.push(Span::styled(format!("effort {effort}"), Style::default().fg(theme.accent)));
+    }
     right.push(sep(theme));
     right.push(Span::styled(
         format!("{} tok", fmt_count(state.usage.tokens_total())),
@@ -930,6 +992,9 @@ mod tests {
                 crate::CommandInfo::named("rewind"),
                 crate::CommandInfo::named("resume"),
             ],
+            theme_preset: None,
+            theme_colors: Vec::new(),
+            effort: None,
         })
     }
 
@@ -1135,14 +1200,15 @@ mod tests {
     fn list_picker_overlay_renders_title_hint_and_rows() {
         use crate::state::{ListPicker, ListPickerItem, PickerKind};
         let mut s = base_state();
-        s.overlay = Some(Overlay::Picker(ListPicker {
-            kind: PickerKind::Rewind,
-            items: vec![
+        let mut picker = ListPicker::new(
+            PickerKind::Rewind,
+            vec![
                 ListPickerItem { id: "turn-2".into(), label: "turn 2".into() },
                 ListPickerItem { id: "turn-1".into(), label: "turn 1".into() },
             ],
-            selected: 1,
-        }));
+        );
+        picker.selected = 1;
+        s.overlay = Some(Overlay::Picker(picker));
         let out = render_to_string(&s, 100, 12);
         assert!(out.contains("rewind"), "picker title: {out}");
         assert!(out.contains("Enter choose"), "hint line: {out}");
@@ -1153,17 +1219,26 @@ mod tests {
     fn resume_picker_overlay_uses_its_own_title() {
         use crate::state::{ListPicker, ListPickerItem, PickerKind};
         let mut s = base_state();
-        s.overlay = Some(Overlay::Picker(ListPicker {
-            kind: PickerKind::Resume,
-            items: vec![ListPickerItem {
+        s.overlay = Some(Overlay::Picker(ListPicker::new(
+            PickerKind::Resume,
+            vec![ListPickerItem {
                 id: "abc".into(),
                 label: "earlier · 2 turn(s) · 3m ago — fix the bug".into(),
             }],
-            selected: 0,
-        }));
+        )));
         let out = render_to_string(&s, 100, 12);
         assert!(out.contains("resume"), "picker title: {out}");
         assert!(out.contains("fix the bug"), "session row: {out}");
+    }
+
+    #[test]
+    fn theme_editor_overlay_renders_preset_and_color_rows() {
+        let mut s = base_state();
+        s.open_theme_editor();
+        let out = render_to_string(&s, 100, 16);
+        assert!(out.contains("theme editor"), "editor title: {out}");
+        assert!(out.contains("preset"), "preset selector row: {out}");
+        assert!(out.contains("accent"), "a color role row is shown: {out}");
     }
 
     #[test]

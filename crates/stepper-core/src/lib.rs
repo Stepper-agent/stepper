@@ -336,6 +336,40 @@ pub fn spawn_core(
                     };
                     let _ = tx.send(AppEvent::Notice { level, text }).await;
                 }
+                Action::SetTheme { preset, colors } => {
+                    // The TUI already applied the theme live; persist it so the next
+                    // session loads it. Project `.stepper/` wins, else user `~/.stepper/`.
+                    let project = orchestrator.project_root.join(".stepper");
+                    let dir = if project.is_dir() {
+                        Some(project)
+                    } else {
+                        orchestrator.home.as_ref().map(|h| h.join(".stepper"))
+                    };
+                    if let Some(dir) = dir {
+                        let result = stepper_config::scaffold::update_settings(&dir, |obj| {
+                            let mut theme = serde_json::Map::new();
+                            if let Some(p) = &preset {
+                                theme.insert("preset".into(), serde_json::Value::String(p.clone()));
+                            }
+                            if !colors.is_empty() {
+                                let map: serde_json::Map<String, serde_json::Value> = colors
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                                    .collect();
+                                theme.insert("colors".into(), serde_json::Value::Object(map));
+                            }
+                            obj.insert("theme".into(), serde_json::Value::Object(theme));
+                        });
+                        if let Err(e) = result {
+                            let _ = tx
+                                .send(AppEvent::Notice {
+                                    level: NoticeLevel::Warn,
+                                    text: format!("theme not persisted: {e}"),
+                                })
+                                .await;
+                        }
+                    }
+                }
                 Action::RunShell(command) => {
                     let (inner, background) = proc::parse_background(&command);
                     if background {

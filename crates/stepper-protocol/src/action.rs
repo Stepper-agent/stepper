@@ -41,6 +41,14 @@ pub enum Action {
         provider: String,
         key: String,
     },
+    /// Persist the TUI color theme (chosen in the `/theme` editor). `preset` is a
+    /// built-in palette name; `colors` are per-role `(name, color-string)`
+    /// overrides. Core writes them to `setting.json`; the TUI applies live. Plain
+    /// strings only — the protocol stays UI-framework-agnostic.
+    SetTheme {
+        preset: Option<String>,
+        colors: Vec<(String, String)>,
+    },
     /// Kill a running background process (`!cmd &`) by its id, from the shell view.
     KillProcess(u64),
     /// Stage a pasted image (Ctrl+V) for the next prompt. `media_type` is a MIME

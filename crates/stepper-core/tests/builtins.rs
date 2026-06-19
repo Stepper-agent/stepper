@@ -208,6 +208,36 @@ async fn builtins_emit_events_without_running_a_turn() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn effort_command_sets_reasoning_effort_without_running_a_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator(dir.path().to_path_buf()),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+
+    action_tx.send(slash("effort", "high")).await.unwrap();
+    let mut saw_effort = false;
+    loop {
+        match events.recv().await.unwrap() {
+            AppEvent::EffortChanged(level) => {
+                assert_eq!(level.as_deref(), Some("high"));
+                saw_effort = true;
+            }
+            AppEvent::Notice { text, .. } => {
+                assert!(text.contains("high"), "confirming notice: {text}");
+                break;
+            }
+            AppEvent::TurnStarted { .. } => panic!("/effort must not run a turn"),
+            _ => {}
+        }
+    }
+    assert!(saw_effort, "/effort emits EffortChanged for the footer");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn interactive_bang_shell_runs_permissionless_without_approval() {
     // The orchestrator helper runs in AcceptEdits with no allow rules, so the
     // model's bash tool WOULD gate `echo` (Ask). A hand-typed `!echo` is

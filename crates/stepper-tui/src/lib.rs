@@ -29,6 +29,13 @@ pub struct TuiInit {
     pub cwd: PathBuf,
     /// Known slash commands (name + one-line description) for the `/` palette.
     pub commands: Vec<CommandInfo>,
+    /// Color-theme preset name (`None` → `dark`) loaded from settings.
+    pub theme_preset: Option<String>,
+    /// Per-role color overrides (`name`, `color-string`) loaded from settings.
+    pub theme_colors: Vec<(String, String)>,
+    /// Session reasoning-effort level loaded from settings (`None` = off), shown
+    /// in the status footer.
+    pub effort: Option<String>,
 }
 
 /// A slash command shown in the `/` palette: its name, a one-line description,

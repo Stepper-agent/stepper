@@ -368,6 +368,7 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         effective_model.as_deref(),
         global.fallback_model.as_deref(),
         cli_mode,
+        global.effort.clone(),
         cwd.clone(),
         limits,
     )
@@ -403,6 +404,9 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
             argument_hint: None,
         })
         .collect();
+    let mut theme_preset: Option<String> = None;
+    let mut theme_colors: Vec<(String, String)> = Vec::new();
+    let mut effort_setting: Option<String> = None;
     if let Ok(cfg) = stepper_config::Config::load(&cwd) {
         // `argument-hint` is keyed by command name; attach it to each user command.
         let hints: std::collections::BTreeMap<String, String> =
@@ -416,7 +420,15 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
                     description,
                 }),
         );
+        // Load the persisted color theme (preset + per-role overrides).
+        if let Some(theme) = &cfg.settings.theme {
+            theme_preset = theme.preset.clone();
+            theme_colors = theme.colors.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        }
+        effort_setting = cfg.settings.reasoning_effort.clone();
     }
+    // `--effort` wins over the setting; "off"/absent shows no footer indicator.
+    let effort = global.effort.clone().or(effort_setting).filter(|e| e != "off");
 
     // `_mcp` keeps the MCP server connections open for the whole TUI session.
     let init = TuiInit {
@@ -425,6 +437,9 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         mode: resolved_mode,
         cwd,
         commands,
+        theme_preset,
+        theme_colors,
+        effort,
     };
     run_tui(event_rx, action_tx, init, cancel).await
 }
@@ -445,6 +460,7 @@ async fn oneshot(
         global.model.as_deref(),
         global.fallback_model.as_deref(),
         cli_mode,
+        global.effort.clone(),
         cwd,
         limits,
     )

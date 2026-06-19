@@ -175,3 +175,13 @@ pub struct ModelChoiceView {
     /// Rendered row (display name + context/price hint).
     pub label: String,
 }
+
+/// One `/connect` candidate: a provider from the models.dev catalog the picker
+/// can add. Selecting a row registers the provider and prompts for its key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderChoiceView {
+    /// The provider id — what `/connect <id>` registers (e.g. `anthropic`).
+    pub id: String,
+    /// Rendered row (id + display name + expected key env var).
+    pub label: String,
+}

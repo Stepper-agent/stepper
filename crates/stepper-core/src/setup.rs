@@ -62,32 +62,61 @@ pub fn compose_system(base_context: &str, role_prompt: &str) -> String {
     out
 }
 
-/// The base/pinned context (`.stepper/stepper.md`, project over user). Empty when
-/// none exists.
+/// The base/pinned context, first-found wins. stepper's own config takes
+/// precedence (project `.stepper/stepper.md`, then user `~/.stepper/stepper.md`);
+/// a local `CLAUDE.md` is read as a fallback for users who haven't migrated —
+/// project root `./CLAUDE.md`, then global `~/.claude/CLAUDE.md` (opencode-style:
+/// project context beats global). Empty when none exists.
 pub fn load_base_context(config: &Config) -> String {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    for dir in [config.project_dir.as_ref(), config.user_dir.as_ref()]
-        .into_iter()
-        .flatten()
-    {
-        if let Ok(text) = std::fs::read_to_string(dir.join("stepper.md")) {
+    // (file, base dir for `@import` resolution), in precedence order.
+    let mut candidates: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    if let Some(dir) = config.project_dir.as_ref() {
+        candidates.push((dir.join("stepper.md"), dir.clone()));
+    }
+    if let Some(root) = config.project_root.as_ref() {
+        candidates.push((root.join("CLAUDE.md"), root.clone()));
+    }
+    if let Some(dir) = config.user_dir.as_ref() {
+        candidates.push((dir.join("stepper.md"), dir.clone()));
+    }
+    if let Some(claude) = home.as_ref().map(|h| h.join(".claude")) {
+        candidates.push((claude.join("CLAUDE.md"), claude));
+    }
+    for (file, base) in candidates {
+        if let Ok(text) = std::fs::read_to_string(&file) {
             // Resolve `@import` directives (Claude-Code-style) — relative to the
-            // `.stepper/` dir, `~/` to $HOME — so a migrated CLAUDE.md that pulls
-            // in shared rule files keeps working.
-            return stepper_config::imports::resolve_imports(&text, dir, home.as_deref());
+            // file's own dir, `~/` to $HOME — so a CLAUDE.md that pulls in shared
+            // rule files keeps working.
+            return stepper_config::imports::resolve_imports(&text, &base, home.as_deref());
         }
     }
     String::new()
 }
 
+/// Map a reasoning-effort level to the per-dialect controls: OpenAI-family
+/// `reasoning_effort` string AND an Anthropic extended-thinking token budget, so
+/// one `/effort` knob drives "how hard to think" regardless of provider.
+pub fn effort_controls(level: &str) -> (Option<String>, Option<u32>) {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "low" => (Some("low".into()), Some(2_048)),
+        "medium" | "med" => (Some("medium".into()), Some(8_192)),
+        "high" => (Some("high".into()), Some(16_384)),
+        // "off"/unknown → no reasoning override, no thinking budget.
+        _ => (None, None),
+    }
+}
+
 /// Build the `step` pipeline from config. With no `step`, a single implicit
-/// `default` layer runs the default model with every tool.
+/// `default` layer runs the default model with every tool. A global
+/// `settings.reasoningEffort` (or `--effort`) fills each step's reasoning
+/// controls where the layer's own frontmatter did not set them.
 pub fn build_steps(config: &Config, default_model: &str) -> Vec<StepDef> {
-    if config.settings.step.is_empty() {
+    let mut steps = if config.settings.step.is_empty() {
         let model_ref = config
             .orchestrator_model()
             .unwrap_or_else(|| default_model.to_string());
-        return vec![StepDef {
+        vec![StepDef {
             name: "default".into(),
             model_ref,
             system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
@@ -106,16 +135,30 @@ pub fn build_steps(config: &Config, default_model: &str) -> Vec<StepDef> {
             parallel: false,
             parallel_max: DEFAULT_PARALLEL_MAX,
             skills: Vec::new(),
-        }];
-    }
+        }]
+    } else {
+        config
+            .settings
+            .step
+            .clone()
+            .into_iter()
+            .map(|name| build_step(config, &name, default_model))
+            .collect()
+    };
 
-    config
-        .settings
-        .step
-        .clone()
-        .into_iter()
-        .map(|name| build_step(config, &name, default_model))
-        .collect()
+    // Global effort fills unset reasoning controls (per-layer frontmatter wins).
+    if let Some(level) = config.settings.reasoning_effort.as_deref() {
+        let (re, tb) = effort_controls(level);
+        for step in &mut steps {
+            if step.reasoning_effort.is_none() {
+                step.reasoning_effort = re.clone();
+            }
+            if step.thinking_budget.is_none() {
+                step.thinking_budget = tb;
+            }
+        }
+    }
+    steps
 }
 
 fn build_step(config: &Config, name: &str, default_model: &str) -> StepDef {
@@ -252,6 +295,62 @@ fn load_layer_index(config: &Config, name: &str) -> Option<stepper_config::Layer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_context_reads_project_root_claude_md_as_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let stepper_dir = root.join(".stepper");
+        std::fs::create_dir_all(&stepper_dir).unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "PROJECT CLAUDE RULES").unwrap();
+
+        let mut cfg = Config::from_settings(Default::default());
+        cfg.project_dir = Some(stepper_dir);
+        cfg.project_root = Some(root);
+        // No stepper.md anywhere → falls back to the project-root CLAUDE.md.
+        let ctx = load_base_context(&cfg);
+        assert!(ctx.contains("PROJECT CLAUDE RULES"), "reads ./CLAUDE.md fallback: {ctx}");
+    }
+
+    #[test]
+    fn effort_controls_maps_levels_to_reasoning_and_thinking() {
+        assert_eq!(effort_controls("off"), (None, None));
+        assert_eq!(effort_controls("low"), (Some("low".into()), Some(2_048)));
+        assert_eq!(effort_controls("high"), (Some("high".into()), Some(16_384)));
+        assert_eq!(effort_controls("bogus"), (None, None), "unknown → off");
+    }
+
+    #[test]
+    fn build_steps_applies_global_effort_to_unset_layers() {
+        let settings = stepper_config::SettingsFile {
+            reasoning_effort: Some("medium".into()),
+            ..Default::default()
+        };
+        let cfg = Config::from_settings(settings);
+        let steps = build_steps(&cfg, "p/m");
+        assert_eq!(steps[0].reasoning_effort.as_deref(), Some("medium"), "global effort fills the step");
+        assert_eq!(steps[0].thinking_budget, Some(8_192));
+        // No global effort → unset (provider default).
+        let bare = build_steps(&Config::from_settings(Default::default()), "p/m");
+        assert!(bare[0].reasoning_effort.is_none() && bare[0].thinking_budget.is_none());
+    }
+
+    #[test]
+    fn base_context_prefers_stepper_md_over_claude_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let stepper_dir = root.join(".stepper");
+        std::fs::create_dir_all(&stepper_dir).unwrap();
+        std::fs::write(stepper_dir.join("stepper.md"), "STEPPER WINS").unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "CLAUDE FALLBACK").unwrap();
+
+        let mut cfg = Config::from_settings(Default::default());
+        cfg.project_dir = Some(stepper_dir);
+        cfg.project_root = Some(root);
+        let ctx = load_base_context(&cfg);
+        assert!(ctx.contains("STEPPER WINS"), "stepper.md wins over CLAUDE.md: {ctx}");
+        assert!(!ctx.contains("CLAUDE FALLBACK"), "CLAUDE.md unused when stepper.md exists");
+    }
 
     #[test]
     fn compose_system_prepends_directives_and_orders_parts() {

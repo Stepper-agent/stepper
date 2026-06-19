@@ -23,6 +23,11 @@ pub struct GlobalArgs {
     /// Start in this mode (auto | plan | accept-edits | default | dont-ask).
     #[arg(long, value_enum, global = true)]
     pub mode: Option<ModeArg>,
+    /// Reasoning effort applied to every layer (off | low | medium | high).
+    /// Maps to OpenAI `reasoning_effort` + Anthropic extended-thinking budget;
+    /// a layer's own `reasoning-effort` frontmatter overrides it.
+    #[arg(long, global = true)]
+    pub effort: Option<String>,
     /// One-shot non-interactive prompt (no inline viewport).
     #[arg(short = 'p', long, global = true)]
     pub print: Option<String>,

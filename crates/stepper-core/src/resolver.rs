@@ -1,17 +1,22 @@
 use crate::error::CoreError;
 use crate::model::{ModelInfo, ModelRegistry};
-use crate::ports::ProviderResolver;
+use crate::ports::{ConnectedProvider, ProviderResolver};
+use std::sync::RwLock;
 use stepper_config::Config;
-use stepper_protocol::ModelChoiceView;
+use stepper_protocol::{ModelChoiceView, ProviderChoiceView};
 use stepper_provider::LlmProvider;
 use stepper_providers::models::ModelEntry;
-use stepper_providers::{CodexTokenStore, ProviderFactory, ProviderKind, ProviderSpec};
+use stepper_providers::{CodexTokenStore, ProviderFactory, ProviderKind, ProviderMeta, ProviderSpec};
 
 /// `ProviderResolver` driven by `setting.json` `providers`. Maps the config
 /// `kind` (+ `auth`) onto a concrete adapter and applies the key precedence
 /// already resolved by config.
 pub struct ConfigProviderResolver {
-    config: Config,
+    /// Behind a lock so `/connect` can register a provider mid-session (the
+    /// live-injection path): `resolve`/`model_info` take a read guard, and the
+    /// async `list_models` snapshots what it needs and drops the guard before any
+    /// `.await` (an `std` guard must never cross an await point).
+    config: RwLock<Config>,
     factory: ProviderFactory,
     registry: ModelRegistry,
     codex_store: Option<CodexTokenStore>,
@@ -30,7 +35,7 @@ impl ConfigProviderResolver {
         catalog: Option<stepper_providers::Catalog>,
     ) -> Self {
         ConfigProviderResolver {
-            config,
+            config: RwLock::new(config),
             factory,
             registry,
             codex_store,
@@ -42,7 +47,9 @@ impl ConfigProviderResolver {
 #[async_trait::async_trait]
 impl ProviderResolver for ConfigProviderResolver {
     fn resolve(&self, model_ref: &str) -> Result<Box<dyn LlmProvider>, CoreError> {
-        let rp = self.config.resolve_provider(model_ref)?;
+        // Resolve under the read guard, then drop it (`rp` is owned) before the
+        // factory build.
+        let rp = self.config.read().unwrap().resolve_provider(model_ref)?;
         let kind = parse_kind(&rp.name, &rp.kind, rp.auth.as_deref())?;
 
         let mut spec = ProviderSpec::new(kind, rp.name.clone(), rp.model.clone());
@@ -66,7 +73,9 @@ impl ProviderResolver for ConfigProviderResolver {
     }
 
     fn model_info(&self, model_ref: &str) -> ModelInfo {
-        match self.config.resolve_provider(model_ref) {
+        // Bind first so the read guard drops before the registry/catalog work.
+        let resolved = self.config.read().unwrap().resolve_provider(model_ref);
+        match resolved {
             Ok(rp) => {
                 let mut info = self.registry.lookup(&rp.name, &rp.model);
                 // Catalog figures override the builtin estimate; an explicit
@@ -79,6 +88,11 @@ impl ProviderResolver for ConfigProviderResolver {
                 if let Some(ctx) = rp.context_window {
                     info.context_window = ctx;
                     info.estimated = false;
+                    // Re-assert the invariant after the override: an output cap can
+                    // never reach the (now-narrowed) context window.
+                    if info.context_window > 0 && info.max_output_tokens >= info.context_window {
+                        info.max_output_tokens = 0;
+                    }
                 }
                 info
             }
@@ -111,30 +125,37 @@ impl ProviderResolver for ConfigProviderResolver {
         };
         let catalog = self.catalog.as_ref().or(fetched.as_ref());
 
-        let mut names: Vec<&String> = self.config.settings.providers.keys().collect();
-        names.sort();
+        // Snapshot each provider's listing spec under the read guard, then drop
+        // it before the network calls below (an std guard can't cross `.await`).
+        let specs: Vec<(String, ProviderKind, String, Option<String>)> = {
+            let config = self.config.read().unwrap();
+            let mut names: Vec<&String> = config.settings.providers.keys().collect();
+            names.sort();
+            names
+                .into_iter()
+                .filter_map(|name| {
+                    let rp = config.resolve_provider(&format!("{name}/_")).ok()?;
+                    let kind = parse_kind(&rp.name, &rp.kind, rp.auth.as_deref()).ok()?;
+                    if kind == ProviderKind::Codex {
+                        return None;
+                    }
+                    let base = rp
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| default_base_url(kind).to_string());
+                    Some((rp.name, kind, base, rp.api_key))
+                })
+                .collect()
+        };
 
         let mut out = Vec::new();
-        for name in names {
-            let Ok(rp) = self.config.resolve_provider(&format!("{name}/_")) else {
-                continue;
-            };
-            let Ok(kind) = parse_kind(&rp.name, &rp.kind, rp.auth.as_deref()) else {
-                continue;
-            };
-            if kind == ProviderKind::Codex {
-                continue;
-            }
-            let base = rp
-                .base_url
-                .clone()
-                .unwrap_or_else(|| default_base_url(kind).to_string());
+        for (name, kind, base, api_key) in specs {
             let entries = stepper_providers::models::list_models(
                 &client,
-                &rp.name,
+                &name,
                 kind,
                 &base,
-                rp.api_key.as_deref(),
+                api_key.as_deref(),
                 catalog,
             )
             .await;
@@ -145,6 +166,125 @@ impl ProviderResolver for ConfigProviderResolver {
         }
         out
     }
+
+    /// The `/connect` seed: every provider in the models.dev catalog (reuse the
+    /// one seeded at construction, else fetch once). Best-effort — empty when the
+    /// catalog is unavailable.
+    async fn list_providers(&self) -> Vec<ProviderChoiceView> {
+        let client = self.factory.http_client();
+        let fetched = if self.catalog.is_none() {
+            stepper_providers::models::fetch_catalog(&client).await.ok()
+        } else {
+            None
+        };
+        let Some(catalog) = self.catalog.as_ref().or(fetched.as_ref()) else {
+            return Vec::new();
+        };
+        catalog
+            .provider_seeds()
+            .into_iter()
+            .map(|m| ProviderChoiceView {
+                id: m.id.clone(),
+                label: provider_label(m),
+            })
+            .collect()
+    }
+
+    /// Register catalog provider `id` into the live config so this session can use
+    /// it immediately. Derives the wire `kind` from the catalog's `npm` package
+    /// and the base URL from its `api` field; the key is supplied separately (the
+    /// caller prompts for it). Returns the derived fields for persistence.
+    async fn connect_provider(&self, id: &str) -> Result<ConnectedProvider, CoreError> {
+        let client = self.factory.http_client();
+        let fetched = if self.catalog.is_none() {
+            stepper_providers::models::fetch_catalog(&client).await.ok()
+        } else {
+            None
+        };
+        let catalog = self
+            .catalog
+            .as_ref()
+            .or(fetched.as_ref())
+            .ok_or_else(|| CoreError::Config("models.dev catalog unavailable".into()))?;
+        let meta = catalog
+            .provider_meta(id)
+            .ok_or_else(|| CoreError::Config(format!("unknown provider '{id}'")))?;
+        let kind = provider_kind(meta).to_string();
+        // Derive the base URL. The catalog omits `api` for ~24 providers; for the
+        // ones whose ai-sdk package bakes in the host (openai, groq, xai, mistral,
+        // google …) we use a known-host table. The ONLY provider that needs no base
+        // is the canonical `anthropic` (the factory default api.anthropic.com +
+        // x-api-key is correct). Everything else with no resolvable base — incl.
+        // anthropic-flavored CLOUD providers like google-vertex-anthropic (GCP auth,
+        // NOT api.anthropic.com) — must be refused: silently defaulting would send
+        // the user's key to the wrong host. (api-present anthropic proxies such as
+        // freemodel/kimi/minimax take the first arm and keep their own base.)
+        let base_url = match meta.api.clone() {
+            Some(api) => Some(api),
+            None if id == "anthropic" => None,
+            None => match known_openai_compat_base(id) {
+                Some(base) => Some(base.to_string()),
+                None => {
+                    return Err(CoreError::Config(format!(
+                        "provider '{id}' has no API base URL in the models.dev catalog — \
+                         add it manually (providers.{id}.baseUrl in setting.json)"
+                    )))
+                }
+            },
+        };
+        // Merge into the live config: never clobber an existing provider's key /
+        // model / auth / context overrides — only (re)set the wire kind and fill
+        // the base URL when absent. No `.await` under the write guard.
+        {
+            let mut config = self.config.write().unwrap();
+            let entry = config.settings.providers.entry(id.to_string()).or_default();
+            entry.kind = kind.clone();
+            if entry.base_url.is_none() {
+                entry.base_url = base_url.clone();
+            }
+        }
+        Ok(ConnectedProvider { kind, base_url })
+    }
+}
+
+/// Base URLs for well-known OpenAI-compatible providers whose models.dev entry
+/// omits `api` (their ai-sdk package hard-codes the host). Only hosts we are
+/// confident about — anything else is refused rather than guessed, so a key is
+/// never sent to the wrong endpoint.
+fn known_openai_compat_base(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "openai" => "https://api.openai.com/v1",
+        "groq" => "https://api.groq.com/openai/v1",
+        "xai" => "https://api.x.ai/v1",
+        "mistral" => "https://api.mistral.ai/v1",
+        "cerebras" => "https://api.cerebras.ai/v1",
+        "togetherai" => "https://api.together.xyz/v1",
+        "deepinfra" => "https://api.deepinfra.com/v1/openai",
+        "google" => "https://generativelanguage.googleapis.com/v1beta/openai",
+        _ => return None,
+    })
+}
+
+/// Map a catalog provider onto one of our wire kinds. Only Anthropic has a
+/// distinct dialect we implement natively; everything else speaks the
+/// OpenAI-compatible API (the catalog's `api` base feeds `{base}/models` etc.).
+fn provider_kind(meta: &ProviderMeta) -> &'static str {
+    let npm = meta.npm.as_deref().unwrap_or("");
+    if meta.id == "anthropic" || npm.contains("anthropic") {
+        "anthropic"
+    } else {
+        "openai-compat"
+    }
+}
+
+/// `id  ·  Display Name  ·  KEY_ENV_VAR` — the `/connect` picker row (searchable
+/// by id or name; the env hint tells the user which key to paste).
+fn provider_label(meta: &ProviderMeta) -> String {
+    let mut s = format!("{}  ·  {}", meta.id, meta.name);
+    if let Some(env) = meta.env.first() {
+        s.push_str(&format!("  ·  {env}"));
+    }
+    s
 }
 
 /// The base URL the factory would default to for a provider that didn't set one
@@ -356,5 +496,165 @@ mod tests {
             Ok(_) => panic!("expected an unknown-kind error, got a provider"),
         };
         assert!(err.to_string().contains("unknown kind"), "got: {err}");
+    }
+
+    #[test]
+    fn provider_kind_maps_anthropic_else_openai_compat() {
+        let anthropic = ProviderMeta {
+            id: "anthropic".into(),
+            npm: Some("@ai-sdk/anthropic".into()),
+            ..Default::default()
+        };
+        assert_eq!(provider_kind(&anthropic), "anthropic", "by id");
+        let by_npm = ProviderMeta {
+            id: "claude-proxy".into(),
+            npm: Some("@foo/anthropic-sdk".into()),
+            ..Default::default()
+        };
+        assert_eq!(provider_kind(&by_npm), "anthropic", "by npm package");
+        let openai = ProviderMeta {
+            id: "openai".into(),
+            npm: Some("@ai-sdk/openai".into()),
+            ..Default::default()
+        };
+        assert_eq!(provider_kind(&openai), "openai-compat", "everything else is compat");
+        let bare = ProviderMeta { id: "x".into(), ..Default::default() };
+        assert_eq!(provider_kind(&bare), "openai-compat", "no npm => compat");
+    }
+
+    /// A catalog with provider-level `/connect` metadata for `acme` (+ anthropic).
+    fn connect_catalog() -> stepper_providers::Catalog {
+        stepper_providers::models::parse_catalog(&serde_json::json!({
+            "acme": {
+                "name": "Acme AI", "npm": "@ai-sdk/openai-compatible",
+                "api": "https://api.acme.ai/v1", "env": ["ACME_API_KEY"],
+                "models": { "acme-1": { "name": "Acme One", "limit": { "context": 200_000 } } }
+            },
+            "anthropic": {
+                "id": "anthropic", "name": "Anthropic", "npm": "@ai-sdk/anthropic",
+                "api": "https://api.anthropic.com", "env": ["ANTHROPIC_API_KEY"],
+                "models": { "claude-x": { "name": "Claude X" } }
+            }
+        }))
+    }
+
+    fn resolver_for_connect(catalog: Option<stepper_providers::Catalog>) -> ConfigProviderResolver {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        ConfigProviderResolver::new(
+            config,
+            ProviderFactory::new().unwrap(),
+            ModelRegistry::builtin(),
+            None,
+            catalog,
+        )
+    }
+
+    #[tokio::test]
+    async fn connect_provider_injects_into_live_config_and_resolves() {
+        let resolver = resolver_for_connect(Some(connect_catalog()));
+        // Not registered before connecting.
+        assert!(
+            resolver.config.read().unwrap().resolve_provider("acme/acme-1").is_err(),
+            "acme is absent until connected"
+        );
+        let connected = resolver.connect_provider("acme").await.unwrap();
+        assert_eq!(connected.kind, "openai-compat");
+        assert_eq!(connected.base_url.as_deref(), Some("https://api.acme.ai/v1"));
+        // Live: the freshly connected provider resolves this session, with the
+        // catalog-derived kind + base URL (key comes later, from the keyring).
+        let rp = resolver.config.read().unwrap().resolve_provider("acme/acme-1").unwrap();
+        assert_eq!(rp.kind, "openai-compat");
+        assert_eq!(rp.base_url.as_deref(), Some("https://api.acme.ai/v1"));
+        assert!(rp.api_key.is_none(), "no key injected — that rides the keyring");
+        // An unknown catalog provider is an error, not a silent no-op.
+        assert!(resolver.connect_provider("nope").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_providers_returns_catalog_seed_sorted_with_key_hint() {
+        let resolver = resolver_for_connect(Some(connect_catalog()));
+        let providers = resolver.list_providers().await;
+        let ids: Vec<&str> = providers.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["acme", "anthropic"], "seed is sorted by id");
+        assert!(
+            providers[0].label.contains("ACME_API_KEY"),
+            "label hints the expected key env var: {}",
+            providers[0].label
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_provider_uses_known_base_for_apiless_compat_and_refuses_unknown() {
+        // The real models.dev catalog omits `api` for ai-sdk-native providers like
+        // groq; an unknown api-less provider must NOT silently route to OpenAI.
+        let catalog = stepper_providers::models::parse_catalog(&serde_json::json!({
+            "groq": { "name": "Groq", "npm": "@ai-sdk/groq", "env": ["GROQ_API_KEY"],
+                      "models": { "llama-x": {} } },
+            "obscure": { "name": "Obscure", "npm": "@ai-sdk/openai-compatible",
+                         "env": ["OBSCURE_KEY"], "models": { "m": {} } },
+            "anthropic": { "name": "Anthropic", "npm": "@ai-sdk/anthropic",
+                           "env": ["ANTHROPIC_API_KEY"], "models": { "claude": {} } },
+            "google-vertex-anthropic": { "name": "Vertex Anthropic",
+                "npm": "@ai-sdk/google-vertex/anthropic",
+                "env": ["GOOGLE_APPLICATION_CREDENTIALS"], "models": { "claude-v": {} } }
+        }));
+        let resolver = resolver_for_connect(Some(catalog));
+        // A known provider gets its real host — never api.openai.com.
+        let groq = resolver.connect_provider("groq").await.unwrap();
+        assert_eq!(groq.kind, "openai-compat");
+        assert_eq!(groq.base_url.as_deref(), Some("https://api.groq.com/openai/v1"));
+        // The canonical anthropic provider needs no base (factory default is right).
+        let an = resolver.connect_provider("anthropic").await.unwrap();
+        assert_eq!(an.kind, "anthropic");
+        assert_eq!(an.base_url, None);
+        // An unknown api-less openai-compat provider is refused, not misrouted.
+        let err = resolver.connect_provider("obscure").await.unwrap_err();
+        assert!(err.to_string().contains("no API base URL"), "got: {err}");
+        assert!(
+            resolver.config.read().unwrap().resolve_provider("obscure/m").is_err(),
+            "the refused provider was not injected"
+        );
+        // An anthropic-FLAVORED cloud provider (Vertex, GCP creds — not the
+        // canonical api.anthropic.com x-api-key host) must also be refused rather
+        // than defaulted to api.anthropic.com.
+        let err2 = resolver.connect_provider("google-vertex-anthropic").await.unwrap_err();
+        assert!(err2.to_string().contains("no API base URL"), "got: {err2}");
+    }
+
+    #[tokio::test]
+    async fn connect_provider_merges_without_clobbering_existing_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::load(dir.path()).unwrap();
+        config.settings.providers.insert(
+            "acme".into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://my-proxy.internal/v1".into()),
+                api_key: Some("{env:ACME_KEY}".into()),
+                auth: None,
+                default_model: Some("acme-1".into()),
+                context_window: Some(123_000),
+            },
+        );
+        let resolver = ConfigProviderResolver::new(
+            config,
+            ProviderFactory::new().unwrap(),
+            ModelRegistry::builtin(),
+            None,
+            Some(connect_catalog()),
+        );
+        resolver.connect_provider("acme").await.unwrap();
+        let cfg = resolver.config.read().unwrap();
+        let p = cfg.settings.providers.get("acme").unwrap();
+        // The user's key / model / context / explicit base survive the reconnect.
+        assert_eq!(p.api_key.as_deref(), Some("{env:ACME_KEY}"));
+        assert_eq!(p.default_model.as_deref(), Some("acme-1"));
+        assert_eq!(p.context_window, Some(123_000));
+        assert_eq!(
+            p.base_url.as_deref(),
+            Some("https://my-proxy.internal/v1"),
+            "an existing base override is preserved, not overwritten by the catalog"
+        );
     }
 }
