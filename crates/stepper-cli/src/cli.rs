@@ -62,9 +62,11 @@ pub struct GlobalArgs {
     /// instead of denying it.
     #[arg(long, global = true)]
     pub dangerously_auto_approve: bool,
-    /// Skip the first-run guided setup that offers to scaffold `.stepper/` when
-    /// no project config is found (also via the `STEPPER_NO_INIT` env var).
-    #[arg(long, global = true, env = "STEPPER_NO_INIT")]
+    /// Skip the first-run guided setup that offers to scaffold `.stepper/` when no
+    /// project config is found (also via the `STEPPER_NO_INIT` env var — resolved
+    /// with presence semantics in `launch`, NOT bound to clap's bool `env` which
+    /// would reject any value other than "true"/"false" and abort every command).
+    #[arg(long, global = true)]
     pub no_init: bool,
 }
 

@@ -38,4 +38,10 @@ pub trait ProviderResolver: Send + Sync {
             "this session has no provider catalog to connect from".into(),
         ))
     }
+    /// Whether `provider` resolves an explicit/env API key that takes precedence
+    /// over the OS keyring (so a key just stored in the keyring would be shadowed).
+    /// Advisory only — used to warn after `/login`. Defaults to false.
+    fn provider_has_explicit_key(&self, _provider: &str) -> bool {
+        false
+    }
 }

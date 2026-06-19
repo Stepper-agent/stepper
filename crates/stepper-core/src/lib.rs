@@ -66,7 +66,18 @@ pub fn spawn_core(
     let (tx, rx) = mpsc::channel::<AppEvent>(128);
     let store = SessionStore::new(&orchestrator.project_root);
     let snapshotter = Snapshotter::new(orchestrator.project_root.clone());
+    // A fresh session must not inherit a prior (crashed/abandoned) session's
+    // checkpoints: the project-global store would otherwise let `/rewind` restore
+    // an unrelated tree and delete the current work. Continued/resumed sessions
+    // (-c/--resume) have turns and keep their own checkpoints.
+    if session.turns.is_empty() {
+        let _ = snapshotter.clear();
+    }
     let mut orchestrator = orchestrator;
+    // The base context WITHOUT any resume digest — restored on /clear and /compact
+    // so an old-format (digest-only) resume's prior content doesn't leak into the
+    // system prompt of the supposedly-fresh session for the rest of the process.
+    let base_context_original = orchestrator.base_context.clone();
     if session.has_messages() {
         orchestrator.resume_seed = session.seed_messages();
     } else {
@@ -238,15 +249,20 @@ pub fn spawn_core(
                         // reachable by their old count, so leaving them on disk lets
                         // /rewind restore a stale tree while the session/turn_id have
                         // moved on (a desync). Drop the store in both.
-                        if (name == "clear" || name == "compact")
-                            && let Err(e) = snapshotter.clear()
-                        {
-                            let _ = tx
-                                .send(AppEvent::Notice {
-                                    level: NoticeLevel::Warn,
-                                    text: format!("checkpoint clear failed: {e}"),
-                                })
-                                .await;
+                        if name == "clear" || name == "compact" {
+                            // Drop the now-unreachable checkpoints AND undo any
+                            // old-format resume digest folded into base_context, so a
+                            // /clear is a true clean break (new-format history lives
+                            // in resume_seed, which builtins already cleared).
+                            orchestrator.base_context = base_context_original.clone();
+                            if let Err(e) = snapshotter.clear() {
+                                let _ = tx
+                                    .send(AppEvent::Notice {
+                                        level: NoticeLevel::Warn,
+                                        text: format!("checkpoint clear failed: {e}"),
+                                    })
+                                    .await;
+                            }
                         }
                         continue;
                     }
@@ -323,10 +339,19 @@ pub fn spawn_core(
                     // up via the explicit>env>keyring precedence (no restart).
                     let (level, text) = match stepper_providers::store_key_in_keyring(&provider, &key)
                     {
-                        Ok(()) => (
-                            NoticeLevel::Info,
-                            format!("saved API key for '{provider}' — pick the model again"),
-                        ),
+                        Ok(()) => {
+                            let mut text =
+                                format!("saved API key for '{provider}' — pick the model again");
+                            // The keyring is the lowest-precedence source; warn if the
+                            // config already pins an explicit key that will shadow it.
+                            if orchestrator.resolver.provider_has_explicit_key(&provider) {
+                                text.push_str(
+                                    " (note: this provider has an explicit apiKey in setting.json \
+                                     or a set env var that takes precedence — remove it to use this key)",
+                                );
+                            }
+                            (NoticeLevel::Info, text)
+                        }
                         Err(e) => (
                             NoticeLevel::Warn,
                             format!(

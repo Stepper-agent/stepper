@@ -484,6 +484,7 @@ impl AgentLoop<'_> {
                 "PreToolUse",
                 Some(name),
                 &serde_json::json!({ "tool": name, "args": input }),
+                &self.cx.cancel,
             )
             .await
         {
@@ -524,6 +525,7 @@ impl AgentLoop<'_> {
                 "PostToolUse",
                 Some(name),
                 &serde_json::json!({ "tool": name, "ok": !is_error }),
+                &self.cx.cancel,
             )
             .await;
 

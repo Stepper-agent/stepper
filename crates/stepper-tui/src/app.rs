@@ -1,5 +1,5 @@
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Paragraph, Widget, Wrap};
 use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthStr;
 use std::sync::Arc;
@@ -137,6 +137,19 @@ fn handle_terminal_event(
         && k.kind != KeyEventKind::Press
     {
         return Ok(false);
+    }
+
+    // Ctrl+C is the universal "get me out" key. A picker or a captured overlay
+    // would otherwise swallow it (no quit, or it types into a filter), trapping
+    // the user; route it to Quit uniformly. The ApiKey overlay keeps its own
+    // Ctrl+C = cancel (don't end the whole session over a mistyped key prompt).
+    if let Event::Key(k) = &ev
+        && k.code == KeyCode::Char('c')
+        && k.modifiers.contains(KeyModifiers::CONTROL)
+        && !matches!(state.overlay, Some(crate::state::Overlay::ApiKey(_)))
+    {
+        let effects = state.apply_action(stepper_protocol::Action::Quit);
+        return run_effects(terminal, action_tx, effects);
     }
 
     // The @-file picker, while open, captures all keys.
@@ -510,9 +523,14 @@ fn run_effects(
             }
             Effect::CommitToScrollback(md) => {
                 let text = crate::markdown::render_markdown(&md);
-                let height = (text.lines.len() as u16).max(1);
+                // Wrap to the terminal width and reserve the WRAPPED row count:
+                // insert_before's buffer spans the full width, so without a wrap a
+                // line wider than the terminal is truncated (text lost) and the
+                // reserved height (logical lines) is too small.
+                let width = terminal.size().map(|s| s.width).unwrap_or(80);
+                let height = crate::render::wrapped_row_count(&text.lines, width).max(1) as u16;
                 terminal.insert_before(height, |buf| {
-                    Paragraph::new(text).render(buf.area, buf);
+                    Paragraph::new(text).wrap(Wrap { trim: false }).render(buf.area, buf);
                 })?;
                 committed = true;
             }

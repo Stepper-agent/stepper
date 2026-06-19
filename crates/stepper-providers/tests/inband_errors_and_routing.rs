@@ -172,13 +172,16 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_e
     match err {
         ProviderError::Api {
             status,
-            code,
-            message,
+            ref code,
+            ref message,
             ..
         } => {
             assert_eq!(status, 0);
-            assert_eq!(code, None, "responses in-band frames carry no code");
+            // The error's own code is captured (not the event type) so a transient
+            // in-band failure is retryable despite the status-less frame.
+            assert_eq!(code.as_deref(), Some("server_error"), "captures error.code");
             assert_eq!(message, "the model crashed");
+            assert!(err.is_retryable(), "server_error is treated as transient/retryable");
         }
         other => panic!("expected in-band Api error, got {other:?}"),
     }

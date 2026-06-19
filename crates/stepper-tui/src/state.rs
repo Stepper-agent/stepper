@@ -872,6 +872,12 @@ impl AppState {
             AppEvent::DiffProposed { .. } => {}
             AppEvent::ApprovalRequested(req) => {
                 if self.overlay.is_none() {
+                    // The @-file picker lives in `self.picker` (not `self.overlay`)
+                    // and both draws over and captures keys away from an overlay —
+                    // so an approval arriving while it is open would be invisible
+                    // AND unanswerable (y/a/n types into the picker filter), hanging
+                    // the turn. Drop the transient picker so the approval surfaces.
+                    self.picker = None;
                     self.overlay = Some(Overlay::Approval(req));
                 } else {
                     self.pending_approvals.push_back(req);

@@ -700,7 +700,10 @@ fn persist_provider(
                 .entry(id.to_string())
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
             if let Some(obj) = entry.as_object_mut() {
-                obj.insert("kind".into(), serde_json::Value::String(connected.kind.clone()));
+                // Fill kind/baseUrl only when absent — preserve a user's existing
+                // dialect (openai-responses/codex) and base, like the live path.
+                obj.entry("kind".to_string())
+                    .or_insert_with(|| serde_json::Value::String(connected.kind.clone()));
                 if let Some(base) = &connected.base_url {
                     obj.entry("baseUrl".to_string())
                         .or_insert_with(|| serde_json::Value::String(base.clone()));

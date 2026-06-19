@@ -70,12 +70,17 @@ pub struct ProviderFactory {
 
 impl ProviderFactory {
     pub fn new() -> Result<Self, ProviderError> {
-        // The streaming client deliberately carries no overall `.timeout()` —
-        // it would kill long-lived SSE streams; mid-stream stalls are covered
-        // by the SSE idle timeout in `sse::drive`.
+        // The streaming client deliberately carries no overall `.timeout()` — it
+        // would kill long-lived SSE streams. But a `read_timeout` bounds the gap
+        // BETWEEN reads (it resets on every chunk), so it never kills an active
+        // stream yet caps a provider that accepts the socket and then stalls —
+        // before sending response headers, on a non-2xx body, or mid-stream. That
+        // stall was otherwise unbounded (the SSE idle timeout in `sse::drive` only
+        // runs once frames are flowing) and hung the whole turn with no way out.
         let client = reqwest::Client::builder()
             .user_agent(concat!("stepper/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(120))
             .tcp_keepalive(Duration::from_secs(60))
             .pool_idle_timeout(Duration::from_secs(90))
             .build()

@@ -50,6 +50,14 @@ pub trait Tool: Send + Sync {
     fn read_only(&self) -> bool {
         self.spec().read_only
     }
+
+    /// The originating MCP server name for an MCP-bridged tool, else `None` for a
+    /// built-in. Used to scope a layer's `mcp.allow` by ORIGIN rather than by
+    /// parsing the `mcp__<server>__<tool>` name (which is ambiguous once a server
+    /// or tool name itself contains `__`).
+    fn mcp_server(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[cfg(test)]

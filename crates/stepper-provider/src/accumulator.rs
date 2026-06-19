@@ -143,8 +143,18 @@ impl StreamAccumulator {
                 out.push(ChatEvent::Usage(self.usage));
             }
             WireDelta::Stop(reason) => {
+                // A MaxTokens stop can cut a tool call mid-arguments. Completing it
+                // would surface a non-object (string) input, which the NEXT request
+                // re-sends and the provider rejects (a hard 400 on the Anthropic
+                // wire: tool_use.input must be an object). Drop a truncated tool so
+                // it never reaches `content`/`tool_uses` — the agent then takes the
+                // MaxTokens continuation branch instead of sending garbage.
+                let truncated = matches!(reason, StopReason::MaxTokens);
                 let indices: Vec<usize> = (0..self.tools.len()).collect();
                 for i in indices {
+                    if truncated && !args_complete(&self.tools[i]) {
+                        continue;
+                    }
                     self.complete(i, &mut out);
                 }
                 self.stop = Some(reason.clone());
@@ -160,6 +170,20 @@ impl StreamAccumulator {
 
     pub fn stop_reason(&self) -> Option<&StopReason> {
         self.stop.as_ref()
+    }
+}
+
+/// Whether a tool builder's arguments are a complete, usable call: already
+/// finalized by an explicit end frame, or the buffered args parse as a JSON
+/// object (an empty buffer counts as `{}`). A MaxTokens stop uses this to discard
+/// a call cut off mid-arguments rather than emit a non-object input.
+fn args_complete(b: &ToolBuilder) -> bool {
+    b.completed || {
+        let t = b.args.trim();
+        t.is_empty()
+            || serde_json::from_str::<serde_json::Value>(t)
+                .map(|v| v.is_object())
+                .unwrap_or(false)
     }
 }
 
@@ -391,6 +415,48 @@ mod tests {
         assert_eq!(completed.len(), 2, "reused index yields two distinct calls");
         assert_eq!(completed[0], ("a".into(), "first".into(), json!({"x": 1})));
         assert_eq!(completed[1], ("b".into(), "second".into(), json!({"y": 2})));
+    }
+
+    #[test]
+    fn maxtokens_truncated_tool_call_is_dropped_not_completed_as_a_string() {
+        // Args cut off mid-JSON by the output cap; a MaxTokens stop must NOT emit a
+        // ToolCallCompleted (a string input would 400 the next request).
+        let evs = collect(vec![
+            WireDelta::ToolCallStart {
+                index: Some(0),
+                id: Some("call_1".into()),
+                name: Some("edit_file".into()),
+            },
+            WireDelta::ToolCallArgs { index: Some(0), fragment: "{\"path\":\"a".into() },
+            WireDelta::Stop(StopReason::MaxTokens),
+        ]);
+        assert!(
+            !evs.iter().any(|e| matches!(e, ChatEvent::ToolCallCompleted { .. })),
+            "a truncated tool call is dropped, not completed: {evs:?}"
+        );
+        assert_eq!(evs.last(), Some(&ChatEvent::Done(StopReason::MaxTokens)));
+    }
+
+    #[test]
+    fn maxtokens_after_a_complete_tool_call_still_completes_it() {
+        // The cap hit AFTER a valid tool_use finished (e.g. trailing text cut): the
+        // complete call must still surface.
+        let evs = collect(vec![
+            WireDelta::ToolCallStart {
+                index: Some(0),
+                id: Some("call_1".into()),
+                name: Some("edit_file".into()),
+            },
+            WireDelta::ToolCallArgs { index: Some(0), fragment: "{\"path\":\"a.rs\"}".into() },
+            WireDelta::Stop(StopReason::MaxTokens),
+        ]);
+        match evs.iter().find_map(|e| match e {
+            ChatEvent::ToolCallCompleted { input, .. } => Some(input),
+            _ => None,
+        }) {
+            Some(v) => assert_eq!(v, &json!({"path": "a.rs"}), "a complete call survives MaxTokens"),
+            None => panic!("a complete tool call must still complete on MaxTokens: {evs:?}"),
+        }
     }
 
     #[test]

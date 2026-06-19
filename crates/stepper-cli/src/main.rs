@@ -360,7 +360,14 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
     // First-run setup runs only on the interactive path (headless returned
     // above). When it writes a config its chosen model becomes this session's
     // model too, so the orchestrator and the footer agree.
-    let onboarding_model = onboarding::maybe_first_run(&cwd, global.no_init).await?;
+    // `STEPPER_NO_INIT` opts out by presence (any value except an explicitly
+    // falsey one); resolved here, not via clap's bool `env` which would abort the
+    // whole command on a non-"true"/"false" value.
+    let no_init = global.no_init
+        || std::env::var_os("STEPPER_NO_INIT").is_some_and(|v| {
+            !matches!(v.to_string_lossy().trim(), "" | "0" | "false" | "no" | "off")
+        });
+    let onboarding_model = onboarding::maybe_first_run(&cwd, no_init).await?;
     let effective_model = global.model.clone().or(onboarding_model);
     let (provider, model) = split_model(effective_model.as_deref());
 

@@ -277,6 +277,7 @@ impl Orchestrator {
                 "SessionStart",
                 None,
                 &serde_json::json!({ "turn": user_turn }),
+                &cancel,
             )
             .await;
 
@@ -636,7 +637,7 @@ impl Orchestrator {
             }
         }
 
-        let _ = self.hooks.run("Stop", None, &serde_json::json!({})).await;
+        let _ = self.hooks.run("Stop", None, &serde_json::json!({}), &cancel).await;
         Ok(TurnOutput {
             summaries: handoff.prior,
             messages: turn_messages,

@@ -270,6 +270,34 @@ pub fn parse_event(event: &str, data: &str) -> Result<Vec<WireDelta>, ProviderEr
             }));
             Ok(out)
         }
+        "response.incomplete" => {
+            // The output-token cap truncated the response. Map it to MaxTokens (with
+            // usage) so the agent issues a bounded continuation, instead of letting
+            // the missing terminal event surface as a retryable UnexpectedEnd that
+            // re-sends the same over-long request 3× at full cost before failing.
+            let v: Value = serde_json::from_str(data).map_err(error::decode)?;
+            let mut out = Vec::new();
+            if let Some(u) = v.pointer("/response/usage") {
+                let input = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                let cached = u
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                out.push(WireDelta::Usage(Usage {
+                    input: input.saturating_sub(cached),
+                    output: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+                    cache_read: cached,
+                    cache_write: 0,
+                }));
+            }
+            let reason = v.pointer("/response/incomplete_details/reason").and_then(Value::as_str);
+            out.push(WireDelta::Stop(if reason == Some("max_output_tokens") {
+                StopReason::MaxTokens
+            } else {
+                StopReason::EndTurn
+            }));
+            Ok(out)
+        }
         "response.failed" | "error" => {
             let v: Value = serde_json::from_str(data).map_err(error::decode)?;
             let message = v
@@ -279,9 +307,19 @@ pub fn parse_event(event: &str, data: &str) -> Result<Vec<WireDelta>, ProviderEr
                 .and_then(Value::as_str)
                 .unwrap_or("responses stream error")
                 .to_string();
+            // Carry the error's own code/type (NOT the top-level event "type") so a
+            // transient in-band error (server_error / rate_limit) is retryable
+            // despite the status-less frame.
+            let code = v
+                .pointer("/response/error/code")
+                .or_else(|| v.pointer("/response/error/type"))
+                .or_else(|| v.pointer("/error/code"))
+                .or_else(|| v.pointer("/error/type"))
+                .and_then(Value::as_str)
+                .map(String::from);
             Err(ProviderError::Api {
                 status: 0,
-                code: None,
+                code,
                 message,
                 retry_after: None,
             })

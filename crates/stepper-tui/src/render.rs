@@ -457,6 +457,12 @@ fn render_context(frame: &mut Frame, area: Rect, b: &ContextBreakdownView, theme
         ("messages", b.messages),
         ("free", b.free),
     ];
+    // Pin the `Esc dismiss` footer so a short inline viewport can never clip it
+    // (the old plain Paragraph clipped the bottom — breakdown tail AND the dismiss
+    // hint — with no way to see it). The window headline + breakdown fill the body
+    // above, top-aligned, so the headline and the first categories stay visible.
+    let split = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    let (body_area, foot_area) = (split[0], split[1]);
     let mut lines = vec![Line::from(Span::styled(
         format!("window: {} tokens (estimated)", fmt_count(b.context_limit)),
         Style::default().fg(theme.muted),
@@ -470,11 +476,11 @@ fn render_context(frame: &mut Frame, area: Rect, b: &ContextBreakdownView, theme
             ),
         ]));
     }
-    lines.push(Line::from(Span::styled(
-        "  Esc dismiss",
-        Style::default().fg(theme.muted),
-    )));
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), body_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled("Esc dismiss", Style::default().fg(theme.muted)))),
+        foot_area,
+    );
 }
 
 /// `/permissions` — the read-only mode/rules/approvals snapshot.
@@ -491,13 +497,25 @@ fn render_permissions(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let mut lines = vec![Line::from(vec![
-        Span::styled("mode: ", Style::default().fg(theme.muted)),
-        Span::styled(
-            snapshot.mode.clone(),
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
-        ),
-    ])];
+    // Pin the `mode:` headline (top) and `Esc dismiss` (bottom) as fixed rows so
+    // a short inline viewport can never push them off-screen; the rules/approvals
+    // list fills the scrollable middle (top-aligned, so mode + the first rules —
+    // the security-critical part — stay visible). The old whole-block scroll
+    // pinned to the bottom and hid the mode + rules entirely.
+    let split = Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let (head_area, body_area, foot_area) = (split[0], split[1], split[2]);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("mode: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                snapshot.mode.clone(),
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        head_area,
+    );
+    let mut lines = Vec::new();
     if snapshot.rules.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no rules configured)",
@@ -531,16 +549,10 @@ fn render_permissions(
             Span::styled(granted, Style::default().fg(theme.muted)),
         ]));
     }
-    lines.push(Line::from(Span::styled(
-        "  Esc dismiss",
-        Style::default().fg(theme.muted),
-    )));
-    let scroll = (lines.len() as u16).saturating_sub(inner.height.max(1));
+    frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), body_area);
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
-        inner,
+        Paragraph::new(Line::from(Span::styled("Esc dismiss", Style::default().fg(theme.muted)))),
+        foot_area,
     );
 }
 
@@ -635,13 +647,16 @@ fn render_live(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             .title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let scroll = live_scroll(lines.len(), inner.height, state.scroll_offset);
+        // Scroll in WRAPPED rows (what ratatui scrolls by); a long streamed line
+        // soft-wraps to many rows, and counting logical lines would leave the
+        // newest output below the fold (the agent looks frozen mid-turn).
+        let scroll = live_scroll(wrapped_row_count(&lines, inner.width), inner.height, state.scroll_offset);
         frame.render_widget(
             Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).scroll((scroll, 0)),
             inner,
         );
     } else {
-        let scroll = live_scroll(lines.len(), area.height, state.scroll_offset);
+        let scroll = live_scroll(wrapped_row_count(&lines, area.width), area.height, state.scroll_offset);
         frame.render_widget(
             Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).scroll((scroll, 0)),
             area,
@@ -684,6 +699,22 @@ fn wrapped_rows_for_line(line: &str, width: usize) -> usize {
         }
     }
     rows
+}
+
+/// Total wrapped visual rows `lines` occupy at `width` columns under
+/// `Wrap { trim: false }` — the unit ratatui's `Paragraph::scroll` (and
+/// `insert_before` height) actually use. Scrolling/sizing by the LOGICAL line
+/// count under-counts whenever a line soft-wraps, pushing the bottom (the newest
+/// streamed output, an action/dismiss hint) below the fold.
+pub(crate) fn wrapped_row_count(lines: &[Line], width: u16) -> usize {
+    let width = width.max(1) as usize;
+    lines
+        .iter()
+        .map(|line| {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            wrapped_rows_for_line(&text, width)
+        })
+        .sum()
 }
 
 /// The Paragraph scroll for the live region: pinned to the bottom, then moved up
@@ -882,29 +913,44 @@ fn render_approval(frame: &mut Frame, area: Rect, req: &ApprovalRequest, theme: 
         }
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "[y] allow once   [a] always allow   [n] deny",
-        Style::default().fg(theme.accent),
-    )));
-
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.warning))
         .title(" approval ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    // Reserve the bottom row for the action hint and render it OUTSIDE the
+    // scrolled diff, so it is never scrolled off-screen. The diff can be far
+    // taller than the (often short) inline viewport; with the hint inside the
+    // scroll region it dropped below the fold and the prompt looked frozen —
+    // the user could not see that y/a/n was expected.
+    let split = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    let (diff_area, hint_area) = (split[0], split[1]);
     // Scroll so the first change is near the top (one line of headroom); else
-    // pin to the bottom as before (small command/mcp prompts).
+    // pin to the bottom. Compute in WRAPPED rows (the unit ratatui scrolls by):
+    // a diff line wider than the overlay soft-wraps, so a logical-line count would
+    // under-scroll and leave the change (or the bottom) out of view.
+    let total = wrapped_row_count(&lines, diff_area.width) as u16;
+    let max_scroll = total.saturating_sub(diff_area.height.max(1));
     let scroll = match first_change {
-        Some(line) => (line.saturating_sub(1) as u16).min((lines.len() as u16).saturating_sub(inner.height.max(1))),
-        None => (lines.len() as u16).saturating_sub(inner.height.max(1)),
+        Some(line) => {
+            let before = wrapped_row_count(&lines[..line], diff_area.width) as u16;
+            before.saturating_sub(1).min(max_scroll)
+        }
+        None => max_scroll,
     };
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0)),
-        inner,
+        diff_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "[y] allow once   [a] always allow   [n] deny",
+            Style::default().fg(theme.accent),
+        ))),
+        hint_area,
     );
 }
 
@@ -1088,6 +1134,36 @@ mod tests {
     }
 
     #[test]
+    fn approval_hint_stays_visible_with_a_tall_diff_in_a_short_viewport() {
+        use stepper_protocol::{ApprovalKind, ApprovalRequest, DiffView};
+        use tokio::sync::oneshot;
+        use uuid::Uuid;
+        let mut s = base_state();
+        let (reply, _rx) = oneshot::channel();
+        // A change at the TOP of a long file: the diff is far taller than a short
+        // inline viewport. The old renderer scrolled to the top change and pushed
+        // the `[y/a/n]` hint (the last line of the scrolled body) off-screen, so
+        // the prompt looked frozen. The hint must now stay pinned regardless.
+        let old: String = std::iter::once("CHANGE ME\n".to_string())
+            .chain((0..40).map(|i| format!("line {i}\n")))
+            .collect();
+        let new: String = std::iter::once("CHANGED LINE\n".to_string())
+            .chain((0..40).map(|i| format!("line {i}\n")))
+            .collect();
+        s.overlay = Some(Overlay::Approval(ApprovalRequest {
+            id: Uuid::new_v4(),
+            kind: ApprovalKind::FileEdit(DiffView { path: PathBuf::from("a.txt"), old, new }),
+            reply,
+        }));
+        let out = render_to_string(&s, 80, 10);
+        assert!(out.contains("CHANGED LINE"), "the top change is shown: {out}");
+        assert!(
+            out.contains("allow once"),
+            "the y/a/n hint must stay visible even when the diff overflows the viewport: {out}"
+        );
+    }
+
+    #[test]
     fn picker_overlay_lists_candidate_entries() {
         let mut s = base_state();
         s.set_picker(
@@ -1255,7 +1331,7 @@ mod tests {
             free: 192_250,
             context_limit: 200_000,
         }));
-        let out = render_to_string(&s, 100, 14);
+        let out = render_to_string(&s, 100, 16);
         assert!(out.contains("context"), "panel title: {out}");
         assert!(out.contains("system prompt"), "category: {out}");
         assert!(out.contains("mcp tools"), "category: {out}");
@@ -1263,6 +1339,8 @@ mod tests {
         assert!(out.contains("4.0k tok"), "messages token count: {out}");
         assert!(out.contains("free"), "free row: {out}");
         assert!(out.contains("200.0k tokens"), "window line: {out}");
+        // The dismiss hint is pinned, so it stays visible (it used to clip).
+        assert!(out.contains("Esc dismiss"), "dismiss hint stays visible: {out}");
     }
 
     #[test]
@@ -1296,6 +1374,65 @@ mod tests {
         assert!(out.contains("Read(//etc/**)") && out.contains("(project)"), "deny rule: {out}");
         assert!(out.contains("approvals (1)"), "approvals header: {out}");
         assert!(out.contains("Bash(git status)"), "approval row: {out}");
+    }
+
+    #[test]
+    fn permissions_keeps_mode_visible_in_a_short_viewport() {
+        use stepper_protocol::{PermissionRuleView, PermissionsSnapshotView};
+        let mut s = base_state();
+        // More rules than fit: the old whole-block scroll pinned to the bottom and
+        // pushed the `mode:` headline (and rules) off the top of a short viewport.
+        let rules = (0..8)
+            .map(|i| PermissionRuleView {
+                verdict: "ask".into(),
+                rule: format!("Bash(cmd{i}:*)"),
+                source: "project".into(),
+            })
+            .collect();
+        s.overlay = Some(Overlay::Permissions(PermissionsSnapshotView {
+            mode: "plan".into(),
+            rules,
+            approvals: vec![],
+        }));
+        let out = render_to_string(&s, 70, 8);
+        assert!(out.contains("mode:") && out.contains("plan"), "mode headline stays pinned: {out}");
+        assert!(out.contains("Esc dismiss"), "dismiss hint stays pinned: {out}");
+    }
+
+    #[test]
+    fn live_region_keeps_newest_output_when_a_long_line_wraps() {
+        let mut s = base_state();
+        s.turn_active = true;
+        // A long line soft-wraps to many rows; the newest line is appended after.
+        // The old logical-line scroll under-counted and left the tail off-screen.
+        s.live.assistant = format!("{}\nNEWEST_TOKENS", "x".repeat(300));
+        let out = render_to_string(&s, 40, 8);
+        assert!(
+            out.contains("NEWEST_TOKENS"),
+            "newest streamed output stays in view when an earlier line wraps: {out}"
+        );
+    }
+
+    #[test]
+    fn approval_surfaces_over_an_open_file_picker() {
+        use stepper_protocol::{AppEvent, ApprovalKind, ApprovalRequest};
+        use tokio::sync::oneshot;
+        use uuid::Uuid;
+        let mut s = base_state();
+        s.set_picker(String::new(), vec!["src/".into(), "notes.md".into()], "");
+        assert!(s.picker.is_some(), "the @-file picker is open");
+        let (reply, _rx) = oneshot::channel();
+        s.apply_event(AppEvent::ApprovalRequested(ApprovalRequest {
+            id: Uuid::new_v4(),
+            kind: ApprovalKind::Command { cmd: "rm -rf /".into(), outside_project: false },
+            reply,
+        }));
+        // The transient picker is dropped so the approval is both drawn and
+        // key-routable (it used to stay hidden behind the picker → turn hangs).
+        assert!(s.picker.is_none(), "the @-picker is dropped for the approval");
+        assert!(matches!(s.overlay, Some(Overlay::Approval(_))), "approval is the live overlay");
+        let out = render_to_string(&s, 80, 10);
+        assert!(out.contains("allow once"), "approval prompt is visible, not hidden: {out}");
     }
 
     #[test]
@@ -1408,4 +1545,5 @@ mod tests {
         assert!(out.contains("cmd18"), "selected item scrolled into view: {out}");
         assert!(!out.contains("cmd00"), "early items scrolled off the top: {out}");
     }
+
 }

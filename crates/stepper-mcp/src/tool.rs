@@ -73,6 +73,10 @@ impl Tool for McpTool {
         &self.spec
     }
 
+    fn mcp_server(&self) -> Option<&str> {
+        Some(&self.server)
+    }
+
     async fn call(&self, args: Value, cx: &ToolCx) -> Result<ToolResult, ToolError> {
         cx.gate(
             PermissionRequest::Mcp {

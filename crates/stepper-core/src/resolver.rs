@@ -72,6 +72,17 @@ impl ProviderResolver for ConfigProviderResolver {
         self.factory.build(spec).map_err(CoreError::from)
     }
 
+    fn provider_has_explicit_key(&self, provider: &str) -> bool {
+        // An explicit literal key or a set `{env:VAR}`/`STEPPER_*` env resolves
+        // non-None here and wins over the keyring (explicit > env > keyring).
+        self.config
+            .read()
+            .unwrap()
+            .resolve_provider(&format!("{provider}/_"))
+            .map(|rp| rp.api_key.is_some())
+            .unwrap_or(false)
+    }
+
     fn model_info(&self, model_ref: &str) -> ModelInfo {
         // Bind first so the read guard drops before the registry/catalog work.
         let resolved = self.config.read().unwrap().resolve_provider(model_ref);
@@ -238,7 +249,13 @@ impl ProviderResolver for ConfigProviderResolver {
         {
             let mut config = self.config.write().unwrap();
             let entry = config.settings.providers.entry(id.to_string()).or_default();
-            entry.kind = kind.clone();
+            // Only fill fields that are absent — never clobber a user's deliberate
+            // config. A new entry (ProviderConfig::default) has kind=="" so it still
+            // gets the catalog kind; an existing `openai-responses`/`codex` provider
+            // keeps its dialect (overwriting it to openai-compat would break it).
+            if entry.kind.is_empty() {
+                entry.kind = kind.clone();
+            }
             if entry.base_url.is_none() {
                 entry.base_url = base_url.clone();
             }
@@ -571,6 +588,32 @@ mod tests {
         assert!(resolver.connect_provider("nope").await.is_err());
     }
 
+    #[test]
+    fn provider_has_explicit_key_reflects_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::load(dir.path()).unwrap();
+        config.settings.providers.insert(
+            "acme".into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("http://localhost/v1".into()),
+                api_key: Some("sk-literal".into()),
+                auth: None,
+                default_model: None,
+                context_window: None,
+            },
+        );
+        let resolver = ConfigProviderResolver::new(
+            config,
+            ProviderFactory::new().unwrap(),
+            ModelRegistry::builtin(),
+            None,
+            None,
+        );
+        assert!(resolver.provider_has_explicit_key("acme"), "an explicit key shadows the keyring");
+        assert!(!resolver.provider_has_explicit_key("nope"), "unknown provider: no explicit key");
+    }
+
     #[tokio::test]
     async fn list_providers_returns_catalog_seed_sorted_with_key_hint() {
         let resolver = resolver_for_connect(Some(connect_catalog()));
@@ -629,10 +672,12 @@ mod tests {
         config.settings.providers.insert(
             "acme".into(),
             ProviderConfig {
-                kind: "openai-compat".into(),
+                // A deliberately non-compat dialect: reconnecting must NOT rewrite it
+                // to the catalog-derived openai-compat (that would break it).
+                kind: "openai-responses".into(),
                 base_url: Some("https://my-proxy.internal/v1".into()),
                 api_key: Some("{env:ACME_KEY}".into()),
-                auth: None,
+                auth: Some("codex-oauth".into()),
                 default_model: Some("acme-1".into()),
                 context_window: Some(123_000),
             },
@@ -647,7 +692,9 @@ mod tests {
         resolver.connect_provider("acme").await.unwrap();
         let cfg = resolver.config.read().unwrap();
         let p = cfg.settings.providers.get("acme").unwrap();
-        // The user's key / model / context / explicit base survive the reconnect.
+        // Every existing override survives the reconnect (kind/auth/key/model/ctx/base).
+        assert_eq!(p.kind, "openai-responses", "an existing wire kind is preserved");
+        assert_eq!(p.auth.as_deref(), Some("codex-oauth"));
         assert_eq!(p.api_key.as_deref(), Some("{env:ACME_KEY}"));
         assert_eq!(p.default_model.as_deref(), Some("acme-1"));
         assert_eq!(p.context_window, Some(123_000));

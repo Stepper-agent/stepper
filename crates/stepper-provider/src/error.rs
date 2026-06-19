@@ -40,8 +40,29 @@ impl ProviderError {
     pub fn is_retryable(&self) -> bool {
         match self {
             ProviderError::Transport(_) | ProviderError::UnexpectedEnd => true,
-            ProviderError::Api { status, .. } => *status == 429 || *status >= 500,
+            // 429/5xx by status, OR a transient code on an in-band stream error
+            // (those arrive on a 200 with status 0, so the status check misses them).
+            ProviderError::Api { status, code, .. } => {
+                *status == 429
+                    || *status >= 500
+                    || code.as_deref().is_some_and(is_transient_api_code)
+            }
             _ => false,
         }
     }
+}
+
+/// In-band stream error codes (delivered on a 200, no HTTP status) that mark a
+/// transient provider condition — retry these like a 429/5xx rather than aborting
+/// the turn (and needlessly burning the fallback model).
+fn is_transient_api_code(code: &str) -> bool {
+    matches!(
+        code,
+        "overloaded_error"
+            | "rate_limit_error"
+            | "rate_limit_exceeded"
+            | "api_error"
+            | "server_error"
+            | "service_unavailable"
+    )
 }

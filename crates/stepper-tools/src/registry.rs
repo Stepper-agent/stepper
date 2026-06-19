@@ -72,20 +72,23 @@ impl ToolRegistry {
         if allowed_servers.is_empty() {
             return self.clone();
         }
-        // MCP tools are namespaced with the SANITIZED server name (stepper-mcp
-        // `bridge::sanitize`), so the scope prefix must sanitize identically —
-        // otherwise a server name with `.`/space/`:` never matches and its tools
-        // are silently scoped out (or, for a disallowed name, leak in).
-        let prefixes: Vec<String> = allowed_servers
+        // Scope by tool ORIGIN (its MCP server), not by string prefix on the
+        // namespaced name: `mcp__<server>__<tool>` cannot be parsed back into
+        // (server, tool) once either contains `__`, so a prefix match leaks a
+        // server whose sanitized name is a prefix of another (`alpha` vs
+        // `alpha__beta`). Server names are sanitized identically to how the bridge
+        // namespaces them, so a `.`/space/`:` name still matches.
+        let allowed: std::collections::HashSet<String> = allowed_servers
             .iter()
             .chain(always_load_servers.iter())
-            .map(|s| format!("mcp__{}__", sanitize_mcp_segment(s)))
+            .map(|s| sanitize_mcp_segment(s))
             .collect();
         let tools = self
             .tools
             .iter()
-            .filter(|(name, _)| {
-                !name.starts_with("mcp__") || prefixes.iter().any(|p| name.starts_with(p))
+            .filter(|(_, tool)| match tool.mcp_server() {
+                None => true, // built-in tools are never MCP-scoped
+                Some(server) => allowed.contains(&sanitize_mcp_segment(server)),
             })
             .map(|(name, tool)| (name.clone(), tool.clone()))
             .collect();
@@ -117,27 +120,46 @@ mod tests {
     use serde_json::Value;
     use stepper_provider::{ToolError, ToolResult, ToolSpec};
 
-    struct Named(ToolSpec);
+    struct Named {
+        spec: ToolSpec,
+        server: Option<String>,
+    }
     #[async_trait]
     impl Tool for Named {
         fn spec(&self) -> &ToolSpec {
-            &self.0
+            &self.spec
+        }
+        fn mcp_server(&self) -> Option<&str> {
+            self.server.as_deref()
         }
         async fn call(&self, _args: Value, _cx: &ToolCx) -> Result<ToolResult, ToolError> {
             Ok(ToolResult::text("ok"))
         }
     }
 
-    fn registry_with(names: &[&str]) -> ToolRegistry {
-        let mut r = ToolRegistry::new();
-        for n in names {
-            r.register(Arc::new(Named(ToolSpec {
-                name: (*n).into(),
+    fn named(name: &str, server: Option<&str>) -> Arc<Named> {
+        Arc::new(Named {
+            spec: ToolSpec {
+                name: name.into(),
                 description: String::new(),
                 input_schema: serde_json::json!({ "type": "object" }),
                 read_only: false,
                 parallel_safe: false,
-            })));
+            },
+            server: server.map(String::from),
+        })
+    }
+
+    /// Derive the server for the simple `mcp__<server>__<tool>` test names. Real
+    /// `McpTool` carries its server explicitly — this is only for the legacy
+    /// single-`__`-segment fixtures below; ambiguous names use `named(..)` directly.
+    fn registry_with(names: &[&str]) -> ToolRegistry {
+        let mut r = ToolRegistry::new();
+        for n in names {
+            let server = n
+                .strip_prefix("mcp__")
+                .map(|rest| rest.split("__").next().unwrap_or("").to_string());
+            r.register(named(n, server.as_deref()));
         }
         r
     }
@@ -172,6 +194,23 @@ mod tests {
             "allowed special-char server matches via sanitized prefix"
         );
         assert!(!names.contains(&"mcp__other__y".to_string()));
+    }
+
+    #[test]
+    fn filter_mcp_does_not_leak_a_superstring_server() {
+        // Two distinct servers whose sanitized names are prefix-related: "alpha"
+        // and "alpha__beta". The old `name.starts_with("mcp__alpha__")` prefix
+        // match leaked the latter into a layer scoped only to "alpha"; origin-based
+        // scoping keys on the tool's real server, so it does not.
+        let mut r = ToolRegistry::new();
+        r.register(named("mcp__alpha__x", Some("alpha")));
+        r.register(named("mcp__alpha__beta__y", Some("alpha__beta")));
+        let names = r.filter_mcp(&["alpha".into()], &[]).names();
+        assert!(names.contains(&"mcp__alpha__x".to_string()), "allowed server's tool kept");
+        assert!(
+            !names.contains(&"mcp__alpha__beta__y".to_string()),
+            "a different server is NOT leaked by a shared name prefix"
+        );
     }
 
     #[test]

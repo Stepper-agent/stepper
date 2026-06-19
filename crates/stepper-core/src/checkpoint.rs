@@ -70,6 +70,12 @@ impl Snapshotter {
             if let Some(parent) = to.parent() {
                 std::fs::create_dir_all(parent).map_err(io)?;
             }
+            // A path that became a directory during the turn would make `copy` error
+            // and abort mid-restore, leaving a partial tree; replace it so restore
+            // is robust (the snapshot is the source of truth for that point in time).
+            if to.is_dir() {
+                std::fs::remove_dir_all(&to).map_err(io)?;
+            }
             std::fs::copy(path, &to).map_err(io)?;
             snapshot.insert(rel);
         }
