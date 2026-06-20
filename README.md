@@ -9,7 +9,7 @@
 > for production use yet.
 
 <!-- release:start -->
-**Latest release:** [v0.9.1](https://github.com/Stepper-agent/stepper/releases/latest)
+**Latest release:** [v0.9.2](https://github.com/Stepper-agent/stepper/releases/latest)
 <!-- release:end -->
 
 A layered CLI/TUI AI coding agent — an orchestrator delegates work through a pipeline of sub-agent layers, each with its own provider/model and a fresh context window.
