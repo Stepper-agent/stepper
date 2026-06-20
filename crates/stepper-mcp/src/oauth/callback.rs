@@ -168,12 +168,18 @@ mod tests {
     #[test]
     fn bind_redirect_binds_a_valid_loopback_override() {
         // Find a free port, then assert bind_redirect binds exactly it and echoes
-        // the override verbatim.
-        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        let uri = format!("http://127.0.0.1:{port}/callback");
-        let server = bind_redirect(&uri).unwrap();
+        // the override verbatim. Releasing the probe leaves a TOCTOU window where a
+        // concurrent test can steal the freed port, so retry that race with a fresh
+        // port — the per-call behaviour under test is unchanged.
+        let (server, uri) = (0..20)
+            .find_map(|_| {
+                let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+                let port = probe.local_addr().ok()?.port();
+                drop(probe);
+                let uri = format!("http://127.0.0.1:{port}/callback");
+                bind_redirect(&uri).ok().map(|server| (server, uri))
+            })
+            .expect("bind_redirect should bind a free loopback port within 20 tries");
         assert_eq!(server.redirect_uri, uri);
     }
 }
