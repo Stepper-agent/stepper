@@ -28,3 +28,4 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rmcp = { workspace = true, features = ["client", "server", "macros"] }
+tempfile = { workspace = true }

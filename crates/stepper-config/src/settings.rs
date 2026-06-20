@@ -291,6 +291,18 @@ pub struct McpServerConfig {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub always_load: bool,
+    /// Whether to connect this server. `false` keeps it in config but skips it at
+    /// startup; omitted or `true` connects.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Working directory for a stdio server (relative paths resolve against the
+    /// project root). Ignored for http.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Per-server connect/handshake timeout in milliseconds (overrides the global
+    /// `STEPPER_MCP_CONNECT_TIMEOUT_MS` / 10s default).
+    #[serde(default)]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]

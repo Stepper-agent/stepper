@@ -3338,6 +3338,7 @@ dependencies = [
  "stepper-permission",
  "stepper-provider",
  "stepper-tools",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

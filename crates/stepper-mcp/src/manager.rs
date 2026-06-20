@@ -6,6 +6,7 @@ use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use rmcp::ServiceExt;
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use stepper_config::McpServerConfig;
@@ -31,6 +32,12 @@ fn connect_timeout() -> Duration {
     Duration::from_millis(ms)
 }
 
+/// The connect/handshake timeout for one server: its per-server `timeout` (ms)
+/// if set, else the global default.
+fn server_timeout(cfg: &McpServerConfig) -> Duration {
+    cfg.timeout.map(Duration::from_millis).unwrap_or_else(connect_timeout)
+}
+
 /// Owns the live MCP client connections for a session and exposes their tools as
 /// native `Tool`s. The connections stay open for the manager's lifetime — drop
 /// it (or call `shutdown`) to close them.
@@ -52,11 +59,15 @@ impl McpManager {
 
     /// Connect every configured server. A server that fails to connect is logged
     /// and skipped — it never takes down the agent.
-    pub async fn connect(servers: &BTreeMap<String, McpServerConfig>) -> Self {
+    pub async fn connect(servers: &BTreeMap<String, McpServerConfig>, base_dir: &Path) -> Self {
         let mut manager = McpManager::empty();
         let mut taken = HashMap::new();
         for (name, cfg) in servers {
-            match connect_one(name, cfg, &mut taken).await {
+            // A server disabled in config stays defined but isn't connected.
+            if cfg.enabled == Some(false) {
+                continue;
+            }
+            match connect_one(name, cfg, base_dir, &mut taken).await {
                 Ok((service, tools)) => {
                     for tool in &tools {
                         manager
@@ -102,14 +113,16 @@ impl McpManager {
 async fn connect_one(
     name: &str,
     cfg: &McpServerConfig,
+    base_dir: &Path,
     taken: &mut HashMap<String, (String, String)>,
 ) -> Result<(RunningService<RoleClient, ()>, Vec<Arc<dyn Tool>>), McpError> {
+    let timeout = server_timeout(cfg);
     let service = match cfg.transport.as_deref() {
-        Some("http") | Some("streamable-http") => connect_http(cfg).await?,
-        _ => connect_stdio(cfg).await?,
+        Some("http") | Some("streamable-http") => connect_http(cfg, timeout).await?,
+        _ => connect_stdio(cfg, base_dir, timeout).await?,
     };
 
-    let mcp_tools = tokio::time::timeout(connect_timeout(), service.list_all_tools())
+    let mcp_tools = tokio::time::timeout(timeout, service.list_all_tools())
         .await
         .map_err(|_| McpError::Connect("list_tools timed out".into()))?
         .map_err(|e| McpError::Connect(format!("list_tools: {e}")))?;
@@ -180,6 +193,8 @@ async fn with_stderr_context(base: String, tail: &StderrTail) -> McpError {
 
 async fn connect_stdio(
     cfg: &McpServerConfig,
+    base_dir: &Path,
+    timeout: Duration,
 ) -> Result<RunningService<RoleClient, ()>, McpError> {
     let command = cfg
         .command
@@ -190,12 +205,21 @@ async fn connect_stdio(
     for (key, value) in &cfg.env {
         cmd.env(key, value);
     }
+    // Per-server working directory (relative paths resolve against the project root).
+    if let Some(cwd) = &cfg.cwd {
+        let dir = if Path::new(cwd).is_absolute() {
+            PathBuf::from(cwd)
+        } else {
+            base_dir.join(cwd)
+        };
+        cmd.current_dir(dir);
+    }
     let (transport, stderr) = TokioChildProcess::builder(cmd)
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| McpError::Connect(e.to_string()))?;
     let tail = StderrTail::drain(stderr);
-    match tokio::time::timeout(connect_timeout(), ().serve(transport)).await {
+    match tokio::time::timeout(timeout, ().serve(transport)).await {
         Err(_) => Err(with_stderr_context("handshake timed out".into(), &tail).await),
         Ok(Err(e)) => Err(with_stderr_context(e.to_string(), &tail).await),
         Ok(Ok(service)) => Ok(service),
@@ -204,6 +228,7 @@ async fn connect_stdio(
 
 async fn connect_http(
     cfg: &McpServerConfig,
+    timeout: Duration,
 ) -> Result<RunningService<RoleClient, ()>, McpError> {
     let url = cfg
         .url
@@ -215,7 +240,7 @@ async fn connect_http(
     config.auth_header = auth_header;
     config.custom_headers = custom_headers;
     let transport = rmcp::transport::StreamableHttpClientTransport::from_config(config);
-    tokio::time::timeout(connect_timeout(), ().serve(transport))
+    tokio::time::timeout(timeout, ().serve(transport))
         .await
         .map_err(|_| McpError::Connect("handshake timed out".into()))?
         .map_err(|e| McpError::Connect(e.to_string()))
@@ -342,7 +367,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_failure_surfaces_the_child_stderr_tail() {
-        let err = connect_stdio(&sh_server("echo deadbeef-stderr-context >&2; exit 7"))
+        let err = connect_stdio(&sh_server("echo deadbeef-stderr-context >&2; exit 7"), Path::new("."), connect_timeout())
             .await
             .expect_err("a child that exits without speaking MCP must fail to connect");
         let message = err.to_string();
@@ -355,7 +380,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn chatty_stderr_is_drained_into_a_bounded_tail() {
         let script = "head -c 200000 /dev/zero | tr '\\0' x >&2; exit 1";
-        let err = connect_stdio(&sh_server(script))
+        let err = connect_stdio(&sh_server(script), Path::new("."), connect_timeout())
             .await
             .expect_err("the child exits, so the handshake must fail");
         let message = err.to_string();
@@ -372,12 +397,44 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn quiet_connect_failure_has_no_stderr_context() {
-        let err = connect_stdio(&sh_server("exit 3"))
+        let err = connect_stdio(&sh_server("exit 3"), Path::new("."), connect_timeout())
             .await
             .expect_err("a silent immediate exit must fail to connect");
         assert!(
             !err.to_string().contains("server stderr"),
             "no stderr output must not fabricate context, got: {err}"
         );
+    }
+
+    #[test]
+    fn server_timeout_prefers_per_server_over_global() {
+        let mut cfg = McpServerConfig::default();
+        assert_eq!(server_timeout(&cfg), connect_timeout(), "no per-server → global default");
+        cfg.timeout = Some(2500);
+        assert_eq!(server_timeout(&cfg), Duration::from_millis(2500));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_disabled_server_is_skipped_and_never_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let mut cfg = sh_server(&format!("touch '{}'; exit 0", marker.display()));
+        cfg.enabled = Some(false);
+        let servers = BTreeMap::from([("off".to_string(), cfg)]);
+        let mgr = McpManager::connect(&servers, Path::new(".")).await;
+        assert!(mgr.is_empty(), "a disabled server is not connected");
+        assert!(!marker.exists(), "a disabled server's command must not run");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stdio_server_runs_in_its_configured_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        // `touch ran-here` (a relative path) lands in the server's cwd. The MCP
+        // handshake still fails (sh isn't an MCP server), but the command ran.
+        let mut cfg = sh_server("touch ran-here; exit 0");
+        cfg.cwd = Some(dir.path().to_string_lossy().into_owned());
+        let servers = BTreeMap::from([("p".to_string(), cfg)]);
+        let _ = McpManager::connect(&servers, Path::new(".")).await;
+        assert!(dir.path().join("ran-here").exists(), "the stdio server ran in its cwd");
     }
 }

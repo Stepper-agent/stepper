@@ -175,7 +175,9 @@ pub async fn build_orchestrator_with_fallback(
         .unwrap_or(8);
     let dispatch_step_cap = config.settings.dispatch.as_ref().and_then(|d| d.step_cap);
 
-    let mcp = McpManager::connect(&config.settings.mcp_servers).await;
+    // stdio MCP servers' `cwd` resolves against the project root (or cwd if none).
+    let mcp_base = config.project_root.as_deref().unwrap_or(cwd.as_path());
+    let mcp = McpManager::connect(&config.settings.mcp_servers, mcp_base).await;
     let mut base_tools = stepper_tools::ToolRegistry::builtins();
     for tool in mcp.tools() {
         base_tools.register(tool);

@@ -58,6 +58,9 @@ fn server_from_env() -> Option<(String, McpServerConfig)> {
                 headers,
                 env: BTreeMap::new(),
                 always_load: false,
+                enabled: None,
+                cwd: None,
+                timeout: None,
             },
         ));
     }
@@ -81,6 +84,9 @@ fn server_from_env() -> Option<(String, McpServerConfig)> {
             headers: BTreeMap::new(),
             env: BTreeMap::new(),
             always_load: false,
+            enabled: None,
+            cwd: None,
+            timeout: None,
         },
     ))
 }
@@ -97,7 +103,7 @@ async fn external_mcp_server_lists_and_optionally_calls_a_tool() {
     let mut servers = BTreeMap::new();
     servers.insert(name.clone(), cfg);
 
-    let manager = McpManager::connect(&servers).await;
+    let manager = McpManager::connect(&servers, std::path::Path::new(".")).await;
     let names = manager.tool_names();
     eprintln!("{name} tools: {names:?}");
     assert!(!manager.is_empty(), "expected the MCP server to expose tools");

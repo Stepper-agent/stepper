@@ -21,7 +21,7 @@ async fn bogus_stdio_command_is_skipped_and_connect_still_succeeds() {
     let mut servers = BTreeMap::new();
     servers.insert("ghost".to_string(), missing_command_server());
 
-    let manager = McpManager::connect(&servers).await;
+    let manager = McpManager::connect(&servers, std::path::Path::new(".")).await;
 
     assert!(
         manager.is_empty(),
@@ -42,7 +42,7 @@ async fn other_servers_survive_a_single_bogus_server() {
     servers.insert("ghost-a".to_string(), missing_command_server());
     servers.insert("ghost-b".to_string(), missing_command_server());
 
-    let manager = McpManager::connect(&servers).await;
+    let manager = McpManager::connect(&servers, std::path::Path::new(".")).await;
 
     assert!(
         manager.is_empty(),
@@ -54,7 +54,7 @@ async fn other_servers_survive_a_single_bogus_server() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_server_map_connects_to_an_empty_manager() {
-    let manager = McpManager::connect(&BTreeMap::new()).await;
+    let manager = McpManager::connect(&BTreeMap::new(), std::path::Path::new(".")).await;
     assert!(manager.is_empty());
     assert!(manager.tools().is_empty());
 }
@@ -78,7 +78,7 @@ async fn a_server_that_never_completes_the_handshake_times_out_and_is_skipped() 
     );
 
     let start = std::time::Instant::now();
-    let manager = McpManager::connect(&servers).await;
+    let manager = McpManager::connect(&servers, std::path::Path::new(".")).await;
     let elapsed = start.elapsed();
     unsafe {
         std::env::remove_var("STEPPER_MCP_CONNECT_TIMEOUT_MS");
