@@ -158,6 +158,12 @@ fn handle_terminal_event(
         return Ok(false);
     }
 
+    // The #-agent autocomplete picker, while open, captures all keys.
+    if state.agent_picker.is_some() {
+        handle_agent_picker_key(state, &ev);
+        return Ok(false);
+    }
+
     // The builtin overlays (context/permissions/rewind/resume picker) capture
     // keys; the approval overlay keeps its y/a/n path through lower_event.
     if state.overlay_captures_keys() {
@@ -189,6 +195,18 @@ fn handle_terminal_event(
         && at_word_boundary(state)
     {
         open_or_refresh_picker(state, String::new());
+        return Ok(false);
+    }
+
+    // Typing '#' at the start of an empty prompt opens the named-agent
+    // autocomplete picker. Unlike '@' (a path is meaningful anywhere), the
+    // `#agent` route is prefix-only, so the picker only arms at the very start
+    // and never over an open overlay — see `agent_trigger_armed`.
+    if let Event::Key(k) = &ev
+        && let KeyCode::Char('#') = k.code
+        && state.agent_trigger_armed()
+    {
+        state.open_agent_picker();
         return Ok(false);
     }
 
@@ -473,6 +491,24 @@ fn handle_picker_key(state: &mut AppState, ev: &Event) {
     }
 }
 
+/// Keys for the `#`-agent autocomplete picker: ↑↓ select, type to filter, Tab or
+/// Enter inserts `#name `, Esc cancels, Backspace edits the query (and exits past
+/// the trigger). No IO — the agent list is static.
+fn handle_agent_picker_key(state: &mut AppState, ev: &Event) {
+    let Event::Key(k) = ev else {
+        return;
+    };
+    match k.code {
+        KeyCode::Up => state.agent_picker_move(-1),
+        KeyCode::Down => state.agent_picker_move(1),
+        KeyCode::Tab | KeyCode::Enter => state.agent_picker_select(),
+        KeyCode::Esc => state.agent_picker_cancel(),
+        KeyCode::Backspace => state.agent_picker_backspace(),
+        KeyCode::Char(c) => state.agent_picker_push(c),
+        _ => {}
+    }
+}
+
 /// List the directory the query resolves to (IO) and rebuild the picker. The
 /// query may be relative (against cwd), absolute (`/…`), or `~/…`.
 fn open_or_refresh_picker(state: &mut AppState, query: String) {
@@ -574,6 +610,7 @@ mod tests {
             mode: Mode::Auto,
             cwd: PathBuf::from("/tmp"),
             commands: vec![],
+            agents: Vec::new(),
             theme_preset: None,
             theme_colors: Vec::new(),
             effort: None,

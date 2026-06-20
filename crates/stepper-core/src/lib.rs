@@ -24,24 +24,27 @@ pub mod setup;
 pub mod skills;
 pub mod tasks;
 
-pub use agent::{AgentLoop, LayerOutcome};
+pub use agent::{AgentLoop, LayerOutcome, LspDiagnostics};
 pub use approver::ChannelApprover;
 pub use builtins::names as builtin_command_names;
 pub use builtins::descriptions as builtin_command_descriptions;
 pub use checkpoint::Snapshotter;
 pub use dispatch::{
-    DispatchRequest, DispatchResult, DispatchTool, Dispatcher, OrchestratorDispatcher,
+    DispatchRequest, DispatchResult, DispatchTool, Dispatcher, OrchestratorDispatcher, TaskTool,
 };
 pub use error::CoreError;
 pub use fanout::{run_parallel, FanoutTask};
 pub use hooks::{HookDecision, HookHost};
-pub use layer::{FailurePolicy, Handoff, StepDef, SubTask};
+pub use layer::{AgentDef, FailurePolicy, Handoff, StepDef, SubTask};
 pub use model::{ModelInfo, ModelRegistry};
 pub use orchestrator::{Orchestrator, SessionLimits, TurnOutput};
 pub use ports::ProviderResolver;
 pub use resolver::ConfigProviderResolver;
 pub use session::{SessionRecord, SessionStore, TurnRecord};
-pub use setup::{build_steps, compose_system, load_base_context, AGENT_DIRECTIVES, DEFAULT_SYSTEM_PROMPT};
+pub use setup::{
+    build_steps, compose_system, load_agents, load_base_context, resolve_formatters,
+    AGENT_DIRECTIVES, DEFAULT_SYSTEM_PROMPT,
+};
 pub use tasks::AssignTasksTool;
 
 use std::sync::Arc;
@@ -119,6 +122,40 @@ pub fn spawn_core(
             match action {
                 Action::Quit => break,
                 Action::SubmitInput(prompt) => {
+                    // `#<agent> ...` routes this turn to a named sub-agent (its own
+                    // model/tools/role) by transiently replacing the pipeline with
+                    // that one agent. `# heading`-style text (a space after `#`) and
+                    // unknown names fall through to a normal turn. The original
+                    // `#<agent> …` text is still recorded as the user message.
+                    let route = prompt
+                        .strip_prefix('#')
+                        .filter(|rest| !rest.starts_with(char::is_whitespace))
+                        .and_then(|rest| {
+                            let mut it = rest.splitn(2, char::is_whitespace);
+                            let name = it.next().unwrap_or("");
+                            let agent_prompt = it.next().unwrap_or("").trim().to_string();
+                            orchestrator
+                                .agents
+                                .iter()
+                                .find(|a| a.name == name)
+                                .cloned()
+                                .map(|a| (a, agent_prompt))
+                        });
+                    let (run_prompt, restore_steps) = match route {
+                        Some((agent, agent_prompt)) if !agent_prompt.is_empty() => {
+                            let default_model = orchestrator
+                                .steps
+                                .first()
+                                .map(|s| s.model_ref.clone())
+                                .unwrap_or_default();
+                            let saved = std::mem::replace(
+                                &mut orchestrator.steps,
+                                vec![crate::setup::agent_step(&agent, &default_model)],
+                            );
+                            (agent_prompt, Some(saved))
+                        }
+                        _ => (prompt.clone(), None),
+                    };
                     turn_id += 1;
                     let _ = tx.send(AppEvent::TurnStarted { turn_id }).await;
                     checkpoint_turn(&snapshotter, turn_id, session.turns.len(), &tx).await;
@@ -134,7 +171,7 @@ pub fn spawn_core(
                         async {
                             result = Some(
                                 orchestrator
-                                    .run_turn(prompt.clone(), images.clone(), &tx, approver.clone(), turn_cancel.clone())
+                                    .run_turn(run_prompt, images.clone(), &tx, approver.clone(), turn_cancel.clone())
                                     .await,
                             );
                         },
@@ -145,6 +182,10 @@ pub fn spawn_core(
                         &tx,
                     )
                     .await;
+                    // Restore the pipeline after a `#<agent>` turn.
+                    if let Some(saved) = restore_steps {
+                        orchestrator.steps = saved;
+                    }
                     match result {
                         Some(Ok(output)) => {
                             cost.record_turn(output.usage, output.cost_usd);
@@ -228,20 +269,27 @@ pub fn spawn_core(
                     }
                 }
                 Action::SlashCommand { name, args } => {
-                    // Built-ins (/help, /clear, /compact, /context, /cost, /model,
-                    // /permissions, /resume, /rewind) are handled first and don't
-                    // run a turn; everything else expands a user command.
-                    if builtins::handle(
-                        &name,
-                        &args,
-                        &mut orchestrator,
-                        &mut session,
-                        &mut turn_id,
-                        &store,
-                        &cost,
-                        &tx,
-                    )
-                    .await
+                    let project_root = orchestrator.project_root.clone();
+                    let home = orchestrator.home.clone();
+                    let cwd = orchestrator.cwd.clone();
+                    // A user command file (`.stepper/commands/<name>.md`) overrides a
+                    // same-named built-in: the project owner controls `.stepper/`
+                    // (writes there already require explicit approval), so `/init`
+                    // etc. can be customized. Built-ins are consulted only when no
+                    // command file shadows the name.
+                    let cmd_def = commands::find_command(&project_root, home.as_deref(), &name);
+                    if cmd_def.is_none()
+                        && builtins::handle(
+                            &name,
+                            &args,
+                            &mut orchestrator,
+                            &mut session,
+                            &mut turn_id,
+                            &store,
+                            &cost,
+                            &tx,
+                        )
+                        .await
                     {
                         // /clear begins a fresh session and /compact collapses the
                         // turns to one synthetic turn (resetting turn_id) — in both
@@ -266,20 +314,24 @@ pub fn spawn_core(
                         }
                         continue;
                     }
-                    let project_root = orchestrator.project_root.clone();
-                    let home = orchestrator.home.clone();
-                    let cwd = orchestrator.cwd.clone();
                     let rules = orchestrator.rules_snapshot();
                     let mode = orchestrator.mode_snapshot();
-                    let (cmd_name, cmd_args) = (name.clone(), args.clone());
+                    // A command's `model:` frontmatter overrides the primary layer for
+                    // THIS turn only (applied below, restored after the turn).
+                    let model_override = cmd_def.as_ref().and_then(|d| d.model.clone());
+                    let cmd_args = args.clone();
                     // Substitution is permission-gated (fail-closed); run it off-thread
-                    // since `!`shell`` may block.
-                    let expanded = tokio::task::spawn_blocking(move || {
-                        commands::expand(project_root, home, cwd, rules, mode, cmd_name, cmd_args)
-                    })
-                    .await
-                    .ok()
-                    .flatten();
+                    // since `!`shell`` may block. `None` here = no command file (and not
+                    // a built-in) → reported as an unknown command below.
+                    let expanded = match cmd_def {
+                        Some(def) => tokio::task::spawn_blocking(move || {
+                            commands::expand_with(def, project_root, home, cwd, rules, mode, cmd_args)
+                        })
+                        .await
+                        .ok()
+                        .flatten(),
+                        None => None,
+                    };
 
                     match expanded {
                         Some(prompt) => {
@@ -288,6 +340,30 @@ pub fn spawn_core(
                             checkpoint_turn(&snapshotter, turn_id, session.turns.len(), &tx).await;
                             let images = std::mem::take(&mut pending_images);
                             let turn_cancel = cancel.child_token();
+                            // Apply the per-command `model:` override (transient): swap
+                            // the primary layer's model, remembering the old one to put
+                            // back after the turn. An unresolvable model is skipped with
+                            // a warning rather than failing the command.
+                            let restore_model = if let Some(m) = model_override.as_deref() {
+                                if orchestrator.resolver.resolve(m).is_ok() {
+                                    orchestrator
+                                        .steps
+                                        .first_mut()
+                                        .map(|s| std::mem::replace(&mut s.model_ref, m.to_string()))
+                                } else {
+                                    let _ = tx
+                                        .send(AppEvent::Notice {
+                                            level: NoticeLevel::Warn,
+                                            text: format!(
+                                                "command model '{m}' could not be resolved — using the current model"
+                                            ),
+                                        })
+                                        .await;
+                                    None
+                                }
+                            } else {
+                                None
+                            };
                             let mut result = None;
                             let mut deferred = Vec::new();
                             let turn_timeout = orchestrator.limits.turn_timeout;
@@ -306,6 +382,12 @@ pub fn spawn_core(
                                 &tx,
                             )
                             .await;
+                            // Restore the primary layer's model after the command turn.
+                            if let Some(old) = restore_model
+                                && let Some(s) = orchestrator.steps.first_mut()
+                            {
+                                s.model_ref = old;
+                            }
                             if let Some(Ok(output)) = result {
                                 cost.record_turn(output.usage, output.cost_usd);
                                 session.turns.push(TurnRecord {

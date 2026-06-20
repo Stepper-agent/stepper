@@ -5,18 +5,24 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
-use stepper_permission::{PermissionMode, RuleSet};
+use stepper_permission::{PermissionMode, PermissionRequest, RuleSet};
 use stepper_protocol::EventTx;
 use stepper_provider::{LlmProvider, Message, ToolContent, ToolError, ToolResult, ToolSpec};
-use stepper_tools::{Approver, Tool, ToolCx, ToolRegistry};
+use stepper_tools::{Approval, Approver, Formatter, Tool, ToolCx, ToolRegistry};
 use tokio_util::sync::CancellationToken;
 
 /// One sub-agent to dispatch.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DispatchRequest {
     pub label: String,
     pub prompt: String,
     pub model_ref: Option<String>,
+    /// Named-agent role prompt (`None` = the generic dispatched-sub-agent role).
+    /// Set by the `task` tool; composed with the project context into the system.
+    pub role: Option<String>,
+    /// Named-agent tool view (empty = inherit the dispatcher's full base tools).
+    pub tool_allow: Vec<String>,
+    pub tool_deny: Vec<String>,
 }
 
 /// A dispatched sub-agent's free-text outcome.
@@ -99,6 +105,7 @@ impl Tool for DispatchTool {
                         .unwrap_or_else(|| format!("task-{i}")),
                     prompt,
                     model_ref: t.get("model").and_then(Value::as_str).map(str::to_string),
+                    ..Default::default()
                 })
             })
             .collect();
@@ -137,6 +144,123 @@ impl Tool for DispatchTool {
     }
 }
 
+/// A model-callable tool that delegates a subtask to a **named** sub-agent
+/// (`.stepper/agents/<name>`), running it with that agent's own model, tool view,
+/// and role prompt, gated by `permission` `Task(<name>)` rules. Reuses the same
+/// `Dispatcher` as [`DispatchTool`] (a single-item batch).
+pub struct TaskTool {
+    spec: ToolSpec,
+    dispatcher: Arc<dyn Dispatcher>,
+    agents: Arc<Vec<crate::layer::AgentDef>>,
+}
+
+impl TaskTool {
+    pub fn new(agents: Arc<Vec<crate::layer::AgentDef>>, dispatcher: Arc<dyn Dispatcher>) -> Self {
+        let list = agents
+            .iter()
+            .map(|a| format!("- {}: {}", a.name, a.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let spec = ToolSpec {
+            name: "task".into(),
+            description: format!(
+                "Delegate a self-contained subtask to a named sub-agent that runs autonomously in \
+                 its own fresh context (its own model, tools, and role) and returns a summary. \
+                 Choose the agent via `subagent_type`.\n\nAvailable agents:\n{list}"
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "subagent_type": { "type": "string", "description": "which named agent to run" },
+                    "description": { "type": "string", "description": "a short (3-5 word) task label" },
+                    "prompt": { "type": "string", "description": "the full, self-contained task for the agent" }
+                },
+                "required": ["subagent_type", "prompt"]
+            }),
+            read_only: false,
+            parallel_safe: false,
+        };
+        TaskTool {
+            spec,
+            dispatcher,
+            agents,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for TaskTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn call(&self, args: Value, cx: &ToolCx) -> Result<ToolResult, ToolError> {
+        let subagent_type = args
+            .get("subagent_type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("`subagent_type` is required".into()))?;
+        let prompt = args
+            .get("prompt")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("`prompt` is required".into()))?
+            .to_string();
+        let agent = self
+            .agents
+            .iter()
+            .find(|a| a.name == subagent_type)
+            .ok_or_else(|| {
+                ToolError::InvalidArgs(format!(
+                    "unknown subagent_type '{subagent_type}'; available: {}",
+                    self.agents
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?;
+
+        // Gate which agents may be launched via `Task(<glob>)` rules (default:
+        // Auto allows, other modes ask, dont-ask denies).
+        cx.gate(
+            PermissionRequest::Other {
+                tool: "Task".into(),
+                arg: subagent_type.to_string(),
+            },
+            Approval::Command {
+                command: format!("run subagent: {subagent_type}"),
+                outside_project: false,
+            },
+        )
+        .await?;
+
+        let label = args
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| subagent_type.to_string());
+        let req = DispatchRequest {
+            label,
+            prompt,
+            model_ref: agent.model_ref.clone(),
+            role: Some(agent.role_prompt.clone()),
+            tool_allow: agent.tool_allow.clone(),
+            tool_deny: agent.tool_deny.clone(),
+        };
+        let result = self
+            .dispatcher
+            .dispatch(vec![req])
+            .await
+            .into_iter()
+            .next()
+            .ok_or_else(|| ToolError::Execution("the sub-agent produced no result".into()))?;
+        Ok(ToolResult {
+            content: vec![ToolContent::text(result.summary)],
+            is_error: !result.ok,
+            truncated: false,
+        })
+    }
+}
+
 /// The production `Dispatcher`: builds a `FanoutTask` per request from the
 /// orchestrator's resolver + base tools and runs them with a concurrency cap.
 /// Sub-agents get the base tool set only (no `dispatch`), so there is no
@@ -164,6 +288,10 @@ pub struct OrchestratorDispatcher {
     /// Project context (`stepper.md`, `@import`s) prepended to each sub-agent's
     /// system prompt — without it sub-agents run blind to the repo.
     pub base_context: String,
+    /// Format-on-edit formatters, shared into each dispatched sub-agent worker.
+    pub formatters: Arc<Vec<Formatter>>,
+    /// LSP diagnostics provider, shared into each dispatched sub-agent worker.
+    pub lsp: Option<Arc<dyn crate::agent::LspDiagnostics>>,
 }
 
 impl OrchestratorDispatcher {
@@ -199,11 +327,23 @@ impl Dispatcher for OrchestratorDispatcher {
                         crate::orchestrator::budget_wrap(provider, &self.budget, model_info);
                     let worker_index = next_index;
                     next_index += 1;
+                    // A named agent (the `task` tool) carries its own role prompt
+                    // and tool view; a generic dispatch leaves them empty and gets
+                    // the standard sub-agent role + full base tools.
+                    let system = match &req.role {
+                        Some(role) => crate::setup::compose_system(&self.base_context, role),
+                        None => self.subagent_system(),
+                    };
+                    let tools = if req.tool_allow.is_empty() && req.tool_deny.is_empty() {
+                        self.base_tools.clone()
+                    } else {
+                        self.base_tools.filtered(&req.tool_allow, &req.tool_deny)
+                    };
                     tasks.push(FanoutTask {
                         label: req.label,
                         worker_index,
                         provider,
-                        tools: self.base_tools.clone(),
+                        tools,
                         cx: ToolCx {
                             cwd: self.cwd.clone(),
                             project_root: self.project_root.clone(),
@@ -220,8 +360,10 @@ impl Dispatcher for OrchestratorDispatcher {
                         step_cap: self.step_cap,
                         hooks: self.hooks.clone(),
                         compaction_provider: self.compaction_provider.clone(),
-                        system: self.subagent_system(),
+                        system,
                         messages: vec![Message::user(req.prompt)],
+                        formatters: self.formatters.clone(),
+                        lsp: self.lsp.clone(),
                     });
                 }
                 Err(e) => failed.push(DispatchResult {
@@ -336,6 +478,8 @@ mod tests {
             sandbox_writable_roots: None,
             budget,
             base_context: base_context.to_string(),
+            formatters: Arc::new(Vec::new()),
+            lsp: None,
         }
     }
 
@@ -356,6 +500,7 @@ mod tests {
                 label: "blocked".into(),
                 prompt: "do work".into(),
                 model_ref: None,
+                ..Default::default()
             }])
             .await;
 

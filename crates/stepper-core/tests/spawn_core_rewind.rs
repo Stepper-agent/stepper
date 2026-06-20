@@ -172,6 +172,9 @@ async fn rewind_prunes_later_files_and_truncates_session() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let orch = Orchestrator {
+        agents: Default::default(),
+        formatters: Default::default(),
+        lsp: Default::default(),
         resolver: Arc::new(SoloResolver),
         base_tools: ToolRegistry::builtins(),
         steps: vec![step()],
@@ -255,6 +258,9 @@ async fn rewind_uses_the_recorded_turn_count_when_the_turn_id_has_drifted() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let orch = Orchestrator {
+        agents: Default::default(),
+        formatters: Default::default(),
+        lsp: Default::default(),
         resolver: Arc::new(FlakyResolver {
             calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }),

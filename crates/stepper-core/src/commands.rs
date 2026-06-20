@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use stepper_config::{parse_command, substitute, CommandArgs, SubstitutionIo};
+use stepper_config::{parse_command, substitute, CommandArgs, CommandDef, SubstitutionIo};
 use stepper_permission::{evaluate_in, path, Decision, PermissionMode, PermissionRequest, RuleSet};
 use stepper_tools::secret::is_secret_path;
 
@@ -29,6 +29,22 @@ pub fn expand(
     args: String,
 ) -> Option<String> {
     let def = find_command(&project_root, home.as_deref(), &name)?;
+    expand_with(def, project_root, home, cwd, rules, mode, args)
+}
+
+/// Expand an already-resolved command definition into a prompt. Split out from
+/// [`expand`] so the dispatcher can call [`find_command`] up front (to let a
+/// command file override a same-named built-in, and to read its `model`) without
+/// parsing the file twice.
+pub fn expand_with(
+    def: CommandDef,
+    project_root: PathBuf,
+    home: Option<PathBuf>,
+    cwd: PathBuf,
+    rules: Arc<RuleSet>,
+    mode: PermissionMode,
+    args: String,
+) -> Option<String> {
     // Quote-aware split so `/cmd "arg with spaces"` is one argument.
     let positional: Vec<String> = shell_words::split(&args)
         .unwrap_or_else(|_| args.split_whitespace().map(str::to_string).collect());
@@ -55,11 +71,14 @@ pub fn expand(
     .ok()
 }
 
-fn find_command(
+/// Resolve `/name` to its command definition (project `.stepper/commands/` first,
+/// then `~/.stepper/commands/`), or `None` if no parseable file exists. Public so
+/// the dispatcher can detect a user command shadowing a built-in.
+pub fn find_command(
     project_root: &std::path::Path,
     home: Option<&std::path::Path>,
     name: &str,
-) -> Option<stepper_config::CommandDef> {
+) -> Option<CommandDef> {
     let bases = [
         Some(project_root.join(".stepper")),
         home.map(|h| h.join(".stepper")),

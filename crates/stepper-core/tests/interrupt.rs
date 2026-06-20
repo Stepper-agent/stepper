@@ -104,6 +104,9 @@ fn step() -> StepDef {
 
 fn orchestrator(root: std::path::PathBuf) -> Orchestrator {
     Orchestrator {
+        agents: Default::default(),
+        formatters: Default::default(),
+        lsp: Default::default(),
         resolver: Arc::new(SoloResolver),
         base_tools: ToolRegistry::builtins(),
         steps: vec![step()],

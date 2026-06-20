@@ -19,6 +19,22 @@ impl FailurePolicy {
     }
 }
 
+/// A named sub-agent (`.stepper/agents/<name>/index.md`), invocable on demand via
+/// the `task` tool or the `#<name>` prompt trigger — distinct from the `step`
+/// pipeline. Parsed from the same layer frontmatter (model/tools/body=role).
+#[derive(Debug, Clone)]
+pub struct AgentDef {
+    pub name: String,
+    pub description: String,
+    /// `provider/model` (or `None` to inherit the default model).
+    pub model_ref: Option<String>,
+    pub tool_allow: Vec<String>,
+    pub tool_deny: Vec<String>,
+    /// The agent's role prompt (markdown body), composed with the project context
+    /// into its system prompt when it runs.
+    pub role_prompt: String,
+}
+
 /// A precomputed layer in the `step` pipeline (model + prompt + tool view +
 /// caps), built from `setting.json` + the layer's `index.md` frontmatter.
 #[derive(Debug, Clone)]

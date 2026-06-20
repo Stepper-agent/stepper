@@ -129,6 +129,8 @@ async fn compacts_above_soft_threshold_and_pins_the_system_prompt() {
     }
 
     let agent = AgentLoop {
+        formatters: Default::default(),
+        lsp: Default::default(),
         layer_name: "compact".into(),
         provider: &provider,
         tools: &registry,
@@ -249,6 +251,8 @@ async fn uses_the_model_summarizer_when_a_compaction_provider_is_set() {
     }
 
     let agent = AgentLoop {
+        formatters: Default::default(),
+        lsp: Default::default(),
         layer_name: "compact".into(),
         provider: &provider,
         tools: &registry,
@@ -330,6 +334,8 @@ async fn overflowing_seeded_history_is_compacted_before_the_first_request() {
     let seeded = history.clone();
 
     let agent = AgentLoop {
+        formatters: Default::default(),
+        lsp: Default::default(),
         layer_name: "compact-first".into(),
         provider: &provider,
         tools: &registry,

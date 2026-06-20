@@ -10,7 +10,8 @@ use stepper_protocol::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::state::{
-    ApiKeyOverlay, AppState, FilePicker, ListPicker, Overlay, ProcStatus, ShellView, ThemeState,
+    AgentPicker, ApiKeyOverlay, AppState, FilePicker, ListPicker, Overlay, ProcStatus, ShellView,
+    ThemeState,
 };
 use crate::theme::Theme;
 
@@ -55,6 +56,8 @@ fn ui(frame: &mut Frame, state: &AppState, theme: &Theme) {
 
     if let Some(picker) = &state.picker {
         render_picker(frame, rows[0], picker, theme);
+    } else if let Some(agent_picker) = &state.agent_picker {
+        render_agent_picker(frame, rows[0], agent_picker, theme);
     } else if let Some(overlay) = &state.overlay {
         match overlay {
             Overlay::Approval(req) => render_approval(frame, rows[0], req, theme),
@@ -211,6 +214,43 @@ fn render_picker(frame: &mut Frame, area: Rect, picker: &FilePicker, theme: &The
             Style::default().fg(theme.muted)
         };
         lines.push(Line::from(Span::styled(format!("  {path}"), style)));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// The `#`-agent autocomplete picker (mirrors the `@` file picker): the live
+/// query on top, then the matching agents (name + description), the highlighted
+/// one reversed.
+fn render_agent_picker(frame: &mut Frame, area: Rect, picker: &AgentPicker, theme: &Theme) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" agents (#) ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled("#", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(picker.query.clone(), Style::default().fg(theme.accent)),
+        Span::styled(
+            "   ↑↓ select · Tab/Enter insert · Esc cancel",
+            Style::default().fg(theme.muted),
+        ),
+    ])];
+    let rows = (inner.height as usize).saturating_sub(1);
+    for row in 0..picker.matches.len().min(rows) {
+        let Some(agent) = picker.entry(row) else { break };
+        let style = if row == picker.selected {
+            Style::default().fg(theme.accent).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        let label = if agent.description.is_empty() {
+            format!("  {}", agent.name)
+        } else {
+            format!("  {} — {}", agent.name, agent.description)
+        };
+        lines.push(Line::from(Span::styled(label, style)));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
@@ -760,7 +800,7 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     // Place the REAL terminal cursor at the textarea's display column (the
     // emulated reversed-cell cursor is disabled in AppState::new). The terminal
     // renders its own cursor correctly over wide / CJK glyphs.
-    if state.picker.is_none() && state.overlay.is_none() {
+    if state.picker.is_none() && state.agent_picker.is_none() && state.overlay.is_none() {
         let sc = state.textarea.screen_cursor();
         let x = inner.x + (sc.col as u16).min(inner.width.saturating_sub(1));
         let y = inner.y + (sc.row as u16).min(inner.height.saturating_sub(1));
@@ -1038,6 +1078,7 @@ mod tests {
                 crate::CommandInfo::named("rewind"),
                 crate::CommandInfo::named("resume"),
             ],
+            agents: Vec::new(),
             theme_preset: None,
             theme_colors: Vec::new(),
             effort: None,
@@ -1175,6 +1216,20 @@ mod tests {
         assert!(out.contains("files (@)"), "picker title: {out}");
         assert!(out.contains("src/"), "dir entry: {out}");
         assert!(out.contains("notes.md"), "file entry: {out}");
+    }
+
+    #[test]
+    fn agent_picker_lists_named_agents_with_descriptions() {
+        let mut s = base_state();
+        s.agents = vec![crate::AgentInfo {
+            name: "reviewer".into(),
+            description: "code review".into(),
+        }];
+        s.open_agent_picker();
+        let out = render_to_string(&s, 100, 12);
+        assert!(out.contains("agents (#)"), "agent picker title: {out}");
+        assert!(out.contains("reviewer"), "agent name: {out}");
+        assert!(out.contains("code review"), "agent description: {out}");
     }
 
     #[test]

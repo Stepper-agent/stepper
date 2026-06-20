@@ -1,4 +1,4 @@
-use crate::tools::{bash, fetch, files, search, todo};
+use crate::tools::{apply_patch, bash, fetch, files, search, todo};
 use crate::Tool;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -22,6 +22,7 @@ impl ToolRegistry {
         r.register(Arc::new(files::ReadFile::default()));
         r.register(Arc::new(files::WriteFile::default()));
         r.register(Arc::new(files::EditFile::default()));
+        r.register(Arc::new(apply_patch::ApplyPatch::default()));
         r.register(Arc::new(bash::Bash::default()));
         r.register(Arc::new(search::Grep::default()));
         r.register(Arc::new(search::GlobTool::default()));

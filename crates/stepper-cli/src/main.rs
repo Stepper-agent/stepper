@@ -13,7 +13,7 @@ use stepper_protocol::{
 };
 use stepper_providers::codex::{oauth, CodexTokenStore};
 use stepper_providers::ProviderFactory;
-use stepper_tui::{run_tui, CommandInfo, TuiInit};
+use stepper_tui::{run_tui, AgentInfo, CommandInfo, TuiInit};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -396,6 +396,13 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         .then(|| provider_of(&model_ref).to_string());
     let (action_tx, action_rx) = tokio::sync::mpsc::channel(64);
     let cancel = CancellationToken::new();
+    // Snapshot the named sub-agents for the TUI's `#`-agent picker before
+    // `spawn_core` consumes the orchestrator.
+    let agents: Vec<AgentInfo> = orchestrator
+        .agents
+        .iter()
+        .map(|a| AgentInfo { name: a.name.clone(), description: a.description.clone() })
+        .collect();
     let event_rx = spawn_core(orchestrator, session, action_rx, cancel.clone());
     if let Some(provider) = key_prompt {
         let _ = action_tx
@@ -444,6 +451,7 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         mode: resolved_mode,
         cwd,
         commands,
+        agents,
         theme_preset,
         theme_colors,
         effort,

@@ -11,6 +11,7 @@ members = [
     "crates/stepper-tools",
     "crates/stepper-core",
     "crates/stepper-mcp",
+    "crates/stepper-lsp",
 ]
 
 [workspace.package]

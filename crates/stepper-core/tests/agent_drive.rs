@@ -6,13 +6,14 @@
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::path::Path;
 use stepper_config::HookEntry;
 use stepper_core::{AgentLoop, CoreError, HookHost, ModelRegistry};
 use stepper_permission::{Decision, PermissionMode, RuleSet};
 use stepper_provider::{
     ChatEvent, ChatRequest, ChatStream, LlmProvider, Message, ProviderError, StopReason,
 };
-use stepper_tools::{Approval, Approver, ToolCx, ToolRegistry};
+use stepper_tools::{Approval, Approver, Detect, Formatter, ToolCx, ToolRegistry};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -92,6 +93,8 @@ async fn finishes_turn_when_model_emits_no_tool_call() {
 
     let registry = ToolRegistry::builtins();
     let agent = AgentLoop {
+        formatters: Default::default(),
+        lsp: Default::default(),
         layer_name: "test".into(),
         provider: &provider,
         tools: &registry,
@@ -136,6 +139,8 @@ async fn terminates_at_step_cap_when_model_never_stops() {
 
     let registry = ToolRegistry::builtins();
     let agent = AgentLoop {
+        formatters: Default::default(),
+        lsp: Default::default(),
         layer_name: "looping".into(),
         provider: &provider,
         tools: &registry,
@@ -212,6 +217,8 @@ async fn blocking_pretooluse_hook_denies_the_tool() {
 
     let registry = ToolRegistry::builtins();
     let agent = AgentLoop {
+        formatters: Default::default(),
+        lsp: Default::default(),
         layer_name: "guarded".into(),
         provider: &provider,
         tools: &registry,
@@ -282,6 +289,8 @@ async fn posttooluse_hook_runs_after_the_tool_without_blocking_the_loop() {
 
     let registry = ToolRegistry::builtins();
     let agent = AgentLoop {
+        formatters: Default::default(),
+        lsp: Default::default(),
         layer_name: "post".into(),
         provider: &provider,
         tools: &registry,
@@ -341,6 +350,8 @@ async fn already_cancelled_token_returns_cancelled_before_any_step() {
 
     let registry = ToolRegistry::builtins();
     let agent = AgentLoop {
+        formatters: Default::default(),
+        lsp: Default::default(),
         layer_name: "cancelled".into(),
         provider: &provider,
         tools: &registry,
@@ -409,6 +420,8 @@ async fn pretooluse_matcher_is_exact_and_does_not_substring_match() {
 
     let registry = ToolRegistry::builtins();
     let agent = AgentLoop {
+        formatters: Default::default(),
+        lsp: Default::default(),
         layer_name: "guarded".into(),
         provider: &provider,
         tools: &registry,
@@ -488,6 +501,8 @@ fn agent<'a>(
     tx: mpsc::Sender<stepper_protocol::AppEvent>,
 ) -> AgentLoop<'a> {
     AgentLoop {
+        formatters: Default::default(),
+        lsp: Default::default(),
         layer_name: "retry".into(),
         provider,
         tools: registry,
@@ -642,6 +657,8 @@ async fn sampling_overrides_are_forwarded_to_the_provider_request() {
     let provider = TempRecordingProvider { seen: seen.clone() };
     let registry = ToolRegistry::builtins();
     let agent = AgentLoop {
+        formatters: Default::default(),
+        lsp: Default::default(),
         layer_name: "sampled".into(),
         provider: &provider,
         tools: &registry,
@@ -701,6 +718,8 @@ async fn max_tokens_comes_from_the_model_info_output_cap() {
     let mut model_info = ModelRegistry::builtin().lookup("anthropic", "claude-sonnet-4-6");
     assert_eq!(model_info.max_output_tokens, 64_000);
     let mut agent = AgentLoop {
+        formatters: Default::default(),
+        lsp: Default::default(),
         layer_name: "capped".into(),
         provider: &provider,
         tools: &registry,
@@ -729,4 +748,181 @@ async fn max_tokens_comes_from_the_model_info_output_cap() {
     agent.model_info = model_info;
     agent.drive("system".into(), vec![Message::user("hi again")]).await.unwrap();
     assert_eq!(seen.lock().unwrap().as_slice(), &[Some(64_000), None]);
+}
+
+#[tokio::test]
+async fn formats_a_file_after_a_write_tool_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = FakeProvider {
+        calls: Mutex::new(0),
+        scripts: vec![
+            // Turn 1: the model writes a file…
+            vec![
+                ChatEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "w".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({ "path": "x.demo", "content": "raw" }),
+                },
+                ChatEvent::Done(StopReason::ToolUse),
+            ],
+            // …then finishes.
+            vec![
+                ChatEvent::TextDelta("done".into()),
+                ChatEvent::Done(StopReason::EndTurn),
+            ],
+        ],
+        fallback: Vec::new(),
+    };
+
+    let registry = ToolRegistry::builtins();
+    // A custom formatter for `.demo` that rewrites the file to "formatted".
+    let formatters = Arc::new(vec![Formatter {
+        name: "demo".into(),
+        extensions: vec![".demo".into()],
+        environment: BTreeMap::new(),
+        detect: Detect::Command {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf formatted > \"$1\"".into(),
+                "sh".into(),
+                "$FILE".into(),
+            ],
+        },
+    }]);
+    let agent = AgentLoop {
+        formatters,
+        lsp: None,
+        layer_name: "fmt".into(),
+        provider: &provider,
+        tools: &registry,
+        cx: make_cx(dir.path()),
+        event_tx: spawn_drain(),
+        model_info: ModelRegistry::builtin().lookup("fake", "fake-model"),
+        step_cap: 5,
+        hooks: Arc::new(HookHost::empty(dir.path().to_path_buf())),
+        compaction_provider: None,
+        temperature: None,
+        top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
+        worker: None,
+    };
+
+    agent
+        .drive("system".into(), vec![Message::user("write it")])
+        .await
+        .unwrap();
+
+    // write_file wrote "raw"; format-on-edit then ran the matching formatter.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("x.demo")).unwrap(),
+        "formatted",
+        "the .demo formatter ran after write_file succeeded"
+    );
+}
+
+/// A fake diagnostics provider that always reports one error — proves the agent
+/// loop appends LSP output to a successful file-edit tool's result.
+struct FakeLsp;
+#[async_trait]
+impl stepper_core::LspDiagnostics for FakeLsp {
+    async fn diagnostics_after_edit(&self, _path: &Path) -> String {
+        "<diagnostics file=\"x.demo\">\nERROR [1:1] FAKE-DIAG\n</diagnostics>".into()
+    }
+}
+
+/// Records each request as JSON so the test can inspect what the model received.
+struct RecordingProvider {
+    calls: Mutex<usize>,
+    scripts: Vec<Vec<ChatEvent>>,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+#[async_trait]
+impl LlmProvider for RecordingProvider {
+    fn provider(&self) -> &str {
+        "fake"
+    }
+    fn model(&self) -> &str {
+        "fake-model"
+    }
+    async fn chat_stream(
+        &self,
+        request: ChatRequest,
+        _cancel: CancellationToken,
+    ) -> Result<ChatStream, ProviderError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(serde_json::to_string(&request).unwrap());
+        let index = {
+            let mut c = self.calls.lock().unwrap();
+            let i = *c;
+            *c += 1;
+            i
+        };
+        let script = self.scripts.get(index).cloned().unwrap_or_default();
+        Ok(Box::pin(futures::stream::iter(script.into_iter().map(Ok))))
+    }
+}
+
+#[tokio::test]
+async fn lsp_diagnostics_are_appended_to_an_edit_tool_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let provider = RecordingProvider {
+        calls: Mutex::new(0),
+        seen: seen.clone(),
+        scripts: vec![
+            vec![
+                ChatEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "w".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({ "path": "x.demo", "content": "code" }),
+                },
+                ChatEvent::Done(StopReason::ToolUse),
+            ],
+            vec![
+                ChatEvent::TextDelta("ok".into()),
+                ChatEvent::Done(StopReason::EndTurn),
+            ],
+        ],
+    };
+
+    let registry = ToolRegistry::builtins();
+    let agent = AgentLoop {
+        formatters: Default::default(),
+        lsp: Some(Arc::new(FakeLsp)),
+        layer_name: "diag".into(),
+        provider: &provider,
+        tools: &registry,
+        cx: make_cx(dir.path()),
+        event_tx: spawn_drain(),
+        model_info: ModelRegistry::builtin().lookup("fake", "fake-model"),
+        step_cap: 5,
+        hooks: Arc::new(HookHost::empty(dir.path().to_path_buf())),
+        compaction_provider: None,
+        temperature: None,
+        top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
+        worker: None,
+    };
+
+    agent
+        .drive("system".into(), vec![Message::user("edit it")])
+        .await
+        .unwrap();
+
+    // The 2nd request carries the tool result fed back to the model; the LSP
+    // diagnostics must be in it.
+    let requests = seen.lock().unwrap();
+    assert!(requests.len() >= 2, "a second request happened after the tool ran");
+    assert!(
+        requests[1].contains("FAKE-DIAG"),
+        "LSP diagnostics were appended to the tool result: {}",
+        requests[1]
+    );
 }

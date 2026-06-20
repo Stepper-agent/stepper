@@ -69,6 +69,83 @@ pub struct SettingsFile {
     /// palette; `colors` are per-role `name → color` overrides applied on top.
     #[serde(default)]
     pub theme: Option<ThemeConfig>,
+    /// Format-on-edit. Omitted/`false` = disabled (the default); `true` = enable
+    /// every built-in formatter; an object keeps built-ins on while adding
+    /// per-formatter overrides and custom formatters. Consumed by the
+    /// orchestrator, which runs the matching formatter after a file-editing tool.
+    #[serde(default)]
+    pub formatter: Option<FormatterConfig>,
+    /// LSP diagnostics on edit. Omitted/`false` = disabled (the default); `true` =
+    /// use every built-in language server **found on PATH**; an object keeps
+    /// built-ins on while adding per-server overrides and custom servers. Servers
+    /// are never downloaded — only installed ones are used.
+    #[serde(default)]
+    pub lsp: Option<LspConfig>,
+}
+
+/// `setting.json` `lsp`: a master on/off switch or a map of per-server overrides
+/// (built-ins detected on PATH stay enabled; an entry with a `command` +
+/// `extensions` for an unknown name defines a custom server).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum LspConfig {
+    /// `lsp: true` (all installed built-ins) / `lsp: false` (all off).
+    All(bool),
+    /// `lsp: { "<id>": { ... } }`.
+    Map(BTreeMap<String, LspServerEntry>),
+}
+
+/// A single language server's configuration (override of a built-in, or custom).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LspServerEntry {
+    /// Disable this server even though built-ins are on.
+    #[serde(default)]
+    pub disabled: bool,
+    /// argv to launch the server (program + args). Required for a custom server;
+    /// overrides the built-in command when set.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// File extensions this server handles (overrides the built-in list).
+    #[serde(default)]
+    pub extensions: Option<Vec<String>>,
+    /// Environment variables to set when launching the server.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// LSP `initializationOptions` passed in the `initialize` request.
+    #[serde(default)]
+    pub initialization: Option<Value>,
+}
+
+/// `setting.json` `formatter`: either a master on/off switch or a map of
+/// per-formatter overrides (built-ins stay enabled; an entry with a `command` +
+/// `extensions` for an unknown name defines a custom formatter).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum FormatterConfig {
+    /// `formatter: true` (all built-ins) / `formatter: false` (all off).
+    All(bool),
+    /// `formatter: { "<name>": { ... } }`.
+    Map(BTreeMap<String, FormatterEntry>),
+}
+
+/// A single formatter's configuration (override of a built-in, or a custom one).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FormatterEntry {
+    /// Disable this formatter even though built-ins are on.
+    #[serde(default)]
+    pub disabled: bool,
+    /// The command to run (argv with a `$FILE` placeholder). Required for a custom
+    /// formatter; overrides the built-in command when set.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// Environment variables to set when running the formatter.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    /// File extensions this formatter handles (overrides the built-in list).
+    #[serde(default)]
+    pub extensions: Option<Vec<String>>,
 }
 
 /// Opt-in OS-level sandbox for the `bash` tool. A best-effort defense-in-depth

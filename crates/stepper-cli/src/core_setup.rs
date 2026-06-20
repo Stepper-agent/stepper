@@ -1,16 +1,96 @@
 //! Assemble a real `Orchestrator` from config + the CLI's convention fallback
 //! (so a bare `cargo run --model anthropic/...` works without a `.stepper/`).
 
-use std::path::PathBuf;
+use async_trait::async_trait;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use stepper_config::{Config, LimitsConfig, Permissions, ProviderConfig};
+use stepper_config::{Config, LimitsConfig, LspConfig, Permissions, ProviderConfig};
 use stepper_core::{
-    build_steps, load_base_context, ConfigProviderResolver, HookHost, ModelRegistry, Orchestrator,
-    SessionLimits,
+    build_steps, load_base_context, ConfigProviderResolver, HookHost, LspDiagnostics, ModelRegistry,
+    Orchestrator, SessionLimits,
 };
+use stepper_lsp::{builtin_catalog, catalog::resolve_builtin, LspManager, ServerSpec};
 use stepper_mcp::McpManager;
 use stepper_permission::{PermissionMode, RuleSet};
 use stepper_providers::{CodexTokenStore, ProviderFactory};
+
+/// Bridges `stepper-lsp`'s manager to the `core` port so `core` stays decoupled
+/// from the LSP crate (only the CLI wires it).
+struct LspBridge(Arc<LspManager>);
+
+#[async_trait]
+impl LspDiagnostics for LspBridge {
+    async fn diagnostics_after_edit(&self, path: &Path) -> String {
+        self.0.diagnostics_after_edit(path).await
+    }
+}
+
+/// Resolve `settings.lsp` into the language servers to run. Omitted/`false` →
+/// none; `true` → every built-in **found on PATH**; a map keeps installed
+/// built-ins on while applying per-server overrides and adding custom servers
+/// (an unknown id with `command` + `extensions`). Servers are never downloaded.
+fn resolve_lsp_servers(cfg: Option<&LspConfig>) -> Vec<ServerSpec> {
+    use std::collections::BTreeMap;
+    match cfg {
+        None | Some(LspConfig::All(false)) => Vec::new(),
+        Some(LspConfig::All(true)) => builtin_catalog().iter().filter_map(resolve_builtin).collect(),
+        Some(LspConfig::Map(map)) => {
+            // Installed built-ins (minus disabled), keyed by id.
+            let mut by_id: BTreeMap<String, ServerSpec> = builtin_catalog()
+                .iter()
+                .filter(|b| !map.get(b.id).map(|e| e.disabled).unwrap_or(false))
+                .filter_map(|b| resolve_builtin(b).map(|s| (s.id.clone(), s)))
+                .collect();
+            for (id, entry) in map {
+                if entry.disabled {
+                    continue;
+                }
+                let env: Vec<(String, String)> =
+                    entry.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                match by_id.get_mut(id) {
+                    // Override an installed built-in in place.
+                    Some(s) => {
+                        if let Some(cmd) = &entry.command {
+                            s.command = cmd.clone();
+                        }
+                        if let Some(ext) = &entry.extensions {
+                            s.extensions = ext.clone();
+                        }
+                        if !env.is_empty() {
+                            s.env = env;
+                        }
+                        if entry.initialization.is_some() {
+                            s.initialization = entry.initialization.clone();
+                        }
+                    }
+                    // Custom server, or a built-in override whose default binary
+                    // isn't installed: needs a command, and extensions (falling
+                    // back to the built-in's list when the id is a known built-in).
+                    None => {
+                        let builtin = builtin_catalog().iter().find(|b| b.id == id.as_str());
+                        let extensions = entry.extensions.clone().or_else(|| {
+                            builtin.map(|b| b.extensions.iter().map(|s| s.to_string()).collect())
+                        });
+                        if let (Some(command), Some(extensions)) = (entry.command.clone(), extensions)
+                        {
+                            by_id.insert(
+                                id.clone(),
+                                ServerSpec {
+                                    id: id.clone(),
+                                    command,
+                                    extensions,
+                                    env,
+                                    initialization: entry.initialization.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            by_id.into_values().collect()
+        }
+    }
+}
 
 pub const DEFAULT_MODEL: &str = "ollama-cloud/qwen3-coder";
 
@@ -161,6 +241,24 @@ pub async fn build_orchestrator_with_fallback(
             roots
         });
 
+    // Format-on-edit: resolve `settings.formatter` into the active formatter set
+    // before `config` moves into the resolver. Empty = disabled (the default).
+    let formatters = Arc::new(stepper_core::resolve_formatters(
+        config.settings.formatter.as_ref(),
+    ));
+
+    // Named sub-agents (`.stepper/agents/`), exposed via the `task` tool. Read
+    // before `config` moves into the resolver.
+    let agents = Arc::new(stepper_core::load_agents(&config));
+
+    // LSP diagnostics: resolve `settings.lsp` into the installed/custom servers and
+    // build the session-scoped manager. `None` when no server is configured.
+    let lsp_servers = resolve_lsp_servers(config.settings.lsp.as_ref());
+    let lsp: Option<Arc<dyn LspDiagnostics>> = (!lsp_servers.is_empty()).then(|| {
+        let manager = Arc::new(LspManager::new(project_root.clone(), lsp_servers));
+        Arc::new(LspBridge(manager)) as Arc<dyn LspDiagnostics>
+    });
+
     let hooks = Arc::new(HookHost::new(config.settings.hooks.clone(), cwd.clone()));
 
     let resolver = Arc::new(ConfigProviderResolver::new(
@@ -191,6 +289,9 @@ pub async fn build_orchestrator_with_fallback(
         fallback_model: fallback_model.map(str::to_string),
         resume_seed: Vec::new(),
         sandbox_writable_roots,
+        formatters,
+        lsp,
+        agents,
     };
     Ok((orchestrator, mcp))
 }
@@ -289,6 +390,54 @@ fn convention_provider(name: &str) -> Option<ProviderConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stepper_config::LspServerEntry;
+
+    #[test]
+    fn lsp_omitted_or_false_runs_no_servers() {
+        assert!(resolve_lsp_servers(None).is_empty());
+        assert!(resolve_lsp_servers(Some(&LspConfig::All(false))).is_empty());
+    }
+
+    #[test]
+    fn lsp_map_adds_a_custom_server() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "my-lsp".to_string(),
+            LspServerEntry {
+                command: Some(vec!["my-lsp-server".into(), "--stdio".into()]),
+                extensions: Some(vec![".foo".into()]),
+                ..Default::default()
+            },
+        );
+        let servers = resolve_lsp_servers(Some(&LspConfig::Map(map)));
+        let custom = servers
+            .iter()
+            .find(|s| s.id == "my-lsp")
+            .expect("custom server present");
+        assert_eq!(custom.command, vec!["my-lsp-server", "--stdio"]);
+        assert_eq!(custom.extensions, vec![".foo".to_string()]);
+    }
+
+    #[test]
+    fn lsp_map_override_of_uninstalled_builtin_uses_builtin_extensions() {
+        // rust-analyzer likely isn't on PATH in CI; overriding its command makes
+        // it available and inherits the built-in's `.rs` extension.
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rust-analyzer".to_string(),
+            LspServerEntry {
+                command: Some(vec!["/custom/ra".into()]),
+                ..Default::default()
+            },
+        );
+        let servers = resolve_lsp_servers(Some(&LspConfig::Map(map)));
+        let ra = servers
+            .iter()
+            .find(|s| s.id == "rust-analyzer")
+            .expect("override present");
+        assert_eq!(ra.command, vec!["/custom/ra"]);
+        assert!(ra.extensions.iter().any(|e| e == ".rs"));
+    }
 
     #[test]
     fn convention_provider_does_not_route_unknown_names_to_openai() {

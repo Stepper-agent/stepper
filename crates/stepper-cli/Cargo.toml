@@ -19,11 +19,13 @@ stepper-config = { path = "../stepper-config" }
 stepper-permission = { path = "../stepper-permission" }
 stepper-tools = { path = "../stepper-tools" }
 stepper-mcp = { path = "../stepper-mcp" }
+stepper-lsp = { path = "../stepper-lsp" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-std"] }
 tokio-util = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 clap = { workspace = true }
 
 [dev-dependencies]

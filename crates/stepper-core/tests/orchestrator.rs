@@ -137,6 +137,9 @@ fn step(name: &str, model_ref: &str, cap: usize) -> StepDef {
 
 fn orchestrator(resolver: Arc<dyn ProviderResolver>, root: std::path::PathBuf) -> Orchestrator {
     Orchestrator {
+        agents: Default::default(),
+        formatters: Default::default(),
+        lsp: Default::default(),
         resolver,
         base_tools: ToolRegistry::builtins(),
         steps: vec![

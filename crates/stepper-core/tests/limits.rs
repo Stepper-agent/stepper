@@ -132,6 +132,9 @@ fn orchestrator(
     limits: SessionLimits,
 ) -> Orchestrator {
     Orchestrator {
+        agents: Default::default(),
+        formatters: Default::default(),
+        lsp: Default::default(),
         resolver,
         base_tools: ToolRegistry::builtins(),
         steps: vec![step(40)],

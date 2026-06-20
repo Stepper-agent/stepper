@@ -8,12 +8,14 @@
 //! depth-defense layer (macOS Seatbelt) that confines the `bash` tool's writes.
 
 pub mod context;
+pub mod format;
 pub mod registry;
 pub mod sandbox;
 pub mod secret;
 pub mod tools;
 
 pub use context::{Approval, Approver, ToolCx};
+pub use format::{builtin_formatters, format_file, Detect, Formatter};
 pub use registry::ToolRegistry;
 
 pub use stepper_provider::{ToolContent, ToolError, ToolResult, ToolSpec};

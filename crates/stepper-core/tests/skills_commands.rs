@@ -220,3 +220,38 @@ fn command_reading_outside_project_is_refused_even_in_plan_mode() {
     );
     assert!(out.is_none(), "outside-project read must be refused even in Plan mode: {out:?}");
 }
+
+#[test]
+fn load_agents_reads_named_agents_from_the_stepper_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join(".stepper/agents/reviewer/index.md"),
+        "---\ndescription: reviews code\nmodel: omlx/x\ntools:\n  allow: [read_file]\n---\nYou are the reviewer.\n",
+    );
+    write(
+        &root.join(".stepper/agents/explorer/index.md"),
+        "---\ndescription: explores\n---\nYou explore.\n",
+    );
+
+    let config = Config::load(root).unwrap();
+    let agents = stepper_core::load_agents(&config);
+    assert_eq!(agents.len(), 2, "both agents loaded");
+
+    let reviewer = agents.iter().find(|a| a.name == "reviewer").unwrap();
+    assert_eq!(reviewer.description, "reviews code");
+    assert_eq!(reviewer.model_ref.as_deref(), Some("omlx/x"));
+    assert_eq!(reviewer.tool_allow, vec!["read_file".to_string()]);
+    assert!(reviewer.role_prompt.contains("You are the reviewer"));
+
+    // No model frontmatter → inherits the default at run time (model_ref None).
+    let explorer = agents.iter().find(|a| a.name == "explorer").unwrap();
+    assert_eq!(explorer.model_ref, None);
+}
+
+#[test]
+fn load_agents_is_empty_without_an_agents_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::load(dir.path()).unwrap();
+    assert!(stepper_core::load_agents(&config).is_empty());
+}

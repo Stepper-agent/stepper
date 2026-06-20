@@ -9,7 +9,7 @@ use stepper_protocol::{
     ProviderChoiceView, SessionView, TodoItemView, UsageView, WorkerView,
 };
 
-use crate::{CommandInfo, TuiInit};
+use crate::{AgentInfo, CommandInfo, TuiInit};
 
 /// Side effects the event loop must execute after a state transition (state.rs
 /// itself stays IO-free and synchronous, so it's trivially unit-testable).
@@ -393,6 +393,56 @@ pub enum Selection {
     Insert(String),
 }
 
+/// `#`-triggered named-agent autocomplete picker. Unlike the file picker it does
+/// no IO — it filters a static list (the configured `.stepper/agents/`) by a
+/// substring query on the agent name; selecting an entry inserts `#name ` into
+/// the prompt (the `#agent` sub-agent trigger that core already routes).
+pub struct AgentPicker {
+    pub query: String,
+    items: Vec<AgentInfo>,
+    pub matches: Vec<usize>,
+    pub selected: usize,
+}
+
+impl AgentPicker {
+    fn new(agents: &[AgentInfo]) -> Self {
+        let items = agents.to_vec();
+        let matches = (0..items.len()).collect();
+        AgentPicker { query: String::new(), items, matches, selected: 0 }
+    }
+
+    fn move_sel(&mut self, delta: i32) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let n = self.matches.len() as i32;
+        self.selected = (((self.selected as i32 + delta) % n + n) % n) as usize;
+    }
+
+    fn refilter(&mut self) {
+        let needle = self.query.to_lowercase();
+        self.matches = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| needle.is_empty() || a.name.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect();
+        if self.selected >= self.matches.len() {
+            self.selected = 0;
+        }
+    }
+
+    fn current(&self) -> Option<&AgentInfo> {
+        self.matches.get(self.selected).map(|&i| &self.items[i])
+    }
+
+    /// The agent at filtered row `row`, for the renderer.
+    pub fn entry(&self, row: usize) -> Option<&AgentInfo> {
+        self.matches.get(row).map(|&i| &self.items[i])
+    }
+}
+
 /// Pure render state. No IO, no awaits — `apply_event` / `apply_action` mutate it
 /// and return `Effects` for the loop to run.
 pub struct AppState {
@@ -418,6 +468,10 @@ pub struct AppState {
     /// prompt racing an approval (e.g. the auto `/login` on launch) is never lost.
     pub pending_prompts: VecDeque<String>,
     pub picker: Option<FilePicker>,
+    /// Named sub-agents for the `#`-agent autocomplete picker (static, from init).
+    pub agents: Vec<AgentInfo>,
+    /// The open `#`-agent picker (IO-free; filters `agents`), if any.
+    pub agent_picker: Option<AgentPicker>,
     /// Background processes (`!cmd &`) shown in the shell view (Down key).
     pub processes: Vec<ProcView>,
     /// Images pasted (Ctrl+V) and staged for the next prompt — shown as an input
@@ -475,6 +529,8 @@ impl AppState {
             pending_approvals: VecDeque::new(),
             pending_prompts: VecDeque::new(),
             picker: None,
+            agents: init.agents,
+            agent_picker: None,
             processes: Vec::new(),
             pending_image_count: 0,
             queue: VecDeque::new(),
@@ -698,6 +754,73 @@ impl AppState {
         self.picker = None;
     }
 
+    // ── # named-agent picker (IO-free; filters the static `agents` list) ──
+
+    /// Whether typing `#` should open the agent picker now. The `#agent` route is
+    /// prefix-only — core matches it only when the *whole* prompt begins with
+    /// `#name` — so the picker arms only at the start of an empty prompt (a
+    /// `#name` inserted mid-prompt would silently never route). It also never
+    /// arms over an open overlay (e.g. an approval, whose keys it would steal),
+    /// and only when named agents exist (else a bare `#` stays a literal heading).
+    pub fn agent_trigger_armed(&self) -> bool {
+        self.input_text().is_empty() && self.overlay.is_none() && !self.agents.is_empty()
+    }
+
+    /// Open the `#`-agent autocomplete picker (no-op without configured agents,
+    /// so a bare `#` stays available for a markdown heading).
+    pub fn open_agent_picker(&mut self) {
+        if self.agents.is_empty() {
+            return;
+        }
+        self.agent_picker = Some(AgentPicker::new(&self.agents));
+    }
+
+    pub fn agent_picker_move(&mut self, delta: i32) {
+        if let Some(p) = &mut self.agent_picker {
+            p.move_sel(delta);
+        }
+    }
+
+    pub fn agent_picker_cancel(&mut self) {
+        self.agent_picker = None;
+    }
+
+    pub fn agent_picker_push(&mut self, c: char) {
+        if let Some(p) = &mut self.agent_picker {
+            p.query.push(c);
+            p.refilter();
+        }
+    }
+
+    /// Backspace in the `#`-agent picker: drop the last query char, or — when the
+    /// query is already empty — close the picker (Backspace past the `#` trigger
+    /// exits, mirroring the file picker).
+    pub fn agent_picker_backspace(&mut self) {
+        let Some(p) = &mut self.agent_picker else {
+            return;
+        };
+        if p.query.pop().is_some() {
+            p.refilter();
+            return;
+        }
+        // Empty query: Backspace past the `#` trigger closes the picker.
+        self.agent_picker = None;
+    }
+
+    /// Insert the highlighted agent as `#name ` into the prompt and close the
+    /// picker (an empty picker just closes).
+    pub fn agent_picker_select(&mut self) {
+        let name = self
+            .agent_picker
+            .as_ref()
+            .and_then(|p| p.current())
+            .map(|a| a.name.clone());
+        if let Some(name) = name {
+            self.textarea.insert_str(format!("#{name} "));
+        }
+        self.agent_picker = None;
+    }
+
     // ── builtin overlays (context / permissions / list picker) ──
 
     /// Whether the current overlay is one whose keys the event loop must route
@@ -872,12 +995,13 @@ impl AppState {
             AppEvent::DiffProposed { .. } => {}
             AppEvent::ApprovalRequested(req) => {
                 if self.overlay.is_none() {
-                    // The @-file picker lives in `self.picker` (not `self.overlay`)
-                    // and both draws over and captures keys away from an overlay —
-                    // so an approval arriving while it is open would be invisible
-                    // AND unanswerable (y/a/n types into the picker filter), hanging
-                    // the turn. Drop the transient picker so the approval surfaces.
+                    // The @-file and #-agent pickers live outside `self.overlay`
+                    // and both draw over and capture keys away from an overlay — so
+                    // an approval arriving while one is open would be invisible AND
+                    // unanswerable (y/a/n types into the picker filter), hanging the
+                    // turn. Drop the transient pickers so the approval surfaces.
                     self.picker = None;
+                    self.agent_picker = None;
                     self.overlay = Some(Overlay::Approval(req));
                 } else {
                     self.pending_approvals.push_back(req);
@@ -1002,6 +1126,11 @@ impl AppState {
                 // Never clobber a live overlay (esp. an approval's oneshot) and
                 // never drop the prompt — queue it if something is on screen.
                 if self.overlay.is_none() {
+                    // Drop the transient pickers first: like an approval, they draw
+                    // over and capture keys away from an overlay, so a key prompt
+                    // racing an open @/# picker would be invisible AND unanswerable.
+                    self.picker = None;
+                    self.agent_picker = None;
                     self.overlay =
                         Some(Overlay::ApiKey(ApiKeyOverlay { provider, input: String::new() }));
                 } else {
@@ -1238,10 +1367,95 @@ mod tests {
                 CommandInfo::named("rewind"),
                 CommandInfo::named("resume"),
             ],
+            agents: Vec::new(),
             theme_preset: None,
             theme_colors: Vec::new(),
             effort: None,
         })
+    }
+
+    fn state_with_agents() -> AppState {
+        let mut s = test_state();
+        s.agents = vec![
+            AgentInfo { name: "reviewer".into(), description: "code review".into() },
+            AgentInfo { name: "researcher".into(), description: "research".into() },
+            AgentInfo { name: "refactorer".into(), description: "refactor".into() },
+        ];
+        s
+    }
+
+    #[test]
+    fn agent_picker_opens_filters_and_inserts_hash_name() {
+        let mut s = state_with_agents();
+        s.open_agent_picker();
+        // An empty query matches every configured agent.
+        assert_eq!(s.agent_picker.as_ref().unwrap().matches.len(), 3);
+
+        // Typing narrows by a substring of the name: "res" → only "researcher".
+        for c in "res".chars() {
+            s.agent_picker_push(c);
+        }
+        assert_eq!(s.agent_picker.as_ref().unwrap().matches.len(), 1);
+
+        // Enter inserts `#researcher ` (the `#agent` trigger core routes) + closes.
+        s.agent_picker_select();
+        assert!(s.agent_picker.is_none());
+        assert_eq!(s.input_text(), "#researcher ");
+    }
+
+    #[test]
+    fn agent_picker_is_a_noop_without_configured_agents() {
+        let mut s = test_state(); // no named agents
+        s.open_agent_picker();
+        assert!(s.agent_picker.is_none(), "a bare # stays literal without agents");
+    }
+
+    #[test]
+    fn agent_picker_backspace_past_the_query_exits() {
+        let mut s = state_with_agents();
+        s.open_agent_picker();
+        s.agent_picker_push('x');
+        s.agent_picker_backspace(); // removes the 'x', the picker stays open
+        assert!(s.agent_picker.is_some(), "still open with an empty query");
+        s.agent_picker_backspace(); // empty query → Backspace closes it
+        assert!(s.agent_picker.is_none(), "Backspace past the trigger exits the picker");
+    }
+
+    #[test]
+    fn agent_trigger_arms_only_at_the_start_of_an_empty_prompt() {
+        let mut s = state_with_agents();
+        assert!(s.agent_trigger_armed(), "empty prompt + agents + no overlay arms");
+        // Mid-prompt: the #agent route is prefix-only, so a #name inserted here
+        // would never route — the picker must not arm.
+        s.textarea.insert_str("fix the bug ");
+        assert!(!s.agent_trigger_armed(), "a non-empty prompt disarms the trigger");
+        // No configured agents → a bare # stays a literal heading.
+        assert!(!test_state().agent_trigger_armed(), "no agents → no picker");
+    }
+
+    #[test]
+    fn agent_trigger_is_disarmed_over_an_open_overlay() {
+        use stepper_protocol::{ApprovalKind, ApprovalRequest};
+        use tokio::sync::oneshot;
+        use uuid::Uuid;
+        let mut s = state_with_agents();
+        let (reply, _rx) = oneshot::channel();
+        s.overlay = Some(Overlay::Approval(ApprovalRequest {
+            id: Uuid::new_v4(),
+            kind: ApprovalKind::Command { cmd: "ls".into(), outside_project: false },
+            reply,
+        }));
+        assert!(!s.agent_trigger_armed(), "# must not steal keys from a live overlay");
+    }
+
+    #[test]
+    fn api_key_prompt_closes_an_open_agent_picker_so_it_is_answerable() {
+        let mut s = state_with_agents();
+        s.open_agent_picker();
+        assert!(s.agent_picker.is_some());
+        s.apply_event(AppEvent::ApiKeyPrompt { provider: "anthropic".into() });
+        assert!(s.agent_picker.is_none(), "the picker is dropped");
+        assert!(matches!(s.overlay, Some(Overlay::ApiKey(_))), "the key prompt surfaces");
     }
 
     #[test]
@@ -1666,6 +1880,27 @@ mod tests {
             reply,
         }));
         assert!(matches!(s.overlay, Some(Overlay::Approval(_))));
+    }
+
+    #[test]
+    fn approval_closes_an_open_agent_picker_so_it_is_answerable() {
+        use stepper_protocol::{ApprovalKind, ApprovalRequest};
+        use tokio::sync::oneshot;
+        use uuid::Uuid;
+        // An approval can race an open #-agent picker (a queued prompt typed while
+        // a prior turn runs). The picker draws over and captures keys, so it must
+        // be dropped or the approval is invisible AND unanswerable (turn hang).
+        let mut s = state_with_agents();
+        s.open_agent_picker();
+        assert!(s.agent_picker.is_some());
+        let (reply, _rx) = oneshot::channel();
+        s.apply_event(AppEvent::ApprovalRequested(ApprovalRequest {
+            id: Uuid::new_v4(),
+            kind: ApprovalKind::Command { cmd: "ls".into(), outside_project: false },
+            reply,
+        }));
+        assert!(s.agent_picker.is_none(), "the picker is dropped");
+        assert!(matches!(s.overlay, Some(Overlay::Approval(_))), "the approval surfaces");
     }
 
     #[test]

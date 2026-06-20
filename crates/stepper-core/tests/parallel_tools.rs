@@ -133,6 +133,8 @@ fn agent<'a>(
     dir: &std::path::Path,
 ) -> AgentLoop<'a> {
     AgentLoop {
+        formatters: Default::default(),
+        lsp: Default::default(),
         layer_name: "test".into(),
         provider,
         tools: registry,

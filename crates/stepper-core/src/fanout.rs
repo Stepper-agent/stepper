@@ -1,11 +1,11 @@
-use crate::agent::{AgentLoop, LayerOutcome};
+use crate::agent::{AgentLoop, LayerOutcome, LspDiagnostics};
 use crate::error::CoreError;
 use crate::hooks::HookHost;
 use crate::model::ModelInfo;
 use std::sync::Arc;
 use stepper_provider::{LlmProvider, Message};
 use stepper_protocol::{AppEvent, EventTx, LayerStatus, ModelView};
-use stepper_tools::{ToolCx, ToolRegistry};
+use stepper_tools::{Formatter, ToolCx, ToolRegistry};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -25,6 +25,10 @@ pub struct FanoutTask {
     pub compaction_provider: Option<Arc<dyn LlmProvider>>,
     pub system: String,
     pub messages: Vec<Message>,
+    /// Format-on-edit formatters for this worker (shared from the orchestrator).
+    pub formatters: Arc<Vec<Formatter>>,
+    /// LSP diagnostics provider for this worker (shared from the orchestrator).
+    pub lsp: Option<Arc<dyn LspDiagnostics>>,
 }
 
 /// Hard ceiling on the number of workers a single fan-out (parallel layer or
@@ -109,6 +113,8 @@ pub async fn run_parallel(
                 reasoning_effort: None,
                 thinking_budget: None,
                 worker: Some(index),
+                formatters: task.formatters,
+                lsp: task.lsp,
             };
             let outcome = agent.drive(task.system, task.messages).await;
             let status = if outcome.is_ok() {

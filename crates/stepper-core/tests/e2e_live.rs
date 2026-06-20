@@ -146,6 +146,9 @@ async fn two_layer_pipeline_writes_a_file_and_rewinds() {
     ));
 
     let orch = Orchestrator {
+        agents: Default::default(),
+        formatters: Default::default(),
+        lsp: Default::default(),
         resolver,
         base_tools: ToolRegistry::builtins(),
         steps: vec![
@@ -269,6 +272,9 @@ fn ollama_orchestrator(
         None,
     ));
     Orchestrator {
+        agents: Default::default(),
+        formatters: Default::default(),
+        lsp: Default::default(),
         resolver,
         base_tools: ToolRegistry::builtins(),
         steps: vec![step(

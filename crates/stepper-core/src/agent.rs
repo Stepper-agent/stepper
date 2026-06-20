@@ -4,6 +4,8 @@ use crate::hooks::{HookDecision, HookHost};
 use crate::layer::SubTask;
 use crate::model::ModelInfo;
 use futures::StreamExt;
+use async_trait::async_trait;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use serde_json::Value;
 use stepper_protocol::{
@@ -13,7 +15,7 @@ use stepper_provider::{
     ChatEvent, ChatRequest, ChatResponse, ContentBlock, LlmProvider, Message, Role, StopReason,
     Usage,
 };
-use stepper_tools::{ToolCx, ToolRegistry};
+use stepper_tools::{format_file, Formatter, ToolCx, ToolRegistry};
 
 /// Per-call hard cap on raw tool output kept in the window.
 const TOOL_RESULT_CALL_CAP: usize = 16_384;
@@ -61,6 +63,22 @@ pub struct AgentLoop<'a> {
     /// in the worker panel) instead of the global stream, which would otherwise
     /// interleave N workers into one buffer.
     pub worker: Option<usize>,
+    /// Active format-on-edit formatters (resolved from `settings.formatter`).
+    /// Empty = disabled (the default). After a file-editing tool succeeds, the
+    /// matching formatter is run on each edited file. Shared across layers/workers.
+    pub formatters: Arc<Vec<Formatter>>,
+    /// Optional LSP diagnostics provider (`settings.lsp`). When set, the file(s) a
+    /// successful file-editing tool wrote are synced to the matching language
+    /// server and its errors are appended to the tool result. `None` = disabled.
+    pub lsp: Option<Arc<dyn LspDiagnostics>>,
+}
+
+/// Post-edit LSP diagnostics for a file (errors-only report; empty when clean).
+/// Implemented by the CLI over `stepper-lsp`'s manager; a trait keeps `core`
+/// decoupled from the LSP crate and lets tests inject a fake.
+#[async_trait]
+pub trait LspDiagnostics: Send + Sync {
+    async fn diagnostics_after_edit(&self, path: &Path) -> String;
 }
 
 impl AgentLoop<'_> {
@@ -474,6 +492,33 @@ impl AgentLoop<'_> {
         }
     }
 
+    /// The files a file-editing tool call will write, resolved to absolute paths
+    /// (for format-on-edit and LSP diagnostics). Empty for non-editing tools, or
+    /// when neither post-edit processor is active.
+    fn edited_paths(&self, name: &str, input: &Value) -> Vec<PathBuf> {
+        if self.formatters.is_empty() && self.lsp.is_none() {
+            return Vec::new();
+        }
+        match name {
+            "write_file" | "edit_file" => input
+                .get("path")
+                .and_then(Value::as_str)
+                .map(|p| vec![self.cx.resolve(p)])
+                .unwrap_or_default(),
+            "apply_patch" => input
+                .get("patch")
+                .and_then(Value::as_str)
+                .map(|patch| {
+                    stepper_tools::tools::apply_patch::patched_paths(patch)
+                        .iter()
+                        .map(|p| self.cx.resolve(p))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
     async fn run_tool(&self, id: &str, name: &str, input: Value) -> ContentBlock {
         self.emit_tool_started(id, name, &input).await;
 
@@ -498,12 +543,16 @@ impl AgentLoop<'_> {
             };
         }
 
+        // Capture which files this call edits before `input` moves into the tool,
+        // so format-on-edit can run on them once the call succeeds.
+        let edited = self.edited_paths(name, &input);
+
         let outcome = match self.tools.get(name) {
             Some(tool) => tool.call(input, &self.cx).await,
             None => Err(stepper_provider::ToolError::NotFound(name.to_string())),
         };
 
-        let (content, is_error) = match outcome {
+        let (mut content, is_error) = match outcome {
             Ok(result) => {
                 // The global todo panel is the main thread's; workers don't drive it.
                 if name == "todo_write" && self.worker.is_none() {
@@ -516,6 +565,31 @@ impl AgentLoop<'_> {
                 true,
             ),
         };
+
+        // Format-on-edit: run the matching formatter on each edited file (best
+        // effort) before LSP/PostToolUse, so they see the formatted content.
+        if !is_error && !self.formatters.is_empty() && !self.cx.cancel.is_cancelled() {
+            for path in &edited {
+                let _ = format_file(path, &self.cx.project_root, &self.formatters).await;
+            }
+        }
+
+        // LSP diagnostics: surface the errors the edit introduced (so the model can
+        // fix them) by appending them to the tool result.
+        if !is_error && !self.cx.cancel.is_cancelled()
+            && let Some(lsp) = &self.lsp
+        {
+            let mut reports = Vec::new();
+            for path in &edited {
+                let report = lsp.diagnostics_after_edit(path).await;
+                if !report.is_empty() {
+                    reports.push(report);
+                }
+            }
+            if !reports.is_empty() {
+                content.push(stepper_provider::ToolContent::text(reports.join("\n\n")));
+            }
+        }
 
         self.emit_tool_finished(id, !is_error).await;
 

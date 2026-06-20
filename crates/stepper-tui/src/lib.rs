@@ -29,6 +29,9 @@ pub struct TuiInit {
     pub cwd: PathBuf,
     /// Known slash commands (name + one-line description) for the `/` palette.
     pub commands: Vec<CommandInfo>,
+    /// Named sub-agents (`.stepper/agents/`) for the `#`-agent autocomplete picker.
+    /// Empty disables the picker (a literal `#` is typed instead).
+    pub agents: Vec<AgentInfo>,
     /// Color-theme preset name (`None` → `dark`) loaded from settings.
     pub theme_preset: Option<String>,
     /// Per-role color overrides (`name`, `color-string`) loaded from settings.
@@ -57,6 +60,14 @@ impl CommandInfo {
             argument_hint: None,
         }
     }
+}
+
+/// A named sub-agent shown in the `#`-agent autocomplete picker: its name (what
+/// `#name` selects) and a one-line description.
+#[derive(Clone, Debug)]
+pub struct AgentInfo {
+    pub name: String,
+    pub description: String,
 }
 
 /// Run the interactive inline-viewport TUI until the user quits or `cancel` fires.

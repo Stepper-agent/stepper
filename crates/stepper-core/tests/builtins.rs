@@ -4,9 +4,10 @@
 
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use stepper_core::{
-    spawn_core, CoreError, FailurePolicy, HookHost, ModelInfo, Orchestrator, ProviderResolver,
-    SessionRecord, SessionStore, StepDef, TurnRecord,
+    spawn_core, AgentDef, CoreError, FailurePolicy, HookHost, ModelInfo, Orchestrator,
+    ProviderResolver, SessionRecord, SessionStore, StepDef, TurnRecord,
 };
 use stepper_permission::{PermissionMode, RuleSet};
 use stepper_protocol::{Action, AppEvent, EventRx};
@@ -88,8 +89,15 @@ fn step() -> StepDef {
 }
 
 fn orchestrator(root: std::path::PathBuf) -> Orchestrator {
+    orchestrator_with(root, Arc::new(Resolver))
+}
+
+fn orchestrator_with(root: std::path::PathBuf, resolver: Arc<dyn ProviderResolver>) -> Orchestrator {
     Orchestrator {
-        resolver: Arc::new(Resolver),
+        agents: Default::default(),
+        formatters: Default::default(),
+        lsp: Default::default(),
+        resolver,
         base_tools: ToolRegistry::builtins(),
         steps: vec![step()],
         base_context: "ctx".into(),
@@ -848,4 +856,147 @@ async fn login_emits_an_api_key_prompt_for_the_named_provider() {
         }
     };
     assert_eq!(provider, "anthropic");
+}
+
+/// Records every resolved model ref; both `solo/m` and `solo/big` answer with a
+/// clean (Done-terminated) stream so command turns complete.
+struct RecordingResolver {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl ProviderResolver for RecordingResolver {
+    fn resolve(&self, model_ref: &str) -> Result<Box<dyn LlmProvider>, CoreError> {
+        self.seen.lock().unwrap().push(model_ref.to_string());
+        match model_ref {
+            "solo/m" | "solo/big" => Ok(Box::new(UsageProvider {
+                usage: Usage::default(),
+            })),
+            other => Err(CoreError::NoModel(other.to_string())),
+        }
+    }
+    fn model_info(&self, _model_ref: &str) -> ModelInfo {
+        ModelInfo {
+            context_window: 200_000,
+            max_output_tokens: 0,
+            input_per_mtok: 0.0,
+            output_per_mtok: 0.0,
+            cache_read_per_mtok: 0.0,
+            cache_write_per_mtok: 0.0,
+            estimated: false,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_file_overrides_a_same_named_builtin() {
+    let dir = tempfile::tempdir().unwrap();
+    let cmd = dir.path().join(".stepper/commands/help.md");
+    std::fs::create_dir_all(cmd.parent().unwrap()).unwrap();
+    std::fs::write(&cmd, "Custom help body.").unwrap();
+
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator(dir.path().to_path_buf()),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+
+    // The built-in `/help` emits a Notice and never starts a turn. With a
+    // same-named command file present, the custom command wins → a turn starts.
+    action_tx.send(slash("help", "")).await.unwrap();
+    let started = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Some(AppEvent::TurnStarted { .. }) => break true,
+                Some(_) => continue,
+                None => break false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        started,
+        "a `.stepper/commands/help.md` file must override the built-in /help and run a turn"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_model_overrides_the_primary_layer_then_restores() {
+    let dir = tempfile::tempdir().unwrap();
+    let cmd = dir.path().join(".stepper/commands/big.md");
+    std::fs::create_dir_all(cmd.parent().unwrap()).unwrap();
+    std::fs::write(&cmd, "---\nmodel: solo/big\n---\nUse the big model.").unwrap();
+
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let orch = orchestrator_with(
+        dir.path().to_path_buf(),
+        Arc::new(RecordingResolver { seen: seen.clone() }),
+    );
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(orch, SessionRecord::fresh(), action_rx, CancellationToken::new());
+
+    // /big → its `model: solo/big` frontmatter overrides the primary layer (the
+    // formerly-dead key is now consumed).
+    action_tx.send(slash("big", "")).await.unwrap();
+    wait_turn_complete(&mut events).await;
+    assert!(
+        seen.lock().unwrap().iter().any(|m| m == "solo/big"),
+        "the command's model: was applied to the turn: {:?}",
+        seen.lock().unwrap()
+    );
+
+    // The override is transient: after the command turn the primary layer is back
+    // to solo/m, so a plain turn never resolves solo/big.
+    seen.lock().unwrap().clear();
+    action_tx.send(Action::SubmitInput("hi".into())).await.unwrap();
+    wait_turn_complete(&mut events).await;
+    let after = seen.lock().unwrap().clone();
+    assert!(!after.is_empty(), "the plain turn resolved a model: {after:?}");
+    assert!(
+        after.iter().all(|m| m == "solo/m"),
+        "the primary model was restored after the command turn (no solo/big leak): {after:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hash_agent_trigger_routes_the_turn_to_a_named_agent_then_restores() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut orch = orchestrator_with(
+        dir.path().to_path_buf(),
+        Arc::new(RecordingResolver { seen: seen.clone() }),
+    );
+    orch.agents = Arc::new(vec![AgentDef {
+        name: "big".into(),
+        description: "uses the big model".into(),
+        model_ref: Some("solo/big".into()),
+        tool_allow: Vec::new(),
+        tool_deny: Vec::new(),
+        role_prompt: "You are the big agent.".into(),
+    }]);
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(orch, SessionRecord::fresh(), action_rx, CancellationToken::new());
+
+    // `#big do it` → routes this turn to the named agent (its model solo/big).
+    action_tx.send(Action::SubmitInput("#big do it".into())).await.unwrap();
+    wait_turn_complete(&mut events).await;
+    assert!(
+        seen.lock().unwrap().iter().any(|m| m == "solo/big"),
+        "the #big agent ran with its own model: {:?}",
+        seen.lock().unwrap()
+    );
+
+    // A plain turn afterwards uses the restored primary model (solo/m), proving the
+    // pipeline swap was transient. `#unknown` and `# heading` would also be normal.
+    seen.lock().unwrap().clear();
+    action_tx.send(Action::SubmitInput("just a normal turn".into())).await.unwrap();
+    wait_turn_complete(&mut events).await;
+    let after = seen.lock().unwrap().clone();
+    assert!(!after.is_empty(), "the plain turn resolved a model: {after:?}");
+    assert!(
+        after.iter().all(|m| m == "solo/m"),
+        "pipeline restored after #agent (no solo/big leak): {after:?}"
+    );
 }

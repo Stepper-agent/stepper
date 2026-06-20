@@ -1,4 +1,4 @@
-use crate::agent::AgentLoop;
+use crate::agent::{AgentLoop, LspDiagnostics};
 use crate::error::CoreError;
 use crate::fanout::{run_parallel, FanoutTask};
 use crate::hooks::HookHost;
@@ -13,7 +13,7 @@ use std::sync::{Arc, RwLock};
 use stepper_permission::{PermissionMode, RuleSet};
 use stepper_provider::{ChatRequest, ChatStream, ContentBlock, LlmProvider, Message, ProviderError};
 use stepper_protocol::{AppEvent, EventTx, LayerStatus, ModelView};
-use stepper_tools::{Approver, ToolCx, ToolRegistry};
+use stepper_tools::{Approver, Formatter, ToolCx, ToolRegistry};
 use tokio_util::sync::CancellationToken;
 
 /// Session-wide safety caps (`--max-turns`, `--max-budget-usd`, `--turn-timeout`,
@@ -226,6 +226,15 @@ pub struct Orchestrator {
     /// or `None` when disabled. Threaded into every layer/worker `ToolCx` so the
     /// `bash` tool can confine writes to the project + `additionalDirectories`.
     pub sandbox_writable_roots: Option<Vec<PathBuf>>,
+    /// Active format-on-edit formatters (`settings.formatter`), shared into every
+    /// layer/worker `AgentLoop`. Empty = disabled (the default).
+    pub formatters: Arc<Vec<Formatter>>,
+    /// Optional LSP diagnostics provider (`settings.lsp`), shared into every
+    /// layer/worker. `None` = disabled (the default).
+    pub lsp: Option<Arc<dyn LspDiagnostics>>,
+    /// Named sub-agents (`.stepper/agents/`), exposed via the `task` tool. Empty =
+    /// no `task` tool registered (the default).
+    pub agents: Arc<Vec<crate::layer::AgentDef>>,
 }
 
 /// What one user turn produced: each layer's free-text outcome (the handoff
@@ -415,7 +424,11 @@ impl Orchestrator {
             // Dispatched sub-agents inherit THIS layer's rules + scoped tool view
             // (taken before `dispatch` is registered, so no recursion) — they can
             // never escalate past the calling layer's permission/tool restrictions.
-            if self.dispatch_enabled {
+            // The `dispatch` tool (parallel generic sub-agents) and the `task` tool
+            // (named sub-agents) share one dispatcher, built from THIS layer's
+            // rules + scoped tool view (taken before either is registered, so no
+            // recursion) — sub-agents can never escalate past the calling layer.
+            if self.dispatch_enabled || !self.agents.is_empty() {
                 let dispatcher = Arc::new(crate::dispatch::OrchestratorDispatcher {
                     resolver: self.resolver.clone(),
                     base_tools: tools.clone(),
@@ -441,8 +454,18 @@ impl Orchestrator {
                     // project context so they aren't blind to the repo.
                     budget: budget.clone(),
                     base_context: self.base_context.clone(),
+                    formatters: self.formatters.clone(),
+                    lsp: self.lsp.clone(),
                 });
-                tools.register(Arc::new(crate::dispatch::DispatchTool::new(dispatcher)));
+                if self.dispatch_enabled {
+                    tools.register(Arc::new(crate::dispatch::DispatchTool::new(dispatcher.clone())));
+                }
+                if !self.agents.is_empty() {
+                    tools.register(Arc::new(crate::dispatch::TaskTool::new(
+                        self.agents.clone(),
+                        dispatcher,
+                    )));
+                }
             }
             // If the next layer is a parallel fan-out, this layer plans it.
             if self.steps.get(index + 1).is_some_and(|s| s.parallel) {
@@ -496,6 +519,8 @@ impl Orchestrator {
                     reasoning_effort: step.reasoning_effort.clone(),
                     thinking_budget: step.thinking_budget,
                     worker: None,
+                    formatters: self.formatters.clone(),
+                    lsp: self.lsp.clone(),
                 };
                 match agent.drive(system.clone(), initial.clone()).await {
                     Ok(outcome) => {
@@ -589,6 +614,8 @@ impl Orchestrator {
                             reasoning_effort: step.reasoning_effort.clone(),
                             thinking_budget: step.thinking_budget,
                             worker: None,
+                            formatters: self.formatters.clone(),
+                            lsp: self.lsp.clone(),
                         };
                         match agent.drive(system.clone(), initial.clone()).await {
                             Ok(outcome) => {
@@ -749,6 +776,8 @@ impl Orchestrator {
                         compaction_provider: compaction_provider.clone(),
                         system: system.clone(),
                         messages: handoff.worker_messages(&sub.prompt),
+                        formatters: self.formatters.clone(),
+                        lsp: self.lsp.clone(),
                     });
                 }
                 Err(e) => sections.push((

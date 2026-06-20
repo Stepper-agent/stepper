@@ -1432,3 +1432,132 @@ async fn bash_benign_paths_still_run() {
     assert!(out.content_text().contains("fn main"));
     assert!(!out.is_error);
 }
+
+#[tokio::test]
+async fn apply_patch_adds_updates_and_deletes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("update.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    std::fs::write(dir.path().join("gone.txt"), "obsolete\n").unwrap();
+    let reg = ToolRegistry::builtins();
+    let cx = cx_with(dir.path(), PermissionMode::Auto, Arc::new(AllowAll));
+
+    // Built line-by-line so leading-space context lines survive.
+    let patch = [
+        "*** Begin Patch",
+        "*** Add File: new.txt",
+        "+fresh content",
+        "*** Update File: update.txt",
+        "@@",
+        " alpha",
+        "-beta",
+        "+BETA",
+        " gamma",
+        "*** Delete File: gone.txt",
+        "*** End Patch",
+    ]
+    .join("\n");
+
+    let out = reg
+        .get("apply_patch")
+        .unwrap()
+        .call(json!({ "patch": patch }), &cx)
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content_text());
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+        "fresh content\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("update.txt")).unwrap(),
+        "alpha\nBETA\ngamma\n"
+    );
+    assert!(!dir.path().join("gone.txt").exists(), "delete removed the file");
+}
+
+#[tokio::test]
+async fn apply_patch_renames_with_move_to() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("old.rs"), "fn a() {}\n").unwrap();
+    let reg = ToolRegistry::builtins();
+    let cx = cx_with(dir.path(), PermissionMode::Auto, Arc::new(AllowAll));
+
+    let patch = [
+        "*** Begin Patch",
+        "*** Update File: old.rs",
+        "*** Move to: new.rs",
+        "@@",
+        "-fn a() {}",
+        "+fn b() {}",
+        "*** End Patch",
+    ]
+    .join("\n");
+
+    reg.get("apply_patch")
+        .unwrap()
+        .call(json!({ "patch": patch }), &cx)
+        .await
+        .unwrap();
+    assert!(!dir.path().join("old.rs").exists(), "original removed");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("new.rs")).unwrap(),
+        "fn b() {}\n"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_refuses_secret_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = ToolRegistry::builtins();
+    let cx = cx_with(dir.path(), PermissionMode::Auto, Arc::new(AllowAll));
+
+    let patch = [
+        "*** Begin Patch",
+        "*** Add File: .env",
+        "+SECRET=1",
+        "*** End Patch",
+    ]
+    .join("\n");
+
+    let err = reg
+        .get("apply_patch")
+        .unwrap()
+        .call(json!({ "patch": patch }), &cx)
+        .await
+        .unwrap_err();
+    match err {
+        ToolError::Denied(msg) => assert!(msg.contains("secret"), "got {msg}"),
+        other => panic!("expected secret refusal, got {other:?}"),
+    }
+    assert!(!dir.path().join(".env").exists(), "nothing written on refusal");
+}
+
+#[tokio::test]
+async fn apply_patch_writes_nothing_when_a_change_is_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = ToolRegistry::builtins();
+    // Default mode → writes ask; DenyAll refuses, so the patch is gated out
+    // before phase 3 ever writes.
+    let cx = cx_with(dir.path(), PermissionMode::Default, Arc::new(DenyAll));
+
+    let patch = [
+        "*** Begin Patch",
+        "*** Add File: created.txt",
+        "+nope",
+        "*** End Patch",
+    ]
+    .join("\n");
+
+    let err = reg
+        .get("apply_patch")
+        .unwrap()
+        .call(json!({ "patch": patch }), &cx)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ToolError::Denied(_)), "got {err:?}");
+    assert!(
+        !dir.path().join("created.txt").exists(),
+        "a denied patch writes nothing"
+    );
+}

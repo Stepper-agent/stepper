@@ -155,6 +155,7 @@ mod tests {
             mode: Mode::Auto,
             cwd: PathBuf::from("/tmp"),
             commands: vec![crate::CommandInfo::named("review"), crate::CommandInfo::named("rewind")],
+            agents: Vec::new(),
             theme_preset: None,
             theme_colors: Vec::new(),
             effort: None,

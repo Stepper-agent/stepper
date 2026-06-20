@@ -130,6 +130,9 @@ fn step() -> StepDef {
 
 fn make_orch(resolver: Arc<dyn ProviderResolver>, root: std::path::PathBuf, mode: PermissionMode) -> Orchestrator {
     Orchestrator {
+        agents: Default::default(),
+        formatters: Default::default(),
+        lsp: Default::default(),
         resolver,
         base_tools: ToolRegistry::builtins(),
         steps: vec![step()],

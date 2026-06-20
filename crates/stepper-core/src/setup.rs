@@ -1,5 +1,7 @@
 use crate::layer::{FailurePolicy, StepDef};
-use stepper_config::{parse_layer, parse_skill, Config};
+use std::collections::BTreeMap;
+use stepper_config::{parse_layer, parse_skill, Config, FormatterConfig};
+use stepper_tools::{builtin_formatters, Detect, Formatter};
 
 /// Per-layer ReAct step backstop for the implicit `default` layer. Set high so it
 /// never interrupts legitimate long tasks — the user-facing runaway guard is the
@@ -104,6 +106,63 @@ pub fn effort_controls(level: &str) -> (Option<String>, Option<u32>) {
         "high" => (Some("high".into()), Some(16_384)),
         // "off"/unknown → no reasoning override, no thinking budget.
         _ => (None, None),
+    }
+}
+
+/// Resolve `settings.formatter` into the active formatter set for format-on-edit.
+/// Omitted / `false` → none (the default); `true` → every built-in; a map keeps
+/// built-ins on while applying per-formatter overrides (`disabled`/`command`/
+/// `extensions`/`environment`) and adding custom formatters (a `command` +
+/// `extensions` under an unknown name). Mirrors opencode's `format` resolution.
+pub fn resolve_formatters(cfg: Option<&FormatterConfig>) -> Vec<Formatter> {
+    match cfg {
+        None | Some(FormatterConfig::All(false)) => Vec::new(),
+        Some(FormatterConfig::All(true)) => builtin_formatters(),
+        Some(FormatterConfig::Map(map)) => {
+            let mut by_name: BTreeMap<String, Formatter> = builtin_formatters()
+                .into_iter()
+                .map(|f| (f.name.clone(), f))
+                .collect();
+            for (name, entry) in map {
+                if entry.disabled {
+                    by_name.remove(name);
+                    continue;
+                }
+                match by_name.get_mut(name) {
+                    // Override a built-in in place.
+                    Some(f) => {
+                        if let Some(exts) = &entry.extensions {
+                            f.extensions = exts.clone();
+                        }
+                        for (k, v) in &entry.environment {
+                            f.environment.insert(k.clone(), v.clone());
+                        }
+                        if let Some(cmd) = &entry.command {
+                            f.detect = Detect::Command {
+                                command: cmd.clone(),
+                            };
+                        }
+                    }
+                    // A custom formatter needs both a command and extensions.
+                    None => {
+                        if let (Some(cmd), Some(exts)) = (&entry.command, &entry.extensions) {
+                            by_name.insert(
+                                name.clone(),
+                                Formatter {
+                                    name: name.clone(),
+                                    extensions: exts.clone(),
+                                    environment: entry.environment.clone(),
+                                    detect: Detect::Command {
+                                        command: cmd.clone(),
+                                    },
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            by_name.into_values().collect()
+        }
     }
 }
 
@@ -226,6 +285,77 @@ fn build_step(config: &Config, name: &str, default_model: &str) -> StepDef {
             skills: Vec::new(),
         },
     }
+}
+
+/// Compile a named agent into a one-shot [`StepDef`] for the `#<agent>` prompt
+/// trigger (run as the turn's sole layer). Uses the agent's model/tools/role; the
+/// caller restores the original pipeline afterwards.
+pub fn agent_step(agent: &crate::layer::AgentDef, default_model: &str) -> StepDef {
+    StepDef {
+        name: agent.name.clone(),
+        model_ref: agent
+            .model_ref
+            .clone()
+            .unwrap_or_else(|| default_model.to_string()),
+        system_prompt: agent.role_prompt.clone(),
+        tool_allow: agent.tool_allow.clone(),
+        tool_deny: agent.tool_deny.clone(),
+        mcp_allow: Vec::new(),
+        step_cap: DEFAULT_STEP_CAP,
+        color: None,
+        on_failure: FailurePolicy::Stop,
+        retries: 0,
+        temperature: None,
+        top_p: None,
+        reasoning_effort: None,
+        thinking_budget: None,
+        permission: Vec::new(),
+        parallel: false,
+        parallel_max: DEFAULT_PARALLEL_MAX,
+        skills: Vec::new(),
+    }
+}
+
+/// Load named sub-agents from `.stepper/agents/<name>/index.md` (project first,
+/// then `~/.stepper/agents/`; project wins). Each is parsed with the same layer
+/// frontmatter as `step` layers. Returns them sorted by name.
+pub fn load_agents(config: &Config) -> Vec<crate::layer::AgentDef> {
+    use std::collections::BTreeMap;
+    let mut by_name: BTreeMap<String, crate::layer::AgentDef> = BTreeMap::new();
+    for dir in [config.project_dir.as_ref(), config.user_dir.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let Ok(entries) = std::fs::read_dir(dir.join("agents")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !is_safe_component(&name) || by_name.contains_key(&name) {
+                continue;
+            }
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let path = entry.path().join("index.md");
+            if let Ok(content) = std::fs::read_to_string(&path)
+                && let Ok(layer) = parse_layer(&name, &content)
+            {
+                by_name.insert(
+                    name.clone(),
+                    crate::layer::AgentDef {
+                        description: layer.frontmatter.description.clone().unwrap_or_default(),
+                        model_ref: layer_model_ref(&layer),
+                        tool_allow: layer.frontmatter.tools.allow.clone(),
+                        tool_deny: layer.frontmatter.tools.deny.clone(),
+                        role_prompt: layer.system_prompt.clone(),
+                        name,
+                    },
+                );
+            }
+        }
+    }
+    by_name.into_values().collect()
 }
 
 fn layer_model_ref(layer: &stepper_config::LayerDef) -> Option<String> {

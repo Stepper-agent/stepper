@@ -42,6 +42,8 @@ impl Approver for AllowAll {
 
 fn task(dir: &std::path::Path, label: &str, say: &str) -> FanoutTask {
     FanoutTask {
+        formatters: Default::default(),
+        lsp: Default::default(),
         label: label.into(),
         worker_index: 0,
         provider: Box::new(SayProvider(say.into())),
@@ -127,6 +129,8 @@ fn gated_task(
     peak: Arc<AtomicUsize>,
 ) -> FanoutTask {
     FanoutTask {
+        formatters: Default::default(),
+        lsp: Default::default(),
         label: label.into(),
         worker_index: 0,
         provider: Box::new(GatedProvider { in_flight, peak }),
@@ -218,6 +222,8 @@ impl LlmProvider for PanicProvider {
 
 fn task_with(dir: &std::path::Path, label: &str, provider: Box<dyn LlmProvider>) -> FanoutTask {
     FanoutTask {
+        formatters: Default::default(),
+        lsp: Default::default(),
         label: label.into(),
         worker_index: 0,
         provider,

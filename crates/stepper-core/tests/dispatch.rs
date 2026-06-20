@@ -171,6 +171,8 @@ fn orchestrator_dispatcher(
     event_tx: mpsc::Sender<stepper_protocol::AppEvent>,
 ) -> OrchestratorDispatcher {
     OrchestratorDispatcher {
+        formatters: Default::default(),
+        lsp: Default::default(),
         resolver: Arc::new(EchoResolver),
         base_tools: ToolRegistry::builtins(),
         hooks: Arc::new(HookHost::empty(dir.to_path_buf())),
@@ -205,11 +207,13 @@ async fn orchestrator_dispatcher_runs_subagents() {
                 label: "one".into(),
                 prompt: "p1".into(),
                 model_ref: None,
+                ..Default::default()
             },
             DispatchRequest {
                 label: "two".into(),
                 prompt: "p2".into(),
                 model_ref: None,
+                ..Default::default()
             },
         ])
         .await;
@@ -234,11 +238,13 @@ async fn orchestrator_dispatcher_reports_unresolvable_models_as_failures() {
                 label: "ok".into(),
                 prompt: "p".into(),
                 model_ref: None,
+                ..Default::default()
             },
             DispatchRequest {
                 label: "bad".into(),
                 prompt: "p".into(),
                 model_ref: Some("bad/model".into()),
+                ..Default::default()
             },
         ])
         .await;
@@ -459,6 +465,9 @@ async fn dispatched_subagents_cannot_use_a_tool_the_calling_layer_denied() {
     };
 
     let orch = Orchestrator {
+        agents: Default::default(),
+        formatters: Default::default(),
+        lsp: Default::default(),
         resolver: Arc::new(ProbeResolver { calls: Arc::new(AtomicUsize::new(0)) }),
         base_tools: base,
         steps: vec![main],
@@ -503,6 +512,9 @@ async fn enabling_dispatch_lets_the_model_fan_out_subagents() {
         sub_ran: sub_ran.clone(),
     });
     let orch = Orchestrator {
+        agents: Default::default(),
+        formatters: Default::default(),
+        lsp: Default::default(),
         resolver,
         base_tools: ToolRegistry::builtins(),
         steps: vec![StepDef {
@@ -557,4 +569,115 @@ async fn enabling_dispatch_lets_the_model_fan_out_subagents() {
         1,
         "the dispatched sub-agent must have actually run"
     );
+}
+
+// ---- P0-5: the `task` tool (named sub-agents) ----
+
+fn cx_with(dir: &std::path::Path, mode: PermissionMode, approver: Arc<dyn Approver>, rules: RuleSet) -> ToolCx {
+    ToolCx {
+        cwd: dir.to_path_buf(),
+        project_root: dir.to_path_buf(),
+        home: None,
+        mode,
+        live_mode: None,
+        rules: Arc::new(rules),
+        approver,
+        cancel: CancellationToken::new(),
+        sandbox_writable_roots: None,
+    }
+}
+
+struct DenyAll;
+#[async_trait]
+impl Approver for DenyAll {
+    async fn request(&self, _a: Approval) -> Decision {
+        Decision::Deny
+    }
+}
+
+fn agent(name: &str, model: Option<&str>) -> stepper_core::AgentDef {
+    stepper_core::AgentDef {
+        name: name.into(),
+        description: "a test agent".into(),
+        model_ref: model.map(str::to_string),
+        tool_allow: Vec::new(),
+        tool_deny: Vec::new(),
+        role_prompt: format!("You are {name}."),
+    }
+}
+
+#[tokio::test]
+async fn task_tool_delegates_to_the_named_agent_with_its_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let tool = stepper_core::TaskTool::new(
+        Arc::new(vec![agent("reviewer", Some("solo/big"))]),
+        Arc::new(RecordingDispatcher { seen: seen.clone() }),
+    );
+    let result = tool
+        .call(
+            serde_json::json!({ "subagent_type": "reviewer", "prompt": "review X" }),
+            &cx(dir.path()),
+        )
+        .await
+        .unwrap();
+    let reqs = seen.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].prompt, "review X");
+    assert_eq!(reqs[0].model_ref.as_deref(), Some("solo/big"));
+    assert_eq!(reqs[0].role.as_deref(), Some("You are reviewer."));
+    assert!(!result.is_error);
+}
+
+#[tokio::test]
+async fn task_tool_rejects_an_unknown_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool = stepper_core::TaskTool::new(
+        Arc::new(vec![agent("reviewer", None)]),
+        Arc::new(RecordingDispatcher { seen: Arc::new(Mutex::new(Vec::new())) }),
+    );
+    let err = tool
+        .call(serde_json::json!({ "subagent_type": "nope", "prompt": "x" }), &cx(dir.path()))
+        .await
+        .unwrap_err();
+    match err {
+        stepper_tools::ToolError::InvalidArgs(msg) => assert!(msg.contains("reviewer"), "lists available: {msg}"),
+        other => panic!("expected InvalidArgs, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn task_tool_is_denied_when_permission_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let tool = stepper_core::TaskTool::new(
+        Arc::new(vec![agent("reviewer", None)]),
+        Arc::new(RecordingDispatcher { seen: seen.clone() }),
+    );
+    // Default mode → Task asks; DenyAll refuses, so the agent never dispatches.
+    let cx = cx_with(dir.path(), PermissionMode::Default, Arc::new(DenyAll), RuleSet::default());
+    let err = tool
+        .call(serde_json::json!({ "subagent_type": "reviewer", "prompt": "x" }), &cx)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, stepper_tools::ToolError::Denied(_)), "got {err:?}");
+    assert!(seen.lock().unwrap().is_empty(), "a denied task never dispatches");
+}
+
+#[tokio::test]
+async fn task_tool_allowed_by_a_task_rule_even_when_mode_would_ask() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let tool = stepper_core::TaskTool::new(
+        Arc::new(vec![agent("reviewer", None)]),
+        Arc::new(RecordingDispatcher { seen: seen.clone() }),
+    );
+    // An explicit `Task(reviewer)` allow rule lets it run in Default mode without
+    // asking; DenyAll would refuse an Ask, so reaching dispatch proves the allow.
+    let rules = RuleSet::from_lists(&["Task(reviewer)".into()], &[], &[]);
+    let cx = cx_with(dir.path(), PermissionMode::Default, Arc::new(DenyAll), rules);
+    tool.call(serde_json::json!({ "subagent_type": "reviewer", "prompt": "x" }), &cx)
+        .await
+        .unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 1, "the allow rule let the task dispatch");
 }

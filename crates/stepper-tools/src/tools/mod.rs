@@ -1,5 +1,6 @@
 //! The built-in tool implementations.
 
+pub mod apply_patch;
 pub mod bash;
 pub mod fetch;
 pub mod files;

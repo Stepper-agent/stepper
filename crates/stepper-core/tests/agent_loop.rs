@@ -102,6 +102,8 @@ async fn react_loop_runs_a_tool_then_finishes() {
         sandbox_writable_roots: None,
     };
     let agent = AgentLoop {
+        formatters: Default::default(),
+        lsp: Default::default(),
         layer_name: "test".into(),
         provider: &provider,
         tools: &registry,
