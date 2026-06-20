@@ -32,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Cmd { name }) => scaffold_command_cmd(&name, cli.global),
         Some(Command::ScaffoldLayer) => scaffold_pipeline_cmd(cli.global),
         Some(Command::Import(args)) => import_cmd(args),
+        Some(Command::Session(args)) => session_cmd(args, cli.global),
     }
 }
 
@@ -385,6 +386,7 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         global.resume.as_deref(),
         global.continue_session,
         global.name.as_deref(),
+        global.fork,
     );
     // The orchestrator's mode is the resolved one (flag > setting.json > default).
     let resolved_mode = perm_to_mode(*orchestrator.mode.read().unwrap());
@@ -485,6 +487,7 @@ async fn oneshot(
         global.resume.as_deref(),
         global.continue_session,
         global.name.as_deref(),
+        global.fork,
     );
     let (action_tx, action_rx) = tokio::sync::mpsc::channel(64);
     let cancel = CancellationToken::new();
@@ -595,9 +598,10 @@ fn resume_or_fresh(
     resume: Option<&str>,
     continue_latest: bool,
     name: Option<&str>,
+    fork: bool,
 ) -> SessionRecord {
     let store = SessionStore::new(project_root);
-    let mut session = match (resume, continue_latest) {
+    let resumed = match (resume, continue_latest) {
         (Some(id), _) => store.load(id).unwrap_or_else(|| {
             eprintln!("no session '{id}' found — starting fresh");
             SessionRecord::fresh()
@@ -608,10 +612,73 @@ fn resume_or_fresh(
         }),
         (None, false) => SessionRecord::fresh(),
     };
+    // `--fork`: branch the resumed session under a fresh id so the original is
+    // left untouched. A no-op when there is nothing to fork (a fresh session).
+    let mut session = if fork && !resumed.turns.is_empty() {
+        resumed.forked()
+    } else {
+        resumed
+    };
     if let Some(name) = name {
         session.name = Some(name.to_string());
     }
     session
+}
+
+/// `stepper session list|delete` — manage this project's saved sessions
+/// (`.stepper/sessions/`), the non-interactive counterpart of the `/resume`
+/// picker.
+fn session_cmd(args: cli::SessionArgs, global: GlobalArgs) -> anyhow::Result<()> {
+    let cwd = global.cwd.clone().map(Ok).unwrap_or_else(std::env::current_dir)?;
+    let store = SessionStore::new(&cwd);
+    match args.cmd {
+        cli::SessionCmd::List { limit, json } => {
+            let recent = store.list_recent(limit.unwrap_or(usize::MAX));
+            let now = std::time::SystemTime::now();
+            if json {
+                let items: Vec<_> = recent
+                    .iter()
+                    .map(|(r, modified)| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "name": r.name,
+                            "turns": r.turns.len(),
+                            "ageSecs": now.duration_since(*modified).map(|d| d.as_secs()).unwrap_or(0),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else if recent.is_empty() {
+                println!("(no saved sessions)");
+            } else {
+                for (record, modified) in &recent {
+                    let label = record.name.clone().unwrap_or_else(|| {
+                        record
+                            .turns
+                            .first()
+                            .and_then(|t| t.user.lines().next())
+                            .unwrap_or("(empty)")
+                            .to_string()
+                    });
+                    println!(
+                        "{}  {} turn(s)  {}  {}",
+                        record.id,
+                        record.turns.len(),
+                        stepper_core::age_label(now, *modified),
+                        label
+                    );
+                }
+            }
+        }
+        cli::SessionCmd::Delete { id } => {
+            if store.delete(&id)? {
+                println!("deleted session {id}");
+            } else {
+                anyhow::bail!("no session '{id}' found");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The provider segment of a `provider/model-id` ref (or the whole string).

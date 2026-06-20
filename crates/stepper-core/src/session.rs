@@ -34,6 +34,17 @@ impl SessionRecord {
         }
     }
 
+    /// A branch of this session under a fresh id, with its turns preserved — for
+    /// `--fork`, which continues a resumed session without touching the original.
+    /// The name (if any) gets a `(fork)` marker so the two stay distinguishable.
+    pub fn forked(&self) -> Self {
+        SessionRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: self.name.as_ref().map(|n| format!("{n} (fork)")),
+            turns: self.turns.clone(),
+        }
+    }
+
     /// Whether any turn carries a real message transcript. Old-format files
     /// (digest only) return false and resume falls back to `resume_context`.
     pub fn has_messages(&self) -> bool {
@@ -135,6 +146,16 @@ impl SessionStore {
         sessions.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
         sessions.truncate(limit);
         sessions
+    }
+
+    /// Delete a session file. Returns whether it existed — a missing file is not
+    /// an error so `session delete <id>` can report "not found" itself.
+    pub fn delete(&self, id: &str) -> Result<bool, CoreError> {
+        match std::fs::remove_file(self.path(id)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(CoreError::Session(e.to_string())),
+        }
     }
 
     pub fn save(&self, record: &SessionRecord) -> Result<(), CoreError> {
@@ -264,6 +285,34 @@ mod tests {
         // Flip the mtimes: "older" becomes the most recent.
         set_mtime(&sessions.join("older.json"), now + std::time::Duration::from_secs(60));
         assert_eq!(store.latest().unwrap().id, "older");
+    }
+
+    #[test]
+    fn delete_removes_a_session_and_reports_existence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let rec = SessionRecord { id: "gone".into(), name: None, turns: vec![] };
+        store.save(&rec).unwrap();
+        assert!(store.load("gone").is_some());
+        assert!(store.delete("gone").unwrap(), "an existing file → true");
+        assert!(store.load("gone").is_none(), "the file is removed");
+        assert!(!store.delete("gone").unwrap(), "a missing file → false (not an error)");
+    }
+
+    #[test]
+    fn forked_copies_turns_under_a_fresh_id_and_marks_the_name() {
+        let original = SessionRecord {
+            id: "orig".into(),
+            name: Some("spike".into()),
+            turns: vec![TurnRecord { user: "do a thing".into(), summaries: vec![], messages: vec![] }],
+        };
+        let fork = original.forked();
+        assert_ne!(fork.id, original.id, "the fork gets a fresh id");
+        assert_eq!(fork.name.as_deref(), Some("spike (fork)"));
+        assert_eq!(fork.turns.len(), 1, "turns are preserved");
+        assert_eq!(original.id, "orig", "the original is untouched");
+        // A nameless session forks to a nameless fork.
+        assert_eq!(SessionRecord::fresh().forked().name, None);
     }
 
     fn set_mtime(path: &std::path::Path, to: std::time::SystemTime) {

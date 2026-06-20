@@ -953,7 +953,9 @@ async fn handle_resume(store: &SessionStore, tx: &EventTx) {
     let _ = tx.send(AppEvent::SessionList(sessions)).await;
 }
 
-fn age_label(now: std::time::SystemTime, modified: std::time::SystemTime) -> String {
+/// A short human age (`just now` / `3m ago` / `2h ago` / `5d ago`) for a session
+/// modified time — shared by the `/resume` picker and the `session list` CLI.
+pub fn age_label(now: std::time::SystemTime, modified: std::time::SystemTime) -> String {
     let secs = now
         .duration_since(modified)
         .map(|d| d.as_secs())

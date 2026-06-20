@@ -40,6 +40,10 @@ pub struct GlobalArgs {
     /// Name this session (stored on the record, shown by session pickers).
     #[arg(long, global = true)]
     pub name: Option<String>,
+    /// Fork the resumed/continued session: continue under a new id, leaving the
+    /// original untouched (no effect without `--resume`/`--continue`).
+    #[arg(long, global = true)]
+    pub fork: bool,
     /// Project working directory (defaults to the current dir).
     #[arg(long, global = true)]
     pub cwd: Option<PathBuf>,
@@ -97,6 +101,31 @@ pub enum Command {
     /// Gemini) into `~/.stepper/`. Shows the plan then asks before writing;
     /// `--dry-run` previews only, `--yes` skips the prompt.
     Import(ImportArgs),
+    /// Manage saved sessions: `stepper session list` / `session delete <id>`.
+    Session(SessionArgs),
+}
+
+#[derive(Args)]
+pub struct SessionArgs {
+    #[command(subcommand)]
+    pub cmd: SessionCmd,
+}
+
+#[derive(Subcommand)]
+pub enum SessionCmd {
+    /// List saved sessions for this project, newest first.
+    List {
+        /// Show only the N most recent (default: all).
+        #[arg(short = 'n', long)]
+        limit: Option<usize>,
+        /// Emit JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a saved session by id (see `session list`).
+    Delete {
+        id: String,
+    },
 }
 
 #[derive(Args)]
@@ -247,6 +276,29 @@ mod tests {
     fn name_flag_parses() {
         let cli = Cli::try_parse_from(["stepper", "--name", "spike"]).unwrap();
         assert_eq!(cli.global.name.as_deref(), Some("spike"));
+    }
+
+    #[test]
+    fn session_subcommands_parse() {
+        let cli = Cli::try_parse_from(["stepper", "session", "list"]).unwrap();
+        let Some(Command::Session(args)) = cli.command else { panic!("expected session command") };
+        assert!(matches!(args.cmd, SessionCmd::List { limit: None, json: false }));
+
+        let cli = Cli::try_parse_from(["stepper", "session", "list", "-n", "5", "--json"]).unwrap();
+        let Some(Command::Session(args)) = cli.command else { panic!("expected session command") };
+        assert!(matches!(args.cmd, SessionCmd::List { limit: Some(5), json: true }));
+
+        let cli = Cli::try_parse_from(["stepper", "session", "delete", "abc"]).unwrap();
+        let Some(Command::Session(args)) = cli.command else { panic!("expected session command") };
+        assert!(matches!(args.cmd, SessionCmd::Delete { id } if id == "abc"));
+    }
+
+    #[test]
+    fn fork_flag_parses_and_defaults_off() {
+        let cli = Cli::try_parse_from(["stepper", "--resume", "abc", "--fork"]).unwrap();
+        assert!(cli.global.fork);
+        assert_eq!(cli.global.resume.as_deref(), Some("abc"));
+        assert!(!Cli::try_parse_from(["stepper"]).unwrap().global.fork);
     }
 
     #[test]

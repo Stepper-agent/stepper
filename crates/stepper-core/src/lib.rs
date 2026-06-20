@@ -26,6 +26,7 @@ pub mod tasks;
 
 pub use agent::{AgentLoop, LayerOutcome, LspDiagnostics};
 pub use approver::ChannelApprover;
+pub use builtins::age_label;
 pub use builtins::names as builtin_command_names;
 pub use builtins::descriptions as builtin_command_descriptions;
 pub use checkpoint::Snapshotter;
