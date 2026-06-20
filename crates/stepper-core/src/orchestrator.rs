@@ -253,7 +253,33 @@ impl Orchestrator {
         *self.mode.read().unwrap()
     }
 
+    /// One user turn: SessionStart hook → the layer pipeline → Stop hook. The Stop
+    /// hook is guaranteed to fire on EVERY exit path (success, error, cancel) to
+    /// mirror SessionStart — a teardown/cleanup/lock-release hook must not be
+    /// skipped when a turn errors or is interrupted.
     pub async fn run_turn(
+        &self,
+        user_turn: String,
+        images: Vec<(String, String)>,
+        event_tx: &EventTx,
+        approver: Arc<dyn Approver>,
+        cancel: CancellationToken,
+    ) -> Result<TurnOutput, CoreError> {
+        let outcome = self
+            .run_turn_inner(user_turn, images, event_tx, approver, cancel)
+            .await;
+        // Mirror SessionStart on every exit. Use a FRESH token (the turn's may
+        // already be cancelled, which would make the hook itself bail immediately)
+        // so a cleanup Stop hook still runs after an interrupted turn — bounded by
+        // its own 30s timeout.
+        let _ = self
+            .hooks
+            .run("Stop", None, &serde_json::json!({}), &CancellationToken::new())
+            .await;
+        outcome
+    }
+
+    async fn run_turn_inner(
         &self,
         user_turn: String,
         images: Vec<(String, String)>,
@@ -637,7 +663,7 @@ impl Orchestrator {
             }
         }
 
-        let _ = self.hooks.run("Stop", None, &serde_json::json!({}), &cancel).await;
+        // Stop runs in the `run_turn` wrapper so it fires on every exit path.
         Ok(TurnOutput {
             summaries: handoff.prior,
             messages: turn_messages,

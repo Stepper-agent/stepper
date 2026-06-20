@@ -39,11 +39,17 @@ const MODE_MENU: &[(&str, &str)] = &[
     ("default", "ask before edits and commands"),
 ];
 
-/// Offer first-run setup only when there is no project config, the user has not
-/// opted out, and stdin is an interactive terminal (so a piped or headless run
-/// never blocks on a prompt).
-pub(crate) fn should_offer(project_exists: bool, no_init: bool, is_tty: bool) -> bool {
-    !project_exists && !no_init && is_tty
+/// Offer first-run setup only when there is no project config AND no usable user
+/// (`~/.stepper`) config, the user has not opted out, and stdin is an interactive
+/// terminal (so a piped or headless run never blocks on a prompt). An already-
+/// configured user is not re-prompted to scaffold a project in every new folder.
+pub(crate) fn should_offer(
+    project_exists: bool,
+    user_configured: bool,
+    no_init: bool,
+    is_tty: bool,
+) -> bool {
+    !project_exists && !user_configured && !no_init && is_tty
 }
 
 /// Resolve a model prompt answer to a concrete `provider/model-id`: a 1-based
@@ -149,8 +155,10 @@ pub(crate) fn resolve_mode_choice(input: &str) -> &'static str {
 /// config was written (so the caller can use it for this session), else `None`
 /// (config present, opted out, non-TTY, or the user skipped).
 pub(crate) async fn maybe_first_run(cwd: &Path, no_init: bool) -> anyhow::Result<Option<String>> {
-    let project_exists = stepper_config::discover(cwd).project_dir.is_some();
-    if !should_offer(project_exists, no_init, std::io::stdin().is_terminal()) {
+    let discovery = stepper_config::discover(cwd);
+    let project_exists = discovery.project_dir.is_some();
+    let user_configured = discovery.user_dir.is_some();
+    if !should_offer(project_exists, user_configured, no_init, std::io::stdin().is_terminal()) {
         return Ok(None);
     }
 
@@ -255,10 +263,11 @@ mod tests {
 
     #[test]
     fn offer_only_when_interactive_unconfigured_and_opted_in() {
-        assert!(should_offer(false, false, true));
-        assert!(!should_offer(true, false, true)); // config already exists
-        assert!(!should_offer(false, true, true)); // --no-init
-        assert!(!should_offer(false, false, false)); // piped / headless
+        assert!(should_offer(false, false, false, true)); // nothing configured → offer
+        assert!(!should_offer(true, false, false, true)); // project config exists
+        assert!(!should_offer(false, true, false, true)); // user ~/.stepper configured
+        assert!(!should_offer(false, false, true, true)); // --no-init
+        assert!(!should_offer(false, false, false, false)); // piped / headless
     }
 
     #[test]
