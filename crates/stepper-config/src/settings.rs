@@ -81,6 +81,12 @@ pub struct SettingsFile {
     /// are never downloaded — only installed ones are used.
     #[serde(default)]
     pub lsp: Option<LspConfig>,
+    /// Terminal-bell notifications. Omitted/`false` = silent (the default); `true`
+    /// rings the bell when a turn completes, an approval is awaited, or a turn
+    /// errors; an object sets each trigger independently. Delivery is a portable
+    /// terminal bell (`\x07`) emitted by the TUI — no OS notifications or sounds.
+    #[serde(default)]
+    pub notification: Option<NotificationConfig>,
 }
 
 /// `setting.json` `lsp`: a master on/off switch or a map of per-server overrides
@@ -146,6 +152,56 @@ pub struct FormatterEntry {
     /// File extensions this formatter handles (overrides the built-in list).
     #[serde(default)]
     pub extensions: Option<Vec<String>>,
+}
+
+/// `setting.json` `notification`: a master on/off switch or per-trigger flags for
+/// the terminal bell. Mirrors the `formatter`/`lsp` untagged shape.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum NotificationConfig {
+    /// `notification: true` (bell on every trigger) / `false` (silent).
+    All(bool),
+    /// `notification: { onComplete, onApproval, onError }`.
+    Detailed(NotificationDetail),
+}
+
+/// Per-trigger bell flags. A present object defaults each trigger to on (so
+/// `notification: {}` rings on all three); `enabled: false` silences everything.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationDetail {
+    /// Master switch for the object form (default on). `enabled: false` = silent.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Ring when a turn finishes.
+    #[serde(default)]
+    pub on_complete: Option<bool>,
+    /// Ring when an approval prompt appears.
+    #[serde(default)]
+    pub on_approval: Option<bool>,
+    /// Ring when a turn errors.
+    #[serde(default)]
+    pub on_error: Option<bool>,
+}
+
+impl NotificationConfig {
+    /// `(on_complete, on_approval, on_error)`. An absent config (`None`) maps to
+    /// all-false at the call site — silence is the default.
+    pub fn resolve(&self) -> (bool, bool, bool) {
+        match self {
+            NotificationConfig::All(on) => (*on, *on, *on),
+            NotificationConfig::Detailed(detail) => {
+                if detail.enabled == Some(false) {
+                    return (false, false, false);
+                }
+                (
+                    detail.on_complete.unwrap_or(true),
+                    detail.on_approval.unwrap_or(true),
+                    detail.on_error.unwrap_or(true),
+                )
+            }
+        }
+    }
 }
 
 /// Opt-in OS-level sandbox for the `bash` tool. A best-effort defense-in-depth
@@ -323,6 +379,39 @@ pub struct McpServerConfig {
     /// `STEPPER_MCP_CONNECT_TIMEOUT_MS` / 10s default).
     #[serde(default)]
     pub timeout: Option<u64>,
+    /// OAuth for a remote (http) server. Present = use stored creds if any (run
+    /// `stepper mcp auth <name>` to obtain them); `oauth.disabled = true` opts out.
+    /// Tokens live in `~/.stepper/mcp-auth.json` (0600), never in this file.
+    #[serde(default)]
+    pub oauth: Option<McpOAuthConfig>,
+}
+
+/// Per-server MCP OAuth. Omit `clientId` to use RFC 7591 Dynamic Client
+/// Registration; supply it (and optionally `clientSecret`) for a pre-registered
+/// client. `scope` defaults to what the server advertises. Tokens and any DCR
+/// registration are persisted to the keyless `~/.stepper/mcp-auth.json` store —
+/// never here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpOAuthConfig {
+    /// Pre-registered OAuth client id (omitted → Dynamic Client Registration).
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Confidential-client secret (public PKCE client when omitted).
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Requested scopes (empty → the server's advertised default).
+    #[serde(default)]
+    pub scope: Vec<String>,
+    /// Local redirect-listener port (default 33418, +1 fallback).
+    #[serde(default)]
+    pub callback_port: Option<u16>,
+    /// Full redirect URI override (otherwise `http://127.0.0.1:<port>/callback`).
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+    /// Opt out of OAuth for this server even though it is http.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -373,6 +462,55 @@ mod tests {
         let d = s.dispatch.unwrap();
         assert_eq!(d.concurrency, None);
         assert_eq!(d.step_cap, None);
+    }
+
+    #[test]
+    fn notification_config_resolves_each_form() {
+        // Absent = silent.
+        assert!(serde_json::from_str::<SettingsFile>("{}").unwrap().notification.is_none());
+        // Bare bool: true rings everything, false silences everything.
+        let on: SettingsFile = serde_json::from_str(r#"{"notification":true}"#).unwrap();
+        assert_eq!(on.notification.unwrap().resolve(), (true, true, true));
+        let off: SettingsFile = serde_json::from_str(r#"{"notification":false}"#).unwrap();
+        assert_eq!(off.notification.unwrap().resolve(), (false, false, false));
+        // Empty object opts in to all three.
+        let empty: SettingsFile = serde_json::from_str(r#"{"notification":{}}"#).unwrap();
+        assert_eq!(empty.notification.unwrap().resolve(), (true, true, true));
+        // Per-trigger: silence the noisy turn-complete, keep approval+error.
+        let detail: SettingsFile =
+            serde_json::from_str(r#"{"notification":{"onComplete":false}}"#).unwrap();
+        assert_eq!(detail.notification.unwrap().resolve(), (false, true, true));
+        // `enabled: false` overrides the per-trigger flags.
+        let disabled: SettingsFile =
+            serde_json::from_str(r#"{"notification":{"enabled":false,"onError":true}}"#).unwrap();
+        assert_eq!(disabled.notification.unwrap().resolve(), (false, false, false));
+    }
+
+    #[test]
+    fn mcp_oauth_config_parses_full_empty_and_disabled() {
+        // Auto-detect default: oauth present, empty (DCR + advertised scopes).
+        let auto: SettingsFile =
+            serde_json::from_str(r#"{"mcpServers":{"s":{"type":"http","url":"https://x","oauth":{}}}}"#)
+                .unwrap();
+        let o = auto.mcp_servers.get("s").unwrap().oauth.clone().unwrap();
+        assert!(o.client_id.is_none() && o.scope.is_empty() && !o.disabled);
+        // Full pre-registered confidential client with explicit scopes + port.
+        let full: SettingsFile = serde_json::from_str(
+            r#"{"mcpServers":{"s":{"oauth":{"clientId":"abc","clientSecret":"sh","scope":["read","write"],"callbackPort":40000}}}}"#,
+        )
+        .unwrap();
+        let o = full.mcp_servers.get("s").unwrap().oauth.clone().unwrap();
+        assert_eq!(o.client_id.as_deref(), Some("abc"));
+        assert_eq!(o.client_secret.as_deref(), Some("sh"));
+        assert_eq!(o.scope, vec!["read".to_string(), "write".to_string()]);
+        assert_eq!(o.callback_port, Some(40000));
+        // Opt out.
+        let off: SettingsFile =
+            serde_json::from_str(r#"{"mcpServers":{"s":{"oauth":{"disabled":true}}}}"#).unwrap();
+        assert!(off.mcp_servers.get("s").unwrap().oauth.as_ref().unwrap().disabled);
+        // Absent oauth = None.
+        let none: SettingsFile = serde_json::from_str(r#"{"mcpServers":{"s":{"type":"http"}}}"#).unwrap();
+        assert!(none.mcp_servers.get("s").unwrap().oauth.is_none());
     }
 
     #[test]

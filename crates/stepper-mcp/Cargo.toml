@@ -19,7 +19,11 @@ async-trait = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "process", "io-util", "time", "sync"] }
 tokio-util = { workspace = true }
 reqwest = { workspace = true }
-rmcp = { workspace = true, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rmcp = { workspace = true, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth"] }
+tracing = { workspace = true }
+tiny_http = { workspace = true }
+open = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time", "io-util"] }

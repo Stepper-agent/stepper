@@ -39,6 +39,12 @@ pub struct TuiInit {
     /// Session reasoning-effort level loaded from settings (`None` = off), shown
     /// in the status footer.
     pub effort: Option<String>,
+    /// Ring the terminal bell when a turn completes (`notification` setting).
+    pub notify_on_complete: bool,
+    /// Ring the terminal bell when an approval prompt is surfaced.
+    pub notify_on_approval: bool,
+    /// Ring the terminal bell when a turn errors.
+    pub notify_on_error: bool,
 }
 
 /// A slash command shown in the `/` palette: its name, a one-line description,

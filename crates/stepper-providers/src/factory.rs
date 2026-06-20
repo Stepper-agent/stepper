@@ -77,7 +77,7 @@ impl ProviderFactory {
         // before sending response headers, on a non-2xx body, or mid-stream. That
         // stall was otherwise unbounded (the SSE idle timeout in `sse::drive` only
         // runs once frames are flowing) and hung the whole turn with no way out.
-        let client = reqwest::Client::builder()
+        let client = apply_extra_ca(reqwest::Client::builder())
             .user_agent(concat!("stepper/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(30))
             .read_timeout(Duration::from_secs(120))
@@ -85,7 +85,7 @@ impl ProviderFactory {
             .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .map_err(error::transport)?;
-        let auth_client = reqwest::Client::builder()
+        let auth_client = apply_extra_ca(reqwest::Client::builder())
             .user_agent(concat!("stepper/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(30))
             .timeout(crate::codex::auth_http_timeout())
@@ -188,6 +188,46 @@ impl ProviderFactory {
     }
 }
 
+/// Merge a private CA bundle (pointed at by `STEPPER_EXTRA_CA_CERTS`, falling back
+/// to `NODE_EXTRA_CA_CERTS` for opencode/Node parity) into the platform trust
+/// store, so corporate-proxy / self-signed TLS endpoints validate. The certs are
+/// ADDITIVE — system roots still apply. Fail-open: an unset var, unreadable file,
+/// or unparsable bundle leaves the builder untouched (system trust only). Proxy
+/// support needs no code here: reqwest already honors `HTTP(S)_PROXY`/`NO_PROXY`.
+pub(crate) fn apply_extra_ca(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let Some(path) =
+        std::env::var_os("STEPPER_EXTRA_CA_CERTS").or_else(|| std::env::var_os("NODE_EXTRA_CA_CERTS"))
+    else {
+        return builder;
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!("extra CA certificates: cannot read {path:?}: {err}");
+            return builder;
+        }
+    };
+    let certs = match reqwest::Certificate::from_pem_bundle(&bytes) {
+        Ok(certs) => certs,
+        Err(err) => {
+            tracing::warn!("extra CA certificates: cannot parse {path:?}: {err}");
+            return builder;
+        }
+    };
+    // rustls-platform-verifier can merge EXTRA roots only on these targets; on any
+    // other target a non-empty root set makes `.build()` error, so stay on system
+    // trust there — keeping the fail-open total (a valid cert never aborts startup).
+    #[cfg(any(all(unix, not(target_os = "android")), target_os = "windows"))]
+    {
+        builder.tls_certs_merge(certs)
+    }
+    #[cfg(not(any(all(unix, not(target_os = "android")), target_os = "windows")))]
+    {
+        let _ = certs;
+        builder
+    }
+}
+
 /// Known commercial OpenAI-compatible hosts that require an API key, so a keyless
 /// build fails closed instead of sending an unauthorized request. Self-hosted and
 /// localhost servers (oMLX, vLLM, a local Ollama) are intentionally excluded and
@@ -200,6 +240,9 @@ fn requires_api_key(base_url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn requires_api_key_for_commercial_hosts_only() {
@@ -212,6 +255,9 @@ mod tests {
 
     #[test]
     fn openai_compat_fails_closed_without_a_key_for_commercial_host() {
+        // `ProviderFactory::new()` reads the extra-CA env vars (via apply_extra_ca);
+        // share ENV_LOCK with the CA tests so their `set_var` never races this read.
+        let _guard = ENV_LOCK.lock().unwrap();
         let factory = ProviderFactory::new().unwrap();
         let spec = ProviderSpec::new(ProviderKind::OpenAiCompat, "ollama-cloud", "qwen3-coder")
             .with_base_url("https://ollama.com/v1")
@@ -224,10 +270,95 @@ mod tests {
 
     #[test]
     fn openai_compat_stays_keyless_for_localhost() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let factory = ProviderFactory::new().unwrap();
         let spec = ProviderSpec::new(ProviderKind::OpenAiCompat, "omlx", "deepseek")
             .with_base_url("http://localhost:8000/v1")
             .with_api_key("none");
         assert!(factory.build(spec).is_ok(), "local servers stay keyless");
+    }
+
+    const TEST_CA_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----\n\
+MIIDFTCCAf2gAwIBAgIUMSUV9547Jfma6vu7vYDogv9TiOMwDQYJKoZIhvcNAQEL\n\
+BQAwGjEYMBYGA1UEAwwPc3RlcHBlci10ZXN0LWNhMB4XDTI2MDYyMDA5MzY0MFoX\n\
+DTM2MDYxNzA5MzY0MFowGjEYMBYGA1UEAwwPc3RlcHBlci10ZXN0LWNhMIIBIjAN\n\
+BgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqierzTtp4J+rxZUJ3iXGUn+SlEez\n\
+3z7QkfQ3h8QAC/PJ7MFvnirRxe3ePI8dWKyiroJhiQM70oCLGzqJHbj/l/fBQc8g\n\
+wBc12Auz9m8GmoV9OH5p60Qyiz39q/XeMwspuVffPK4xSI4DExrpikIBAH51nIEq\n\
+EyzvtsLnRuPwzjanl6ki5BlWsqaSdTOwZr5q60acnUYhw/mEQvSqxar89Rk8RGxs\n\
+VZ6+DjE7lNI+CahOp9c1YoXO+jQCTiYm/q/+VTaYJo3CuhqmAIhh1AGbywcQ1L7I\n\
+M6LSUoaTi02zoCsuIj2wYdSTe9ZT0brdUPpLYAzn5wPqeWZEKJlRnAbMzQIDAQAB\n\
+o1MwUTAdBgNVHQ4EFgQUyaSIE3OuTwwo1Z0ouIpekZv8HPUwHwYDVR0jBBgwFoAU\n\
+yaSIE3OuTwwo1Z0ouIpekZv8HPUwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0B\n\
+AQsFAAOCAQEAfpfBYCAEV+L457kWTZ7kJpl/Cuw8a+gM5RPOnonw44rtjj3L3F9O\n\
+ppAf7UIFVfeniC6gr8IN2xk/+r8BoeekLHGYPLHtPfWqXpB8f17ljH9t5484a4WU\n\
+RHrp+fJyaELOaJZnp/wycM+3ExUSaa3eEsfDcQwU2PJXnwZ/uL7SnjsR2dY50XNG\n\
+Iuuy1CGORrwI3TMrz+g4qr2ml6R+bZIMT/y9yMLKgJVHwuhPnSd2d61l67w/69sj\n\
+FzpnbagaS7HkaUN0ZQ5IY/Jtedf91V10M1Ci5edHmNo5K2ihL3krZ+aFqaAXi/Hk\n\
+IASKmoilz1GrAGEFfwEnc0L5PrhPs/eX8Q==\n\
+-----END CERTIFICATE-----\n";
+
+    fn build(builder: reqwest::ClientBuilder) -> bool {
+        builder.build().is_ok()
+    }
+
+    #[test]
+    fn from_pem_bundle_parses_the_test_ca() {
+        let certs = reqwest::Certificate::from_pem_bundle(TEST_CA_PEM).unwrap();
+        assert_eq!(certs.len(), 1, "the bundle holds exactly one CA cert");
+    }
+
+    #[test]
+    fn extra_ca_is_a_noop_without_the_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = (
+            std::env::var_os("STEPPER_EXTRA_CA_CERTS"),
+            std::env::var_os("NODE_EXTRA_CA_CERTS"),
+        );
+        unsafe {
+            std::env::remove_var("STEPPER_EXTRA_CA_CERTS");
+            std::env::remove_var("NODE_EXTRA_CA_CERTS");
+        }
+        assert!(build(apply_extra_ca(reqwest::Client::builder())));
+        unsafe {
+            restore("STEPPER_EXTRA_CA_CERTS", prev.0);
+            restore("NODE_EXTRA_CA_CERTS", prev.1);
+        }
+    }
+
+    #[test]
+    fn extra_ca_loads_a_valid_bundle_and_falls_open_on_garbage() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = (
+            std::env::var_os("STEPPER_EXTRA_CA_CERTS"),
+            std::env::var_os("NODE_EXTRA_CA_CERTS"),
+        );
+        let dir = std::env::temp_dir();
+        let good = dir.join("stepper-test-ca.pem");
+        std::fs::write(&good, TEST_CA_PEM).unwrap();
+        let garbage = dir.join("stepper-test-garbage.pem");
+        std::fs::write(&garbage, b"not a certificate").unwrap();
+        unsafe {
+            std::env::remove_var("NODE_EXTRA_CA_CERTS");
+            std::env::set_var("STEPPER_EXTRA_CA_CERTS", &good);
+        }
+        assert!(build(apply_extra_ca(reqwest::Client::builder())), "valid bundle builds");
+        unsafe { std::env::set_var("STEPPER_EXTRA_CA_CERTS", &garbage) };
+        assert!(build(apply_extra_ca(reqwest::Client::builder())), "garbage falls open");
+        unsafe { std::env::set_var("STEPPER_EXTRA_CA_CERTS", dir.join("does-not-exist.pem")) };
+        assert!(build(apply_extra_ca(reqwest::Client::builder())), "missing file falls open");
+        let _ = std::fs::remove_file(&good);
+        let _ = std::fs::remove_file(&garbage);
+        unsafe {
+            restore("STEPPER_EXTRA_CA_CERTS", prev.0);
+            restore("NODE_EXTRA_CA_CERTS", prev.1);
+        }
+    }
+
+    unsafe fn restore(key: &str, prev: Option<std::ffi::OsString>) {
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
     }
 }

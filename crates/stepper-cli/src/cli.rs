@@ -115,6 +115,30 @@ pub enum Command {
     Import(ImportArgs),
     /// Manage saved sessions: `stepper session list` / `session delete <id>`.
     Session(SessionArgs),
+    /// Manage MCP server OAuth: `stepper mcp auth <name>` / `logout <name>` / `status`.
+    Mcp(McpArgs),
+}
+
+#[derive(Args)]
+pub struct McpArgs {
+    #[command(subcommand)]
+    pub cmd: McpCmd,
+}
+
+#[derive(Subcommand)]
+pub enum McpCmd {
+    /// Authorize an OAuth MCP server in the browser and store its tokens.
+    Auth {
+        /// The server name from `mcpServers` in `.stepper/setting.json`.
+        name: String,
+    },
+    /// Drop a server's stored OAuth tokens.
+    Logout {
+        /// The server name.
+        name: String,
+    },
+    /// Show OAuth status for every OAuth-capable configured server.
+    Status,
 }
 
 #[derive(Args)]

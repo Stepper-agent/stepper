@@ -6,9 +6,11 @@
 pub mod bridge;
 pub mod error;
 pub mod manager;
+pub mod oauth;
 pub mod tool;
 
 pub use bridge::namespaced_name;
 pub use error::McpError;
 pub use manager::McpManager;
+pub use oauth::{authenticate, logout, status, McpOAuthStatus};
 pub use tool::McpTool;

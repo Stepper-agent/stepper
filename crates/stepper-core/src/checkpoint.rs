@@ -141,6 +141,33 @@ impl Snapshotter {
         self.store.join(format!("{id}.meta"))
     }
 
+    /// Delete a single checkpoint dir and its turn-count sidecar (best-effort) —
+    /// used to drop a `/redo` forward snapshot once it is consumed or invalidated.
+    /// A missing id is a no-op.
+    pub fn remove(&self, id: &str) {
+        let _ = std::fs::remove_dir_all(self.store.join(id));
+        let _ = std::fs::remove_file(self.meta_path(id));
+    }
+
+    /// Garbage-collect every `redo-<n>` forward snapshot left on disk. The redo
+    /// stack is in-memory only, so at process start no live `/redo` can reference
+    /// any of them — a crash between `/undo` and `/redo` would otherwise orphan
+    /// them forever (`prune` only bounds `turn-<N>`). Called once at startup.
+    pub fn clear_redo_snapshots(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.store) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("redo-") {
+                // Handles both the `redo-<n>` dir and its `redo-<n>.meta` sidecar,
+                // whichever this entry is, regardless of enumeration order.
+                let path = entry.path();
+                let _ = std::fs::remove_dir_all(&path);
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
     /// Drop the entire checkpoint store (used by `/clear`, which begins a fresh
     /// session). A missing store is a no-op.
     pub fn clear(&self) -> Result<(), CoreError> {
@@ -314,6 +341,65 @@ mod tests {
         assert_eq!(snap.checkpoint_turns("turn-1"), None);
         // kept turns retain their recorded count
         assert_eq!(snap.checkpoint_turns("turn-25"), Some(25));
+    }
+
+    #[test]
+    fn remove_drops_one_checkpoint_dir_and_sidecar_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        let snap = Snapshotter::new(root.clone());
+        snap.snapshot("redo-0").unwrap();
+        snap.record_turns("redo-0", 3);
+        snap.snapshot("turn-1").unwrap();
+        let store = root.join(".stepper/checkpoints");
+        assert!(store.join("redo-0").is_dir() && store.join("redo-0.meta").exists());
+        snap.remove("redo-0");
+        assert!(!store.join("redo-0").exists(), "redo-0 dir removed");
+        assert!(!store.join("redo-0.meta").exists(), "redo-0 sidecar removed");
+        assert!(store.join("turn-1").is_dir(), "an unrelated checkpoint is untouched");
+        // A missing id is a no-op.
+        snap.remove("redo-0");
+    }
+
+    #[test]
+    fn redo_snapshots_survive_prune_and_turn_enumeration() {
+        // `redo-<n>` forward snapshots must NOT be pruned by RETAIN (only `turn-<N>`
+        // are) so a pending /redo keeps its tree even past 20 turns.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        let snap = Snapshotter::new(root.clone());
+        snap.snapshot("redo-0").unwrap();
+        for n in 1..=25 {
+            snap.snapshot(&format!("turn-{n}")).unwrap();
+        }
+        snap.prune(20).unwrap();
+        let store = root.join(".stepper/checkpoints");
+        assert!(store.join("redo-0").is_dir(), "redo-0 survives prune");
+        assert!(!store.join("turn-1").exists(), "oldest turn-1 is pruned");
+        assert!(store.join("turn-25").is_dir(), "newest turn kept");
+    }
+
+    #[test]
+    fn clear_redo_snapshots_gcs_every_redo_dir_and_sidecar_but_keeps_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        let snap = Snapshotter::new(root.clone());
+        snap.snapshot("redo-0").unwrap();
+        snap.record_turns("redo-0", 1);
+        snap.snapshot("redo-3").unwrap();
+        snap.snapshot("turn-1").unwrap();
+        snap.record_turns("turn-1", 0);
+        let store = root.join(".stepper/checkpoints");
+        snap.clear_redo_snapshots();
+        assert!(!store.join("redo-0").exists() && !store.join("redo-0.meta").exists());
+        assert!(!store.join("redo-3").exists());
+        assert!(store.join("turn-1").is_dir(), "turn checkpoints are untouched");
+        assert_eq!(snap.checkpoint_turns("turn-1"), Some(0), "turn sidecar kept");
+        // Idempotent / no store = no-op.
+        snap.clear_redo_snapshots();
     }
 
     #[test]

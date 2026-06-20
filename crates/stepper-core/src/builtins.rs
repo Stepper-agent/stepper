@@ -45,6 +45,8 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("deny", "<spec>", "add a deny rule"),
     ("resume", "", "pick a session"),
     ("rewind", "", "pick a checkpoint, also Esc-Esc"),
+    ("undo", "", "revert the last turn (files + message)"),
+    ("redo", "", "re-apply an undone turn"),
 ];
 
 /// Names of the built-in commands, for the `/` palette (merged with the user's).

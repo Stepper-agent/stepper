@@ -77,6 +77,10 @@ pub fn spawn_core(
     if session.turns.is_empty() {
         let _ = snapshotter.clear();
     }
+    // The redo stack is in-memory only, so any `redo-<n>` dir left on disk (a crash
+    // between /undo and /redo) is unreferenced — GC it. A resumed session keeps its
+    // `turn-<N>` checkpoints but never a live redo, so this is always safe.
+    snapshotter.clear_redo_snapshots();
     let mut orchestrator = orchestrator;
     // The base context WITHOUT any resume digest — restored on /clear and /compact
     // so an old-format (digest-only) resume's prior content doesn't leak into the
@@ -99,6 +103,12 @@ pub fn spawn_core(
             home: orchestrator.home.clone(),
         });
         let mut turn_id: u64 = session.turns.len() as u64;
+        // `/undo` pushes a forward snapshot here so `/redo` can move back forward;
+        // any new turn (or /rewind, /resume, /clear, /compact) invalidates the
+        // stack. `redo_counter` keeps the `redo-<n>` ids unique even after a
+        // /compact resets `turn_id`.
+        let mut redo_stack: Vec<RedoEntry> = Vec::new();
+        let mut redo_counter: u64 = 0;
         // Session-level usage/cost, accumulated from each completed turn for
         // the `/cost` built-in.
         let mut cost = builtins::SessionCost::default();
@@ -158,6 +168,8 @@ pub fn spawn_core(
                         _ => (prompt.clone(), None),
                     };
                     turn_id += 1;
+                    // A new turn forks the timeline — any pending /redo is now stale.
+                    clear_redo(&mut redo_stack, &snapshotter);
                     let _ = tx.send(AppEvent::TurnStarted { turn_id }).await;
                     checkpoint_turn(&snapshotter, turn_id, session.turns.len(), &tx).await;
                     // Attach (and clear) any images pasted since the last prompt.
@@ -214,6 +226,9 @@ pub fn spawn_core(
                     }
                 }
                 Action::Rewind { checkpoint_id } => {
+                    // Jumping to an arbitrary checkpoint forks the timeline — any
+                    // pending /redo forward snapshots are now unreachable.
+                    clear_redo(&mut redo_stack, &snapshotter);
                     let (level, text) = match snapshotter.restore(&checkpoint_id) {
                         Ok(()) => {
                             // A `turn-N` checkpoint is the tree *before* turn N —
@@ -246,6 +261,7 @@ pub fn spawn_core(
                     // In-session resume: replace the live session with the chosen
                     // one and reseed the conversation at full fidelity (old-format
                     // records synthesize digest pairs inside seed_messages).
+                    clear_redo(&mut redo_stack, &snapshotter);
                     match store.load(&session_id) {
                         Some(loaded) => {
                             session = loaded;
@@ -279,6 +295,25 @@ pub fn spawn_core(
                     // etc. can be customized. Built-ins are consulted only when no
                     // command file shadows the name.
                     let cmd_def = commands::find_command(&project_root, home.as_deref(), &name);
+                    // `/undo` and `/redo` act immediately on the snapshotter (which
+                    // `builtins::handle` doesn't receive — same reason /rewind lives
+                    // here), so intercept them unless a user command file shadows the
+                    // name. They are in the COMMANDS table for the palette/help.
+                    if cmd_def.is_none() && (name == "undo" || name == "redo") {
+                        handle_undo_redo(
+                            &name,
+                            &snapshotter,
+                            &store,
+                            &mut session,
+                            &mut orchestrator,
+                            &mut turn_id,
+                            &mut redo_stack,
+                            &mut redo_counter,
+                            &tx,
+                        )
+                        .await;
+                        continue;
+                    }
                     if cmd_def.is_none()
                         && builtins::handle(
                             &name,
@@ -304,6 +339,9 @@ pub fn spawn_core(
                             // /clear is a true clean break (new-format history lives
                             // in resume_seed, which builtins already cleared).
                             orchestrator.base_context = base_context_original.clone();
+                            // snapshotter.clear() below removes the redo-* dirs too;
+                            // just drop the stale stack entries.
+                            redo_stack.clear();
                             if let Err(e) = snapshotter.clear() {
                                 let _ = tx
                                     .send(AppEvent::Notice {
@@ -337,6 +375,7 @@ pub fn spawn_core(
                     match expanded {
                         Some(prompt) => {
                             turn_id += 1;
+                            clear_redo(&mut redo_stack, &snapshotter);
                             let _ = tx.send(AppEvent::TurnStarted { turn_id }).await;
                             checkpoint_turn(&snapshotter, turn_id, session.turns.len(), &tx).await;
                             let images = std::mem::take(&mut pending_images);
@@ -479,6 +518,11 @@ pub fn spawn_core(
                     }
                 }
                 Action::RunShell(command) => {
+                    // A `!cmd` (foreground or detached `&`) runs arbitrary shell in
+                    // the project tree — it forks the timeline just like a turn, so
+                    // any pending /redo forward snapshot is now stale. Invalidate it
+                    // before the command can touch a file (covers both branches).
+                    clear_redo(&mut redo_stack, &snapshotter);
                     let (inner, background) = proc::parse_background(&command);
                     if background {
                         // `!cmd &` — spawn detached (no turn, no 120s timeout) and
@@ -663,6 +707,111 @@ async fn checkpoint_turn(
                 level: NoticeLevel::Warn,
                 text: format!("checkpoint prune failed: {e}"),
             })
+            .await;
+    }
+}
+
+/// A `/undo` step: the working-tree snapshot taken just before the undo (so
+/// `/redo` can move forward again), the session turns the undo dropped, and the
+/// `turn_id` to restore on redo. The `redo-<n>` snapshot id is outside the
+/// `turn-<N>` namespace, so `prune`/`rewind` never touch it.
+struct RedoEntry {
+    snapshot_id: String,
+    turns: Vec<TurnRecord>,
+    turn_id: u64,
+}
+
+/// Drop every pending `/redo` step and delete its forward snapshot from disk.
+/// Called whenever the timeline forks (a new turn, `/rewind`, `/resume`), so a
+/// later `/redo` can never restore a stale tree over newer work.
+fn clear_redo(stack: &mut Vec<RedoEntry>, snapshotter: &Snapshotter) {
+    for entry in stack.drain(..) {
+        snapshotter.remove(&entry.snapshot_id);
+    }
+}
+
+/// `/undo` reverts the last turn: it snapshots the current tree (for `/redo`),
+/// restores the `turn-<turn_id>` checkpoint (the tree BEFORE that turn), drops
+/// the turn(s) from the session, and pushes a redo step. `/redo` pops the most
+/// recent step, restores its forward snapshot, re-appends the dropped turns, and
+/// deletes the consumed snapshot. The whole stack is invalidated by any new turn
+/// (the caller calls `clear_redo`).
+#[allow(clippy::too_many_arguments)]
+async fn handle_undo_redo(
+    name: &str,
+    snapshotter: &Snapshotter,
+    store: &SessionStore,
+    session: &mut SessionRecord,
+    orchestrator: &mut Orchestrator,
+    turn_id: &mut u64,
+    redo_stack: &mut Vec<RedoEntry>,
+    redo_counter: &mut u64,
+    tx: &mpsc::Sender<AppEvent>,
+) {
+    if name == "undo" {
+        if *turn_id == 0 {
+            let _ = tx
+                .send(AppEvent::Notice { level: NoticeLevel::Info, text: "nothing to undo".into() })
+                .await;
+            return;
+        }
+        let checkpoint_id = format!("turn-{turn_id}");
+        // The session turns to keep = those completed BEFORE the undone turn. Prefer
+        // the count recorded with the checkpoint (robust to a turn_id drifted past
+        // the real turn count by failed turns / `/compact`); clamp to be safe.
+        let keep = snapshotter
+            .checkpoint_turns(&checkpoint_id)
+            .or_else(|| (*turn_id as usize).checked_sub(1))
+            .unwrap_or(0)
+            .min(session.turns.len());
+        // Snapshot the CURRENT tree FIRST so `/redo` can move forward again.
+        let redo_id = format!("redo-{redo_counter}");
+        *redo_counter += 1;
+        if let Err(e) = snapshotter.snapshot(&redo_id) {
+            let _ = tx
+                .send(AppEvent::Notice { level: NoticeLevel::Warn, text: format!("undo failed (snapshot): {e}") })
+                .await;
+            return;
+        }
+        if let Err(e) = snapshotter.restore(&checkpoint_id) {
+            snapshotter.remove(&redo_id);
+            let _ = tx
+                .send(AppEvent::Notice { level: NoticeLevel::Warn, text: format!("undo failed: {e}") })
+                .await;
+            return;
+        }
+        let dropped = session.turns.split_off(keep);
+        redo_stack.push(RedoEntry { snapshot_id: redo_id, turns: dropped, turn_id: *turn_id });
+        *turn_id = keep as u64;
+        let _ = store.save(session);
+        orchestrator.resume_seed = session.seed_messages();
+        let _ = tx
+            .send(AppEvent::Notice {
+                level: NoticeLevel::Info,
+                text: "undid the last turn (/redo to restore)".into(),
+            })
+            .await;
+    } else {
+        let Some(entry) = redo_stack.pop() else {
+            let _ = tx
+                .send(AppEvent::Notice { level: NoticeLevel::Info, text: "nothing to redo".into() })
+                .await;
+            return;
+        };
+        if let Err(e) = snapshotter.restore(&entry.snapshot_id) {
+            snapshotter.remove(&entry.snapshot_id);
+            let _ = tx
+                .send(AppEvent::Notice { level: NoticeLevel::Warn, text: format!("redo failed: {e}") })
+                .await;
+            return;
+        }
+        session.turns.extend(entry.turns);
+        *turn_id = entry.turn_id;
+        snapshotter.remove(&entry.snapshot_id);
+        let _ = store.save(session);
+        orchestrator.resume_seed = session.seed_messages();
+        let _ = tx
+            .send(AppEvent::Notice { level: NoticeLevel::Info, text: "redid".into() })
             .await;
     }
 }

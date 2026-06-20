@@ -22,6 +22,9 @@ pub enum Effect {
     /// Purge the terminal scrollback (`/clear`) so the prior conversation
     /// disappears, then repaint the viewport fresh.
     ClearScreen,
+    /// Ring the terminal bell (`\x07`) — a turn finished, an approval is awaited,
+    /// or a turn errored, and the matching `notification` trigger is enabled.
+    Bell,
 }
 
 pub type Effects = SmallVec<[Effect; 2]>;
@@ -499,6 +502,16 @@ pub struct AppState {
     /// Session reasoning-effort level (`None` = off), shown in the status footer;
     /// updated by `AppEvent::EffortChanged` from `/effort`.
     pub effort: Option<String>,
+    /// Terminal-bell triggers from the `notification` setting (turn-complete /
+    /// approval-awaited / turn-error). Each gates an `Effect::Bell`.
+    pub notify_on_complete: bool,
+    pub notify_on_approval: bool,
+    pub notify_on_error: bool,
+    /// Set when the current turn emitted an error, so the `TurnComplete` that
+    /// always follows it does not ALSO ring the complete-bell (core sends both —
+    /// a failed turn would otherwise double-beep). Error and complete bells are
+    /// mutually exclusive per turn; the error wins.
+    errored_this_turn: bool,
 }
 
 /// A blank input textarea configured the way every fresh prompt needs it:
@@ -542,6 +555,10 @@ impl AppState {
             theme: crate::theme::Theme::resolve(init.theme_preset.as_deref(), &init.theme_colors),
             theme_preset: init.theme_preset.unwrap_or_else(|| "dark".to_string()),
             effort: init.effort,
+            notify_on_complete: init.notify_on_complete,
+            notify_on_approval: init.notify_on_approval,
+            notify_on_error: init.notify_on_error,
+            errored_this_turn: false,
             commands: init.commands,
             palette_selected: 0,
             esc_armed: false,
@@ -974,6 +991,7 @@ impl AppState {
         match event {
             AppEvent::TurnStarted { .. } => {
                 self.turn_active = true;
+                self.errored_this_turn = false;
                 self.notice = None;
                 self.live.clear();
                 self.tool_lines.clear();
@@ -1003,6 +1021,9 @@ impl AppState {
                     self.picker = None;
                     self.agent_picker = None;
                     self.overlay = Some(Overlay::Approval(req));
+                    if self.notify_on_approval {
+                        effects.push(Effect::Bell);
+                    }
                 } else {
                     self.pending_approvals.push_back(req);
                 }
@@ -1152,6 +1173,12 @@ impl AppState {
                 self.turn_active = false;
                 self.workers.clear();
                 self.flush_block(&mut effects);
+                // An errored turn already rang (or deliberately stayed silent); the
+                // trailing TurnComplete must not add a "success" beep on top.
+                if self.notify_on_complete && !self.errored_this_turn {
+                    effects.push(Effect::Bell);
+                }
+                self.errored_this_turn = false;
                 self.dispatch_queued(&mut effects);
             }
             AppEvent::Cleared => {
@@ -1191,6 +1218,12 @@ impl AppState {
             }
             AppEvent::Error(text) => {
                 self.notice = Some(Notice { level: NoticeLevel::Error, text: format!("error: {text}") });
+                // Mark the turn errored so the trailing TurnComplete won't also
+                // beep (opencode likewise suppresses the done-notification here).
+                self.errored_this_turn = true;
+                if self.notify_on_error {
+                    effects.push(Effect::Bell);
+                }
             }
         }
         effects
@@ -1371,6 +1404,9 @@ mod tests {
             theme_preset: None,
             theme_colors: Vec::new(),
             effort: None,
+            notify_on_complete: false,
+            notify_on_approval: false,
+            notify_on_error: false,
         })
     }
 
@@ -1844,6 +1880,60 @@ mod tests {
         let effects = s.apply_event(AppEvent::TurnComplete { turn_id: 1 });
         assert!(effects.is_empty());
         assert!(!s.turn_active);
+    }
+
+    #[test]
+    fn notification_bell_fires_per_enabled_trigger_only() {
+        use stepper_protocol::{ApprovalKind, ApprovalRequest};
+        use tokio::sync::oneshot;
+        use uuid::Uuid;
+        let has_bell = |fx: &Effects| fx.iter().any(|e| matches!(e, Effect::Bell));
+
+        // Turn-complete rings only when enabled (default state is all-false).
+        let mut s = test_state();
+        s.notify_on_complete = true;
+        assert!(has_bell(&s.apply_event(AppEvent::TurnComplete { turn_id: 1 })));
+        let mut silent = test_state();
+        assert!(!has_bell(&silent.apply_event(AppEvent::TurnComplete { turn_id: 1 })));
+
+        // Error rings only when enabled.
+        let mut s = test_state();
+        s.notify_on_error = true;
+        assert!(has_bell(&s.apply_event(AppEvent::Error("boom".into()))));
+        assert!(!has_bell(&silent.apply_event(AppEvent::Error("boom".into()))));
+
+        // A failed turn rings AT MOST once: core emits Error then TurnComplete, so
+        // an enabled complete-bell must be suppressed after an error (no double-beep).
+        let mut s = test_state();
+        s.notify_on_complete = true;
+        s.notify_on_error = true;
+        s.apply_event(AppEvent::TurnStarted { turn_id: 1 });
+        let err = s.apply_event(AppEvent::Error("boom".into()));
+        let done = s.apply_event(AppEvent::TurnComplete { turn_id: 1 });
+        assert!(has_bell(&err), "the error rings");
+        assert!(!has_bell(&done), "the trailing TurnComplete does not also ring");
+        // A clean turn (no error) still rings the complete-bell.
+        s.apply_event(AppEvent::TurnStarted { turn_id: 2 });
+        assert!(has_bell(&s.apply_event(AppEvent::TurnComplete { turn_id: 2 })));
+
+        // An approval that surfaces immediately rings; a second one queued behind
+        // it (the user is clearly present, mid-interaction) stays silent.
+        let mut s = test_state();
+        s.notify_on_approval = true;
+        let (reply1, _rx1) = oneshot::channel();
+        let surfaced = s.apply_event(AppEvent::ApprovalRequested(ApprovalRequest {
+            id: Uuid::new_v4(),
+            kind: ApprovalKind::Mcp { server: "a".into(), tool: "x".into() },
+            reply: reply1,
+        }));
+        assert!(has_bell(&surfaced), "an approval that surfaces rings");
+        let (reply2, _rx2) = oneshot::channel();
+        let queued = s.apply_event(AppEvent::ApprovalRequested(ApprovalRequest {
+            id: Uuid::new_v4(),
+            kind: ApprovalKind::Mcp { server: "b".into(), tool: "y".into() },
+            reply: reply2,
+        }));
+        assert!(!has_bell(&queued), "a queued approval stays silent");
     }
 
     #[test]

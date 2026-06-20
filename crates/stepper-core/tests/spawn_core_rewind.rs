@@ -167,6 +167,165 @@ async fn wait_notice(rx: &mut EventRx) -> String {
     panic!("event stream ended before a Notice");
 }
 
+fn solo_orch(root: std::path::PathBuf) -> Orchestrator {
+    Orchestrator {
+        agents: Default::default(),
+        formatters: Default::default(),
+        lsp: Default::default(),
+        resolver: Arc::new(SoloResolver),
+        base_tools: ToolRegistry::builtins(),
+        steps: vec![step()],
+        base_context: "ctx".into(),
+        project_root: root.clone(),
+        cwd: root.clone(),
+        home: None,
+        rules: Arc::new(std::sync::RwLock::new(RuleSet::default())),
+        mode: Arc::new(std::sync::RwLock::new(PermissionMode::AcceptEdits)),
+        hooks: Arc::new(HookHost::empty(root.clone())),
+        always_load_mcp: Vec::new(),
+        compaction_model: None,
+        dispatch_enabled: false,
+        dispatch_concurrency: 8,
+        dispatch_step_cap: None,
+        limits: stepper_core::SessionLimits::default(),
+        fallback_model: None,
+        resume_seed: Vec::new(),
+        sandbox_writable_roots: None,
+    }
+}
+
+fn undo() -> Action {
+    Action::SlashCommand { name: "undo".into(), args: String::new() }
+}
+fn redo() -> Action {
+    Action::SlashCommand { name: "redo".into(), args: String::new() }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn undo_reverts_the_last_turn_and_redo_reapplies_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let session = SessionRecord::fresh();
+    let session_id = session.id.clone();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(solo_orch(root.clone()), session, action_rx, CancellationToken::new());
+
+    action_tx.send(Action::SubmitInput("one".into())).await.unwrap();
+    wait_turn_complete(&mut events, 1).await;
+    // Present in the turn-2 checkpoint (the undo target) — must survive the undo.
+    std::fs::write(root.join("kept.txt"), "x").unwrap();
+    action_tx.send(Action::SubmitInput("two".into())).await.unwrap();
+    wait_turn_complete(&mut events, 2).await;
+    // Created after turn 2 — captured by the redo snapshot, removed by the undo.
+    std::fs::write(root.join("transient.txt"), "y").unwrap();
+
+    action_tx.send(undo()).await.unwrap();
+    let notice = wait_notice(&mut events).await;
+    assert!(notice.contains("undid"), "got: {notice}");
+    assert!(root.join("kept.txt").exists(), "turn-2 checkpoint file survives undo");
+    assert!(!root.join("transient.txt").exists(), "post-turn-2 file removed by undo");
+    let reloaded = SessionStore::new(&root).load(&session_id).unwrap();
+    assert_eq!(reloaded.turns.len(), 1, "undo drops the last turn");
+    assert_eq!(reloaded.turns[0].user, "one");
+
+    action_tx.send(redo()).await.unwrap();
+    let notice = wait_notice(&mut events).await;
+    assert!(notice.contains("redid"), "got: {notice}");
+    assert!(root.join("kept.txt").exists());
+    assert!(root.join("transient.txt").exists(), "redo restores the forward tree");
+    let reloaded = SessionStore::new(&root).load(&session_id).unwrap();
+    assert_eq!(reloaded.turns.len(), 2, "redo re-appends the dropped turn");
+    assert_eq!(reloaded.turns[1].user, "two");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn undo_and_redo_are_noops_on_an_empty_stack() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(solo_orch(root.clone()), SessionRecord::fresh(), action_rx, CancellationToken::new());
+
+    action_tx.send(undo()).await.unwrap();
+    assert!(wait_notice(&mut events).await.contains("nothing to undo"));
+    action_tx.send(redo()).await.unwrap();
+    assert!(wait_notice(&mut events).await.contains("nothing to redo"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_turn_after_undo_invalidates_redo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(solo_orch(root.clone()), SessionRecord::fresh(), action_rx, CancellationToken::new());
+
+    action_tx.send(Action::SubmitInput("one".into())).await.unwrap();
+    wait_turn_complete(&mut events, 1).await;
+    action_tx.send(undo()).await.unwrap();
+    assert!(wait_notice(&mut events).await.contains("undid"));
+    // The forward snapshot exists on disk...
+    let redo_dir = root.join(".stepper/checkpoints/redo-0");
+    assert!(redo_dir.is_dir(), "undo left a redo-0 forward snapshot");
+
+    // ...but a brand-new turn forks the timeline and must invalidate it.
+    action_tx.send(Action::SubmitInput("two".into())).await.unwrap();
+    wait_turn_complete(&mut events, 1).await; // turn_id reset to 0 by undo, so this is turn 1
+    assert!(!redo_dir.exists(), "a new turn deletes the stale redo snapshot");
+    action_tx.send(redo()).await.unwrap();
+    assert!(wait_notice(&mut events).await.contains("nothing to redo"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shell_command_after_undo_invalidates_redo() {
+    // `!cmd` mutates the working tree just like a turn, so a later /redo must not
+    // restore a stale forward tree over the shell command's changes.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(solo_orch(root.clone()), SessionRecord::fresh(), action_rx, CancellationToken::new());
+
+    action_tx.send(Action::SubmitInput("one".into())).await.unwrap();
+    wait_turn_complete(&mut events, 1).await;
+    action_tx.send(undo()).await.unwrap();
+    assert!(wait_notice(&mut events).await.contains("undid"));
+    assert!(root.join(".stepper/checkpoints/redo-0").is_dir());
+
+    action_tx.send(Action::RunShell("true".into())).await.unwrap();
+    wait_turn_complete(&mut events, 1).await; // turn_id was reset to 0 by undo
+    assert!(!root.join(".stepper/checkpoints/redo-0").exists(), "the shell command cleared the redo snapshot");
+    action_tx.send(redo()).await.unwrap();
+    assert!(wait_notice(&mut events).await.contains("nothing to redo"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_level_undo_then_redo_returns_to_the_full_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let session = SessionRecord::fresh();
+    let session_id = session.id.clone();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(solo_orch(root.clone()), session, action_rx, CancellationToken::new());
+
+    action_tx.send(Action::SubmitInput("one".into())).await.unwrap();
+    wait_turn_complete(&mut events, 1).await;
+    action_tx.send(Action::SubmitInput("two".into())).await.unwrap();
+    wait_turn_complete(&mut events, 2).await;
+
+    action_tx.send(undo()).await.unwrap();
+    assert!(wait_notice(&mut events).await.contains("undid"));
+    action_tx.send(undo()).await.unwrap();
+    assert!(wait_notice(&mut events).await.contains("undid"));
+    assert_eq!(SessionStore::new(&root).load(&session_id).unwrap().turns.len(), 0);
+
+    action_tx.send(redo()).await.unwrap();
+    assert!(wait_notice(&mut events).await.contains("redid"));
+    action_tx.send(redo()).await.unwrap();
+    assert!(wait_notice(&mut events).await.contains("redid"));
+    let reloaded = SessionStore::new(&root).load(&session_id).unwrap();
+    assert_eq!(reloaded.turns.len(), 2, "two redos restore both turns");
+    assert_eq!(reloaded.turns[0].user, "one");
+    assert_eq!(reloaded.turns[1].user, "two");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rewind_prunes_later_files_and_truncates_session() {
     let dir = tempfile::tempdir().unwrap();

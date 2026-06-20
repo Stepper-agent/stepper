@@ -1082,6 +1082,9 @@ mod tests {
             theme_preset: None,
             theme_colors: Vec::new(),
             effort: None,
+            notify_on_complete: false,
+            notify_on_approval: false,
+            notify_on_error: false,
         })
     }
 

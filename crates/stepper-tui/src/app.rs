@@ -582,6 +582,16 @@ fn run_effects(
                 );
                 committed = true;
             }
+            Effect::Bell => {
+                // A bare BEL (`\x07`) — the terminal turns it into an audible beep
+                // or a visual flash. Deliberately does NOT set `committed`: it
+                // moves no cursor and writes no cell, so it must not trigger a
+                // viewport repaint.
+                use std::io::Write;
+                let mut out = std::io::stdout();
+                let _ = out.write_all(b"\x07");
+                let _ = out.flush();
+            }
         }
     }
     Ok(committed)
@@ -614,6 +624,9 @@ mod tests {
             theme_preset: None,
             theme_colors: Vec::new(),
             effort: None,
+            notify_on_complete: false,
+            notify_on_approval: false,
+            notify_on_error: false,
         });
         s.overlay = Some(Overlay::ApiKey(ApiKeyOverlay {
             provider: "anthropic".into(),

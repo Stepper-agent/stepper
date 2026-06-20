@@ -23,6 +23,7 @@ globset = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
 shell-words = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 stepper-permission = { path = "../stepper-permission" }

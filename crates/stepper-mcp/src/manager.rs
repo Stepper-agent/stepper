@@ -118,7 +118,7 @@ async fn connect_one(
 ) -> Result<(RunningService<RoleClient, ()>, Vec<Arc<dyn Tool>>), McpError> {
     let timeout = server_timeout(cfg);
     let service = match cfg.transport.as_deref() {
-        Some("http") | Some("streamable-http") => connect_http(cfg, timeout).await?,
+        Some("http") | Some("streamable-http") => connect_http(name, cfg, timeout).await?,
         _ => connect_stdio(cfg, base_dir, timeout).await?,
     };
 
@@ -227,6 +227,7 @@ async fn connect_stdio(
 }
 
 async fn connect_http(
+    name: &str,
     cfg: &McpServerConfig,
     timeout: Duration,
 ) -> Result<RunningService<RoleClient, ()>, McpError> {
@@ -235,15 +236,87 @@ async fn connect_http(
         .clone()
         .ok_or_else(|| McpError::Config("http server needs a `url`".into()))?;
     let (auth_header, custom_headers) = split_headers(&cfg.headers);
-    let mut config =
-        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url);
+    let mut config = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+        url.clone(),
+    );
     config.auth_header = auth_header;
     config.custom_headers = custom_headers;
-    let transport = rmcp::transport::StreamableHttpClientTransport::from_config(config);
-    tokio::time::timeout(timeout, ().serve(transport))
-        .await
+    // Build the http client ourselves (instead of rmcp's default) so a private
+    // CA bundle is honored. `pool_max_idle_per_host(0)` replicates rmcp's
+    // `default_http_client` tuning (it disables idle-connection pooling to avoid
+    // ~40ms TCP Delayed-ACK stalls on Linux) so the swap stays behavior-preserving
+    // apart from the added CA.
+    let client = apply_extra_ca(reqwest::Client::builder())
+        .pool_max_idle_per_host(0)
+        .build()
+        .map_err(|e| McpError::Connect(e.to_string()))?;
+    // An OAuth-enabled server uses a bearer-injecting/refreshing AuthClient when it
+    // has stored creds; with none, fail clearly instead of firing an unauthorized
+    // request. Plain servers keep the bare client (existing behavior). The OAuth
+    // load does network metadata discovery, so it's bounded by the SAME per-server
+    // timeout as the handshake — a hung auth server can't stall startup.
+    let served = if crate::oauth::is_oauth_enabled(cfg) {
+        let loaded = tokio::time::timeout(timeout, crate::oauth::load_auth_client(name, &url, client))
+            .await
+            .map_err(|_| McpError::Connect(format!("OAuth init for '{name}' timed out")))??;
+        match loaded {
+            Some(auth_client) => {
+                let transport =
+                    rmcp::transport::StreamableHttpClientTransport::with_client(auth_client, config);
+                tokio::time::timeout(timeout, ().serve(transport)).await
+            }
+            None => {
+                return Err(McpError::Connect(format!(
+                    "server '{name}' needs OAuth — run: stepper mcp auth {name}"
+                )))
+            }
+        }
+    } else {
+        let transport = rmcp::transport::StreamableHttpClientTransport::with_client(client, config);
+        tokio::time::timeout(timeout, ().serve(transport)).await
+    };
+    served
         .map_err(|_| McpError::Connect("handshake timed out".into()))?
         .map_err(|e| McpError::Connect(e.to_string()))
+}
+
+/// Merge a private CA bundle (`STEPPER_EXTRA_CA_CERTS`, falling back to
+/// `NODE_EXTRA_CA_CERTS`) into the platform trust store so an http MCP server
+/// behind a corporate proxy / self-signed TLS validates. Additive (system roots
+/// still apply) and fail-open: unset/unreadable/unparsable leaves the builder
+/// untouched. Proxy needs no code: reqwest honors `HTTP(S)_PROXY`/`NO_PROXY`.
+fn apply_extra_ca(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let Some(path) =
+        std::env::var_os("STEPPER_EXTRA_CA_CERTS").or_else(|| std::env::var_os("NODE_EXTRA_CA_CERTS"))
+    else {
+        return builder;
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!("extra CA certificates: cannot read {path:?}: {err}");
+            return builder;
+        }
+    };
+    let certs = match reqwest::Certificate::from_pem_bundle(&bytes) {
+        Ok(certs) => certs,
+        Err(err) => {
+            tracing::warn!("extra CA certificates: cannot parse {path:?}: {err}");
+            return builder;
+        }
+    };
+    // rustls-platform-verifier can merge EXTRA roots only on these targets; on any
+    // other target a non-empty root set makes `.build()` error, so stay on system
+    // trust there — keeping the fail-open total (a valid cert never aborts startup).
+    #[cfg(any(all(unix, not(target_os = "android")), target_os = "windows"))]
+    {
+        builder.tls_certs_merge(certs)
+    }
+    #[cfg(not(any(all(unix, not(target_os = "android")), target_os = "windows")))]
+    {
+        let _ = certs;
+        builder
+    }
 }
 
 /// Split configured headers into rmcp's `auth_header` (the bearer TOKEN) and
@@ -315,6 +388,25 @@ mod tests {
     }
 
     #[test]
+    fn extra_ca_falls_open_so_http_mcp_still_builds() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("STEPPER_EXTRA_CA_CERTS");
+        unsafe { std::env::set_var("STEPPER_EXTRA_CA_CERTS", "/no/such/ca.pem") };
+        assert!(
+            apply_extra_ca(reqwest::Client::builder()).build().is_ok(),
+            "a missing extra-CA path must fail open, not break the http transport"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("STEPPER_EXTRA_CA_CERTS", v),
+                None => std::env::remove_var("STEPPER_EXTRA_CA_CERTS"),
+            }
+        }
+    }
+
+    #[test]
     fn split_headers_strips_the_bearer_scheme_case_insensitively() {
         // The HTTP auth scheme is case-insensitive (RFC 7235); every casing must
         // be stripped so rmcp's bearer_auth does not produce a double prefix.
@@ -363,6 +455,27 @@ mod tests {
             args: vec!["-c".to_string(), script.to_string()],
             ..McpServerConfig::default()
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oauth_http_server_without_creds_fails_with_an_actionable_message() {
+        // OAuth-enabled http server + no stored tokens => connect_http short-circuits
+        // BEFORE any network, telling the user to authenticate. The unique name keeps
+        // the real ~/.stepper/mcp-auth.json from accidentally satisfying it.
+        let cfg = McpServerConfig {
+            transport: Some("http".into()),
+            url: Some("https://example.invalid/mcp".into()),
+            oauth: Some(stepper_config::McpOAuthConfig::default()),
+            ..McpServerConfig::default()
+        };
+        let err = connect_http("stepper-test-oauth-no-creds-zzz", &cfg, connect_timeout())
+            .await
+            .expect_err("an oauth server with no creds must fail to connect");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("needs OAuth") && msg.contains("stepper mcp auth"),
+            "got: {msg}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

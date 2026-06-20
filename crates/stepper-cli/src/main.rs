@@ -33,6 +33,70 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::ScaffoldLayer) => scaffold_pipeline_cmd(cli.global),
         Some(Command::Import(args)) => import_cmd(args),
         Some(Command::Session(args)) => session_cmd(args, cli.global),
+        Some(Command::Mcp(args)) => mcp_cmd(args, cli.global).await,
+    }
+}
+
+/// `stepper mcp auth|logout|status`: manage OAuth for remote (http) MCP servers.
+/// Tokens live in `~/.stepper/mcp-auth.json` (0600), never in `setting.json`.
+async fn mcp_cmd(args: cli::McpArgs, global: GlobalArgs) -> anyhow::Result<()> {
+    let cwd = global_cwd(&global)?;
+    let cfg = stepper_config::Config::load(&cwd).map_err(|e| anyhow::anyhow!("load config: {e}"))?;
+    match args.cmd {
+        cli::McpCmd::Auth { name } => {
+            let server = cfg
+                .settings
+                .mcp_servers
+                .get(&name)
+                .ok_or_else(|| anyhow::anyhow!("no MCP server '{name}' in setting.json"))?;
+            // Match `is_oauth_enabled` (the gate connect/status use) exactly, so a
+            // server you can auth is one whose tokens actually get used: only an
+            // http/streamable-http server with a url + non-disabled oauth qualifies.
+            if !matches!(server.transport.as_deref(), Some("http") | Some("streamable-http")) {
+                anyhow::bail!("server '{name}' is not http — set \"type\": \"http\" (OAuth is http-only)");
+            }
+            let url = server
+                .url
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("server '{name}' has no `url`"))?;
+            let oauth_cfg = server.oauth.clone().ok_or_else(|| {
+                anyhow::anyhow!("server '{name}' has no `oauth` config — add \"oauth\": {{}} to enable it")
+            })?;
+            if oauth_cfg.disabled {
+                anyhow::bail!("server '{name}' has `oauth.disabled = true`");
+            }
+            // Follows redirects and carries any extra CA (proxy/corp TLS).
+            let client = ProviderFactory::new()?.http_client();
+            stepper_mcp::authenticate(&name, &oauth_cfg, url, client)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Authorized MCP server '{name}'.");
+            Ok(())
+        }
+        cli::McpCmd::Logout { name } => {
+            let removed = stepper_mcp::logout(&name).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!(
+                "{}",
+                if removed {
+                    format!("Removed stored OAuth tokens for '{name}'.")
+                } else {
+                    format!("No stored OAuth tokens for '{name}'.")
+                }
+            );
+            Ok(())
+        }
+        cli::McpCmd::Status => {
+            let entries = stepper_mcp::status(&cfg.settings.mcp_servers);
+            if entries.is_empty() {
+                println!("No OAuth-capable MCP servers configured.");
+                return Ok(());
+            }
+            for entry in entries {
+                let mark = if entry.authenticated { "authed " } else { "no token" };
+                println!("[{mark}] {}", entry.server);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -423,6 +487,8 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
     let mut theme_preset: Option<String> = None;
     let mut theme_colors: Vec<(String, String)> = Vec::new();
     let mut effort_setting: Option<String> = None;
+    // (on_complete, on_approval, on_error) terminal-bell triggers; silent default.
+    let mut notify = (false, false, false);
     if let Ok(cfg) = stepper_config::Config::load(&cwd) {
         // `argument-hint` is keyed by command name; attach it to each user command.
         let hints: std::collections::BTreeMap<String, String> =
@@ -442,6 +508,9 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
             theme_colors = theme.colors.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         }
         effort_setting = cfg.settings.reasoning_effort.clone();
+        if let Some(notification) = &cfg.settings.notification {
+            notify = notification.resolve();
+        }
     }
     // `--effort` wins over the setting; "off"/absent shows no footer indicator.
     let effort = global.effort.clone().or(effort_setting).filter(|e| e != "off");
@@ -457,6 +526,9 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         theme_preset,
         theme_colors,
         effort,
+        notify_on_complete: notify.0,
+        notify_on_approval: notify.1,
+        notify_on_error: notify.2,
     };
     run_tui(event_rx, action_tx, init, cancel).await
 }

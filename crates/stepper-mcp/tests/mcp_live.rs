@@ -61,6 +61,7 @@ fn server_from_env() -> Option<(String, McpServerConfig)> {
                 enabled: None,
                 cwd: None,
                 timeout: None,
+                oauth: None,
             },
         ));
     }
@@ -87,6 +88,7 @@ fn server_from_env() -> Option<(String, McpServerConfig)> {
             enabled: None,
             cwd: None,
             timeout: None,
+            oauth: None,
         },
     ))
 }

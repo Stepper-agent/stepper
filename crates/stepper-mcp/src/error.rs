@@ -7,4 +7,7 @@ pub enum McpError {
 
     #[error("mcp connection error: {0}")]
     Connect(String),
+
+    #[error("mcp auth error: {0}")]
+    Auth(String),
 }

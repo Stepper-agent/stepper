@@ -14,6 +14,45 @@ const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 const CONNECT_TIMEOUT_MS: u64 = 30_000;
 const ALLOW_PRIVATE_ENV: &str = "STEPPER_WEB_FETCH_ALLOW_PRIVATE";
 
+/// Merge a private CA bundle (`STEPPER_EXTRA_CA_CERTS`, falling back to
+/// `NODE_EXTRA_CA_CERTS`) into the platform trust store so web_fetch validates
+/// corporate-proxy / self-signed TLS. Additive (system roots still apply) and
+/// fail-open: unset/unreadable/unparsable leaves the builder untouched. Proxy
+/// needs no code: reqwest honors `HTTP(S)_PROXY`/`NO_PROXY` by default.
+fn apply_extra_ca(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let Some(path) =
+        std::env::var_os("STEPPER_EXTRA_CA_CERTS").or_else(|| std::env::var_os("NODE_EXTRA_CA_CERTS"))
+    else {
+        return builder;
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!("extra CA certificates: cannot read {path:?}: {err}");
+            return builder;
+        }
+    };
+    let certs = match reqwest::Certificate::from_pem_bundle(&bytes) {
+        Ok(certs) => certs,
+        Err(err) => {
+            tracing::warn!("extra CA certificates: cannot parse {path:?}: {err}");
+            return builder;
+        }
+    };
+    // rustls-platform-verifier can merge EXTRA roots only on these targets; on any
+    // other target a non-empty root set makes `.build()` error, so stay on system
+    // trust there — keeping the fail-open total (a valid cert never aborts startup).
+    #[cfg(any(all(unix, not(target_os = "android")), target_os = "windows"))]
+    {
+        builder.tls_certs_merge(certs)
+    }
+    #[cfg(not(any(all(unix, not(target_os = "android")), target_os = "windows")))]
+    {
+        let _ = certs;
+        builder
+    }
+}
+
 /// Overall request deadline (connect + headers + body). Override with
 /// `STEPPER_WEB_FETCH_TIMEOUT_MS`.
 fn fetch_timeout() -> Duration {
@@ -156,7 +195,7 @@ impl Tool for WebFetch {
         let pin = reject_private_host(&a.url).await?;
 
         let timeout = fetch_timeout();
-        let mut builder = reqwest::Client::builder()
+        let mut builder = apply_extra_ca(reqwest::Client::builder())
             .user_agent(concat!("stepper/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS).min(timeout))
@@ -252,6 +291,25 @@ mod tests {
         assert!(is_private_ip("100.127.255.255".parse().unwrap()));
         assert!(!is_private_ip("100.63.255.255".parse().unwrap()));
         assert!(!is_private_ip("100.128.0.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn extra_ca_falls_open_and_still_builds() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("STEPPER_EXTRA_CA_CERTS");
+        unsafe { std::env::set_var("STEPPER_EXTRA_CA_CERTS", "/no/such/ca.pem") };
+        assert!(
+            apply_extra_ca(reqwest::Client::builder()).build().is_ok(),
+            "a missing extra-CA path must fail open, not break web_fetch"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("STEPPER_EXTRA_CA_CERTS", v),
+                None => std::env::remove_var("STEPPER_EXTRA_CA_CERTS"),
+            }
+        }
     }
 
     #[tokio::test]
