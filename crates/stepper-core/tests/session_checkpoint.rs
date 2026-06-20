@@ -10,6 +10,7 @@ fn turn(user: &str, layer: &str, summary: &str) -> TurnRecord {
         user: user.into(),
         summaries: vec![(layer.into(), summary.into())],
         messages: Vec::new(),
+        ..Default::default()
     }
 }
 

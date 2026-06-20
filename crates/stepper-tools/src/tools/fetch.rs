@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
+use stepper_config::ProxyConfig;
 use stepper_permission::PermissionRequest;
 use stepper_provider::{ToolError, ToolResult, ToolSpec};
 
@@ -51,6 +52,41 @@ fn apply_extra_ca(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
         let _ = certs;
         builder
     }
+}
+
+/// Apply an explicit proxy from config. `None`/inactive leaves the builder
+/// untouched so reqwest's `HTTP(S)_PROXY`/`NO_PROXY` env default applies; an
+/// explicit proxy replaces the env proxy; `disabled: true` forces a direct
+/// connection. Fail-open: a malformed proxy URL is logged and skipped.
+fn apply_proxy(mut builder: reqwest::ClientBuilder, proxy: Option<&ProxyConfig>) -> reqwest::ClientBuilder {
+    let Some(proxy) = proxy.filter(|p| p.is_active()) else {
+        return builder;
+    };
+    if proxy.disabled {
+        return builder.no_proxy();
+    }
+    let no_proxy = || proxy.no_proxy.as_deref().and_then(reqwest::NoProxy::from_string);
+    // Scheme-specific proxies before the catch-all `all` — reqwest uses the first
+    // matching one, so `all` must come last or it shadows `http`/`https`.
+    if let Some(url) = proxy.http.as_deref() {
+        match reqwest::Proxy::http(url) {
+            Ok(p) => builder = builder.proxy(p.no_proxy(no_proxy())),
+            Err(e) => tracing::warn!("proxy: ignoring invalid `http` proxy {url:?}: {e}"),
+        }
+    }
+    if let Some(url) = proxy.https.as_deref() {
+        match reqwest::Proxy::https(url) {
+            Ok(p) => builder = builder.proxy(p.no_proxy(no_proxy())),
+            Err(e) => tracing::warn!("proxy: ignoring invalid `https` proxy {url:?}: {e}"),
+        }
+    }
+    if let Some(url) = proxy.all.as_deref() {
+        match reqwest::Proxy::all(url) {
+            Ok(p) => builder = builder.proxy(p.no_proxy(no_proxy())),
+            Err(e) => tracing::warn!("proxy: ignoring invalid `all` proxy {url:?}: {e}"),
+        }
+    }
+    builder
 }
 
 /// Overall request deadline (connect + headers + body). Override with
@@ -144,6 +180,7 @@ async fn reject_private_host(url: &str) -> Result<Option<(String, SocketAddr)>, 
 
 pub struct WebFetch {
     spec: ToolSpec,
+    proxy: Option<ProxyConfig>,
 }
 
 #[derive(Deserialize)]
@@ -151,9 +188,18 @@ struct Args {
     url: String,
 }
 
+impl WebFetch {
+    /// `web_fetch` routing its request through an explicit `proxy` from config
+    /// (`None` keeps reqwest's `HTTP(S)_PROXY`/`NO_PROXY` env default).
+    pub fn with_proxy(proxy: Option<ProxyConfig>) -> Self {
+        WebFetch { proxy, ..WebFetch::default() }
+    }
+}
+
 impl Default for WebFetch {
     fn default() -> Self {
         WebFetch {
+            proxy: None,
             spec: ToolSpec {
                 name: "web_fetch".into(),
                 description: "Fetch a URL over HTTP(S) and return its text body (truncated). \
@@ -195,7 +241,7 @@ impl Tool for WebFetch {
         let pin = reject_private_host(&a.url).await?;
 
         let timeout = fetch_timeout();
-        let mut builder = apply_extra_ca(reqwest::Client::builder())
+        let mut builder = apply_proxy(apply_extra_ca(reqwest::Client::builder()), self.proxy.as_ref())
             .user_agent(concat!("stepper/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS).min(timeout))
@@ -310,6 +356,27 @@ mod tests {
                 None => std::env::remove_var("STEPPER_EXTRA_CA_CERTS"),
             }
         }
+    }
+
+    #[test]
+    fn apply_proxy_handles_none_disabled_explicit_and_garbage() {
+        let ok = |b: reqwest::ClientBuilder| b.build().is_ok();
+        // None / inactive → env-proxy default preserved (no-op).
+        assert!(ok(apply_proxy(reqwest::Client::builder(), None)));
+        assert!(ok(apply_proxy(reqwest::Client::builder(), Some(&ProxyConfig::default()))));
+        // disabled → direct connection.
+        let disabled = ProxyConfig { disabled: true, ..Default::default() };
+        assert!(ok(apply_proxy(reqwest::Client::builder(), Some(&disabled))));
+        // explicit https proxy with a bypass list.
+        let explicit = ProxyConfig {
+            https: Some("http://127.0.0.1:8080".into()),
+            no_proxy: Some("localhost".into()),
+            ..Default::default()
+        };
+        assert!(ok(apply_proxy(reqwest::Client::builder(), Some(&explicit))));
+        // garbage proxy URL → fail open (still builds).
+        let garbage = ProxyConfig { all: Some("not a url".into()), ..Default::default() };
+        assert!(ok(apply_proxy(reqwest::Client::builder(), Some(&garbage))));
     }
 
     #[tokio::test]

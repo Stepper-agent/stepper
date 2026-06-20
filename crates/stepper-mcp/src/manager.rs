@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use stepper_config::McpServerConfig;
+use stepper_config::{McpServerConfig, ProxyConfig};
 use stepper_tools::Tool;
 use tokio::io::AsyncReadExt;
 
@@ -59,7 +59,11 @@ impl McpManager {
 
     /// Connect every configured server. A server that fails to connect is logged
     /// and skipped — it never takes down the agent.
-    pub async fn connect(servers: &BTreeMap<String, McpServerConfig>, base_dir: &Path) -> Self {
+    pub async fn connect(
+        servers: &BTreeMap<String, McpServerConfig>,
+        base_dir: &Path,
+        proxy: Option<&ProxyConfig>,
+    ) -> Self {
         let mut manager = McpManager::empty();
         let mut taken = HashMap::new();
         for (name, cfg) in servers {
@@ -67,7 +71,7 @@ impl McpManager {
             if cfg.enabled == Some(false) {
                 continue;
             }
-            match connect_one(name, cfg, base_dir, &mut taken).await {
+            match connect_one(name, cfg, base_dir, &mut taken, proxy).await {
                 Ok((service, tools)) => {
                     for tool in &tools {
                         manager
@@ -115,10 +119,11 @@ async fn connect_one(
     cfg: &McpServerConfig,
     base_dir: &Path,
     taken: &mut HashMap<String, (String, String)>,
+    proxy: Option<&ProxyConfig>,
 ) -> Result<(RunningService<RoleClient, ()>, Vec<Arc<dyn Tool>>), McpError> {
     let timeout = server_timeout(cfg);
     let service = match cfg.transport.as_deref() {
-        Some("http") | Some("streamable-http") => connect_http(name, cfg, timeout).await?,
+        Some("http") | Some("streamable-http") => connect_http(name, cfg, timeout, proxy).await?,
         _ => connect_stdio(cfg, base_dir, timeout).await?,
     };
 
@@ -230,6 +235,7 @@ async fn connect_http(
     name: &str,
     cfg: &McpServerConfig,
     timeout: Duration,
+    proxy: Option<&ProxyConfig>,
 ) -> Result<RunningService<RoleClient, ()>, McpError> {
     let url = cfg
         .url
@@ -246,7 +252,7 @@ async fn connect_http(
     // `default_http_client` tuning (it disables idle-connection pooling to avoid
     // ~40ms TCP Delayed-ACK stalls on Linux) so the swap stays behavior-preserving
     // apart from the added CA.
-    let client = apply_extra_ca(reqwest::Client::builder())
+    let client = apply_proxy(apply_extra_ca(reqwest::Client::builder()), proxy)
         .pool_max_idle_per_host(0)
         .build()
         .map_err(|e| McpError::Connect(e.to_string()))?;
@@ -317,6 +323,41 @@ fn apply_extra_ca(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
         let _ = certs;
         builder
     }
+}
+
+/// Apply an explicit proxy from config to an http MCP client. `None`/inactive
+/// leaves the builder on reqwest's `HTTP(S)_PROXY`/`NO_PROXY` env default; an
+/// explicit proxy replaces the env proxy; `disabled: true` forces a direct
+/// connection. Fail-open: a malformed proxy URL is logged and skipped.
+fn apply_proxy(mut builder: reqwest::ClientBuilder, proxy: Option<&ProxyConfig>) -> reqwest::ClientBuilder {
+    let Some(proxy) = proxy.filter(|p| p.is_active()) else {
+        return builder;
+    };
+    if proxy.disabled {
+        return builder.no_proxy();
+    }
+    let no_proxy = || proxy.no_proxy.as_deref().and_then(reqwest::NoProxy::from_string);
+    // Scheme-specific proxies before the catch-all `all` — reqwest uses the first
+    // matching one, so `all` must come last or it shadows `http`/`https`.
+    if let Some(url) = proxy.http.as_deref() {
+        match reqwest::Proxy::http(url) {
+            Ok(p) => builder = builder.proxy(p.no_proxy(no_proxy())),
+            Err(e) => tracing::warn!("proxy: ignoring invalid `http` proxy {url:?}: {e}"),
+        }
+    }
+    if let Some(url) = proxy.https.as_deref() {
+        match reqwest::Proxy::https(url) {
+            Ok(p) => builder = builder.proxy(p.no_proxy(no_proxy())),
+            Err(e) => tracing::warn!("proxy: ignoring invalid `https` proxy {url:?}: {e}"),
+        }
+    }
+    if let Some(url) = proxy.all.as_deref() {
+        match reqwest::Proxy::all(url) {
+            Ok(p) => builder = builder.proxy(p.no_proxy(no_proxy())),
+            Err(e) => tracing::warn!("proxy: ignoring invalid `all` proxy {url:?}: {e}"),
+        }
+    }
+    builder
 }
 
 /// Split configured headers into rmcp's `auth_header` (the bearer TOKEN) and
@@ -407,6 +448,19 @@ mod tests {
     }
 
     #[test]
+    fn apply_proxy_none_disabled_explicit_and_garbage_all_build() {
+        let ok = |b: reqwest::ClientBuilder| b.build().is_ok();
+        assert!(ok(apply_proxy(reqwest::Client::builder(), None)));
+        assert!(ok(apply_proxy(reqwest::Client::builder(), Some(&ProxyConfig::default()))));
+        let disabled = ProxyConfig { disabled: true, ..Default::default() };
+        assert!(ok(apply_proxy(reqwest::Client::builder(), Some(&disabled))));
+        let explicit = ProxyConfig { all: Some("http://127.0.0.1:8080".into()), ..Default::default() };
+        assert!(ok(apply_proxy(reqwest::Client::builder(), Some(&explicit))));
+        let garbage = ProxyConfig { http: Some("not a url".into()), ..Default::default() };
+        assert!(ok(apply_proxy(reqwest::Client::builder(), Some(&garbage))));
+    }
+
+    #[test]
     fn split_headers_strips_the_bearer_scheme_case_insensitively() {
         // The HTTP auth scheme is case-insensitive (RFC 7235); every casing must
         // be stripped so rmcp's bearer_auth does not produce a double prefix.
@@ -468,7 +522,7 @@ mod tests {
             oauth: Some(stepper_config::McpOAuthConfig::default()),
             ..McpServerConfig::default()
         };
-        let err = connect_http("stepper-test-oauth-no-creds-zzz", &cfg, connect_timeout())
+        let err = connect_http("stepper-test-oauth-no-creds-zzz", &cfg, connect_timeout(), None)
             .await
             .expect_err("an oauth server with no creds must fail to connect");
         let msg = err.to_string();
@@ -534,7 +588,7 @@ mod tests {
         let mut cfg = sh_server(&format!("touch '{}'; exit 0", marker.display()));
         cfg.enabled = Some(false);
         let servers = BTreeMap::from([("off".to_string(), cfg)]);
-        let mgr = McpManager::connect(&servers, Path::new(".")).await;
+        let mgr = McpManager::connect(&servers, Path::new("."), None).await;
         assert!(mgr.is_empty(), "a disabled server is not connected");
         assert!(!marker.exists(), "a disabled server's command must not run");
     }
@@ -547,7 +601,7 @@ mod tests {
         let mut cfg = sh_server("touch ran-here; exit 0");
         cfg.cwd = Some(dir.path().to_string_lossy().into_owned());
         let servers = BTreeMap::from([("p".to_string(), cfg)]);
-        let _ = McpManager::connect(&servers, Path::new(".")).await;
+        let _ = McpManager::connect(&servers, Path::new("."), None).await;
         assert!(dir.path().join("ran-here").exists(), "the stdio server ran in its cwd");
     }
 }

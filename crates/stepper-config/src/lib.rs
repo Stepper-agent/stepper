@@ -29,8 +29,8 @@ pub use schema::{settings_schema, validate_settings, validate_settings_values};
 pub use settings::{
     deep_merge, ApprovalRule, FormatterConfig, FormatterEntry, HookEntry, LimitsConfig, LspConfig,
     LspServerEntry, McpOAuthConfig, McpServerConfig, ModelOverride, NotificationConfig,
-    NotificationDetail, OrchestratorConfig, Permissions, ProviderConfig, SandboxConfig, SettingsFile,
-    ThemeConfig, PROVIDER_KINDS,
+    NotificationDetail, OrchestratorConfig, Permissions, ProviderConfig, ProxyConfig, SandboxConfig,
+    SettingsFile, ThemeConfig, PROVIDER_KINDS,
 };
 pub use substitution::{substitute, CommandArgs, SubstitutionIo};
 

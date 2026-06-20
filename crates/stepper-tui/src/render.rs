@@ -384,7 +384,11 @@ fn render_list_picker(frame: &mut Frame, area: Rect, picker: &ListPicker, theme:
     let rows = (inner.height as usize).saturating_sub(1);
     let offset = scroll_offset(picker.selected, picker.matches.len(), rows);
     for (row, &idx) in picker.matches.iter().enumerate().skip(offset).take(rows) {
-        let style = if row == picker.selected {
+        let style = if !picker.items[idx].connectable {
+            // Unactionable row (an unsupported `/connect` provider): dimmed, never
+            // highlighted — Enter is a no-op so a reversed cursor would mislead.
+            Style::default().fg(theme.muted).add_modifier(Modifier::DIM)
+        } else if row == picker.selected {
             Style::default().fg(theme.accent).add_modifier(Modifier::REVERSED)
         } else {
             Style::default().fg(theme.muted)
@@ -1337,8 +1341,8 @@ mod tests {
         let mut picker = ListPicker::new(
             PickerKind::Rewind,
             vec![
-                ListPickerItem { id: "turn-2".into(), label: "turn 2".into() },
-                ListPickerItem { id: "turn-1".into(), label: "turn 1".into() },
+                ListPickerItem { id: "turn-2".into(), label: "turn 2".into(), connectable: true },
+                ListPickerItem { id: "turn-1".into(), label: "turn 1".into(), connectable: true },
             ],
         );
         picker.selected = 1;
@@ -1358,6 +1362,7 @@ mod tests {
             vec![ListPickerItem {
                 id: "abc".into(),
                 label: "earlier · 2 turn(s) · 3m ago — fix the bug".into(),
+                connectable: true,
             }],
         )));
         let out = render_to_string(&s, 100, 12);

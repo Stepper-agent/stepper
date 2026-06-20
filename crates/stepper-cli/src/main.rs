@@ -34,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Import(args)) => import_cmd(args),
         Some(Command::Session(args)) => session_cmd(args, cli.global),
         Some(Command::Mcp(args)) => mcp_cmd(args, cli.global).await,
+        Some(Command::Stats(args)) => stats_cmd(args, cli.global),
     }
 }
 
@@ -65,8 +66,9 @@ async fn mcp_cmd(args: cli::McpArgs, global: GlobalArgs) -> anyhow::Result<()> {
             if oauth_cfg.disabled {
                 anyhow::bail!("server '{name}' has `oauth.disabled = true`");
             }
-            // Follows redirects and carries any extra CA (proxy/corp TLS).
-            let client = ProviderFactory::new()?.http_client();
+            // Follows redirects and carries any extra CA + the configured proxy
+            // (so OAuth works in a corp-proxy / non-env-proxy environment too).
+            let client = ProviderFactory::with_proxy(cfg.settings.proxy.as_ref())?.http_client();
             stepper_mcp::authenticate(&name, &oauth_cfg, url, client)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -844,6 +846,32 @@ fn session_cmd(args: cli::SessionArgs, global: GlobalArgs) -> anyhow::Result<()>
                 anyhow::bail!("no session '{id}' found");
             }
         }
+    }
+    Ok(())
+}
+
+/// `stepper stats`: aggregate token/cost usage across every saved session.
+fn stats_cmd(args: cli::StatsArgs, global: GlobalArgs) -> anyhow::Result<()> {
+    let cwd = global.cwd.clone().map(Ok).unwrap_or_else(std::env::current_dir)?;
+    // Resolve the project root (as session/resume do) so it works from any subdir.
+    let root = stepper_config::discovery::discover(&cwd).project_root.unwrap_or(cwd);
+    let store = SessionStore::new(&root);
+    let records: Vec<_> = store.list_recent(usize::MAX).into_iter().map(|(r, _)| r).collect();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stats = stepper_core::aggregate_stats(&records, args.days, now_secs);
+
+    if let Some(path) = args.export {
+        let is_csv = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("csv"));
+        let body = if is_csv { stats.to_csv() } else { serde_json::to_string_pretty(&stats)? };
+        std::fs::write(&path, body)?;
+        println!("wrote stats to {}", path.display());
+    } else if args.json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+    } else {
+        print!("{}", stats.render_text(args.models, args.tools));
     }
     Ok(())
 }

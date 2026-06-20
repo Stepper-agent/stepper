@@ -212,9 +212,13 @@ impl ProviderResolver for ConfigProviderResolver {
         catalog
             .provider_seeds()
             .into_iter()
-            .map(|m| ProviderChoiceView {
-                id: m.id.clone(),
-                label: provider_label(m),
+            .map(|m| {
+                let connectable = provider_connectable(m);
+                ProviderChoiceView {
+                    id: m.id.clone(),
+                    label: provider_label(m, connectable),
+                    connectable,
+                }
             })
             .collect()
     }
@@ -282,6 +286,16 @@ impl ProviderResolver for ConfigProviderResolver {
     }
 }
 
+/// Whether `connect_provider` can resolve an API base for this catalog entry —
+/// the SINGLE source of truth shared with the `/connect` picker so the rows it
+/// offers exactly match the ones `connect_provider` accepts. Mirrors the
+/// `base_url` decision in `connect_provider`: an explicit `api`, the canonical
+/// `anthropic` (factory default), or a known openai-compat host. Everything else
+/// (e.g. google-vertex-anthropic) is unconnectable without a manual `baseUrl`.
+fn provider_connectable(meta: &ProviderMeta) -> bool {
+    meta.api.is_some() || meta.id == "anthropic" || known_openai_compat_base(&meta.id).is_some()
+}
+
 /// Base URLs for well-known OpenAI-compatible providers whose models.dev entry
 /// omits `api` (their ai-sdk package hard-codes the host). Only hosts we are
 /// confident about — anything else is refused rather than guessed, so a key is
@@ -313,11 +327,15 @@ fn provider_kind(meta: &ProviderMeta) -> &'static str {
 }
 
 /// `id  ·  Display Name  ·  KEY_ENV_VAR` — the `/connect` picker row (searchable
-/// by id or name; the env hint tells the user which key to paste).
-fn provider_label(meta: &ProviderMeta) -> String {
+/// by id or name; the env hint tells the user which key to paste). Unconnectable
+/// providers get a trailing note so the dimmed row explains itself.
+fn provider_label(meta: &ProviderMeta, connectable: bool) -> String {
     let mut s = format!("{}  ·  {}", meta.id, meta.name);
     if let Some(env) = meta.env.first() {
         s.push_str(&format!("  ·  {env}"));
+    }
+    if !connectable {
+        s.push_str("  ·  (unsupported — set baseUrl manually)");
     }
     s
 }
@@ -764,6 +782,49 @@ mod tests {
         // than defaulted to api.anthropic.com.
         let err2 = resolver.connect_provider("google-vertex-anthropic").await.unwrap_err();
         assert!(err2.to_string().contains("no API base URL"), "got: {err2}");
+    }
+
+    #[test]
+    fn provider_connectable_mirrors_connect_base_resolution() {
+        // api present.
+        assert!(provider_connectable(&ProviderMeta {
+            id: "acme".into(),
+            api: Some("https://api.acme.ai/v1".into()),
+            ..Default::default()
+        }));
+        // canonical anthropic (factory default base is correct).
+        assert!(provider_connectable(&ProviderMeta { id: "anthropic".into(), ..Default::default() }));
+        // known api-less openai-compat host.
+        assert!(provider_connectable(&ProviderMeta { id: "groq".into(), ..Default::default() }));
+        // api-less + unknown host + not anthropic → unconnectable.
+        assert!(!provider_connectable(&ProviderMeta { id: "obscure".into(), ..Default::default() }));
+        assert!(!provider_connectable(&ProviderMeta {
+            id: "google-vertex-anthropic".into(),
+            ..Default::default()
+        }));
+    }
+
+    #[tokio::test]
+    async fn list_providers_connectable_flag_matches_connect_acceptance() {
+        // Same shape as the refuses-unknown catalog: a mix of connectable and not.
+        let catalog = stepper_providers::models::parse_catalog(&serde_json::json!({
+            "groq": { "name": "Groq", "npm": "@ai-sdk/groq", "env": ["GROQ_API_KEY"], "models": { "llama-x": {} } },
+            "obscure": { "name": "Obscure", "npm": "@ai-sdk/openai-compatible", "env": ["OBSCURE_KEY"], "models": { "m": {} } },
+            "anthropic": { "name": "Anthropic", "npm": "@ai-sdk/anthropic", "env": ["ANTHROPIC_API_KEY"], "models": { "claude": {} } },
+            "google-vertex-anthropic": { "name": "Vertex Anthropic", "npm": "@ai-sdk/google-vertex/anthropic", "env": ["GOOGLE_APPLICATION_CREDENTIALS"], "models": { "claude-v": {} } }
+        }));
+        let resolver = resolver_for_connect(Some(catalog));
+        let listed = resolver.list_providers().await;
+        assert!(!listed.is_empty(), "the catalog seeds the picker");
+        // Every row's `connectable` flag matches whether `connect_provider` accepts
+        // it — the picker can't offer a row the resolver would only reject.
+        for p in &listed {
+            let accepted = resolver.connect_provider(&p.id).await.is_ok();
+            assert_eq!(p.connectable, accepted, "flag vs acceptance mismatch for {}", p.id);
+        }
+        let vertex = listed.iter().find(|p| p.id == "google-vertex-anthropic").unwrap();
+        assert!(!vertex.connectable, "vertex is unconnectable");
+        assert!(vertex.label.contains("unsupported"), "dimmed row explains itself: {}", vertex.label);
     }
 
     #[tokio::test]

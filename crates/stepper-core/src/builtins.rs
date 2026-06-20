@@ -448,11 +448,25 @@ async fn handle_compact(
     let freed_tokens = before.saturating_sub(estimate_tokens(&messages));
 
     // The compacted history replaces the persisted turns as one synthetic turn,
-    // and reseeds the live conversation for the next turn.
+    // and reseeds the live conversation for the next turn. Roll the prior turns'
+    // usage/cost into it so cross-session `stepper stats` totals survive a compaction
+    // instead of being silently zeroed.
+    let prior_usage = session.turns.iter().fold(Usage::default(), |mut acc, t| {
+        acc.add(&t.usage);
+        acc
+    });
+    let prior_cost = session.turns.iter().map(|t| t.cost_usd).sum();
     session.turns = vec![TurnRecord {
         user: "/compact".into(),
         summaries: vec![("compact".into(), summary)],
         messages: messages.clone(),
+        usage: prior_usage,
+        cost_usd: prior_cost,
+        // Stamp the compaction moment so the rolled-up usage still falls inside a
+        // `stats --days` window (an absent timestamp would drop it from every
+        // windowed view — the opposite of preserving it).
+        ended_at: crate::now_unix_secs(),
+        ..Default::default()
     }];
     *turn_id = session.turns.len() as u64;
     let _ = store.save(session);

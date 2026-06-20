@@ -22,6 +22,7 @@ pub mod resolver;
 pub mod session;
 pub mod setup;
 pub mod skills;
+pub mod stats;
 pub mod tasks;
 
 pub use agent::{AgentLoop, LayerOutcome, LspDiagnostics};
@@ -42,6 +43,7 @@ pub use orchestrator::{Orchestrator, SessionLimits, TurnOutput};
 pub use ports::ProviderResolver;
 pub use resolver::ConfigProviderResolver;
 pub use session::{SessionRecord, SessionStore, TurnRecord};
+pub use stats::{aggregate_stats, SessionStats};
 pub use setup::{
     build_steps, compose_system, load_agents, load_base_context, resolve_formatters,
     AGENT_DIRECTIVES, DEFAULT_SYSTEM_PROMPT,
@@ -167,6 +169,14 @@ pub fn spawn_core(
                         }
                         _ => (prompt.clone(), None),
                     };
+                    // The model that will actually run this turn (the swapped
+                    // `#agent` step, or the primary step otherwise) — captured
+                    // before `restore_steps` puts the pipeline back, for stats.
+                    let turn_model_ref = orchestrator
+                        .steps
+                        .first()
+                        .map(|s| s.model_ref.clone())
+                        .unwrap_or_default();
                     turn_id += 1;
                     // A new turn forks the timeline — any pending /redo is now stale.
                     clear_redo(&mut redo_stack, &snapshotter);
@@ -206,6 +216,10 @@ pub fn spawn_core(
                                 user: prompt,
                                 summaries: output.summaries,
                                 messages: output.messages,
+                                usage: output.usage,
+                                cost_usd: output.cost_usd,
+                                model_ref: turn_model_ref,
+                                ended_at: now_unix_secs(),
                             });
                             let _ = store.save(&session);
                             // Carry the conversation into the live context so the
@@ -404,6 +418,12 @@ pub fn spawn_core(
                             } else {
                                 None
                             };
+                            // The running model (after any per-command override) for stats.
+                            let turn_model_ref = orchestrator
+                                .steps
+                                .first()
+                                .map(|s| s.model_ref.clone())
+                                .unwrap_or_default();
                             let mut result = None;
                             let mut deferred = Vec::new();
                             let turn_timeout = orchestrator.limits.turn_timeout;
@@ -434,6 +454,10 @@ pub fn spawn_core(
                                     user: format!("/{name} {args}").trim().to_string(),
                                     summaries: output.summaries,
                                     messages: output.messages,
+                                    usage: output.usage,
+                                    cost_usd: output.cost_usd,
+                                    model_ref: turn_model_ref,
+                                    ended_at: now_unix_secs(),
                                 });
                                 let _ = store.save(&session);
                                 // Same as the chat path: carry the conversation
@@ -673,6 +697,15 @@ fn fmt_secs(secs: u64) -> String {
         (m, 0) => format!("{m}m"),
         (m, s) => format!("{m}m {s}s"),
     }
+}
+
+/// Wall-clock unix-epoch seconds for a turn's `ended_at`, or `None` if the system
+/// clock is before the epoch (never, in practice).
+pub(crate) fn now_unix_secs() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 /// Snapshot the working tree for `/rewind`, surfacing a warning if it fails

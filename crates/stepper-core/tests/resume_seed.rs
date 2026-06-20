@@ -337,6 +337,7 @@ async fn resume_seeds_the_real_prior_messages_into_the_next_request() {
                 },
                 Message::assistant("prior answer"),
             ],
+            ..Default::default()
         }],
     };
     store.save(&prior).unwrap();
@@ -409,6 +410,7 @@ async fn clear_drops_the_resume_seed_for_later_turns() {
             user: "earlier ask".into(),
             summaries: vec![("solo".into(), "prior answer".into())],
             messages: vec![Message::user("earlier ask"), Message::assistant("prior answer")],
+            ..Default::default()
         }],
     };
     store.save(&prior).unwrap();

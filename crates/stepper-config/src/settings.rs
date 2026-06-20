@@ -87,6 +87,12 @@ pub struct SettingsFile {
     /// terminal bell (`\x07`) emitted by the TUI — no OS notifications or sounds.
     #[serde(default)]
     pub notification: Option<NotificationConfig>,
+    /// Explicit HTTP/HTTPS proxy for all outbound requests (provider calls,
+    /// `web_fetch`, http MCP). Omitted = honor the standard `HTTP(S)_PROXY` /
+    /// `NO_PROXY` environment variables (reqwest's default). Setting it overrides
+    /// the environment; `disabled: true` forces a direct connection.
+    #[serde(default)]
+    pub proxy: Option<ProxyConfig>,
 }
 
 /// `setting.json` `lsp`: a master on/off switch or a map of per-server overrides
@@ -212,6 +218,34 @@ impl NotificationConfig {
 pub struct SandboxConfig {
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Explicit proxy. Any of `http`/`https`/`all` set REPLACES the environment
+/// proxy (reqwest turns off env auto-proxy once an explicit proxy is set);
+/// `disabled: true` forces a direct connection (ignoring the environment).
+/// `noProxy` is a comma-separated host/suffix bypass list for the explicit proxy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub all: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_proxy: Option<String>,
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+impl ProxyConfig {
+    /// Whether this asks for any non-default behavior (an explicit proxy or a
+    /// forced direct connection). `false` → leave reqwest on its env default. A
+    /// lone `noProxy` with no proxy URL is meaningless, so it counts as inactive.
+    pub fn is_active(&self) -> bool {
+        self.disabled || self.http.is_some() || self.https.is_some() || self.all.is_some()
+    }
 }
 
 /// TUI color theme: a built-in `preset` palette plus per-role color overrides.
@@ -528,6 +562,31 @@ mod tests {
         let empty: SettingsFile = serde_json::from_str(r#"{"theme":{}}"#).unwrap();
         let t = empty.theme.unwrap();
         assert!(t.preset.is_none() && t.colors.is_empty());
+    }
+
+    #[test]
+    fn proxy_config_parses_and_camelcases_no_proxy() {
+        // Absent by default.
+        assert!(serde_json::from_str::<SettingsFile>("{}").unwrap().proxy.is_none());
+        // A full config (camelCase noProxy) parses and is active.
+        let s: SettingsFile = serde_json::from_str(
+            r#"{"proxy":{"http":"http://p:3128","https":"http://p:3128","all":"http://p:8080","noProxy":"localhost,127.0.0.1"}}"#,
+        )
+        .unwrap();
+        let p = s.proxy.unwrap();
+        assert_eq!(p.http.as_deref(), Some("http://p:3128"));
+        assert_eq!(p.all.as_deref(), Some("http://p:8080"));
+        assert_eq!(p.no_proxy.as_deref(), Some("localhost,127.0.0.1"));
+        assert!(!p.disabled);
+        assert!(p.is_active());
+        // `disabled: true` alone (forced direct) is active.
+        let d: SettingsFile = serde_json::from_str(r#"{"proxy":{"disabled":true}}"#).unwrap();
+        assert!(d.proxy.unwrap().is_active());
+        // An empty block / lone noProxy is inactive (no proxy URL, not disabled).
+        let empty: SettingsFile = serde_json::from_str(r#"{"proxy":{}}"#).unwrap();
+        assert!(!empty.proxy.unwrap().is_active());
+        let lone: SettingsFile = serde_json::from_str(r#"{"proxy":{"noProxy":"localhost"}}"#).unwrap();
+        assert!(!lone.proxy.unwrap().is_active());
     }
 
     #[test]

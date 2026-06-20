@@ -175,15 +175,19 @@ pub async fn build_orchestrator_with_fallback(
         .unwrap_or(8);
     let dispatch_step_cap = config.settings.dispatch.as_ref().and_then(|d| d.step_cap);
 
+    // Explicit proxy from config (None → reqwest's env-proxy default) routes every
+    // outbound client: provider calls, `web_fetch`, and http MCP.
+    let proxy = config.settings.proxy.clone();
+
     // stdio MCP servers' `cwd` resolves against the project root (or cwd if none).
     let mcp_base = config.project_root.as_deref().unwrap_or(cwd.as_path());
-    let mcp = McpManager::connect(&config.settings.mcp_servers, mcp_base).await;
-    let mut base_tools = stepper_tools::ToolRegistry::builtins();
+    let mcp = McpManager::connect(&config.settings.mcp_servers, mcp_base, proxy.as_ref()).await;
+    let mut base_tools = stepper_tools::ToolRegistry::builtins_with_proxy(proxy.clone());
     for tool in mcp.tools() {
         base_tools.register(tool);
     }
 
-    let factory = ProviderFactory::new()?;
+    let factory = ProviderFactory::with_proxy(proxy.as_ref())?;
     let codex_store = CodexTokenStore::load(CodexTokenStore::default_path(), factory.client()).ok();
     // Seed ModelInfo (context window + pricing) from the live models.dev catalog
     // so unknown-but-cataloged models get real figures instead of the builtin

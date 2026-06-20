@@ -587,6 +587,7 @@ fn long_session(id: &str, messages: usize) -> SessionRecord {
             user: "the long opening ask".into(),
             summaries: vec![("solo".into(), "did things".into())],
             messages: msgs,
+            ..Default::default()
         }],
     }
 }
@@ -596,7 +597,11 @@ async fn compact_folds_the_persisted_conversation_with_focus_instructions() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let store = SessionStore::new(&root);
-    let session = long_session("to-compact", 12);
+    let mut session = long_session("to-compact", 12);
+    // Give the pre-compaction turn real usage/cost so we can assert compaction
+    // rolls them into the synthetic turn (stats must survive a compaction).
+    session.turns[0].usage = Usage { input: 500, output: 200, ..Default::default() };
+    session.turns[0].cost_usd = 0.42;
     let original = session.seed_messages();
     let before = stepper_core::compaction::estimate_tokens(&original);
     store.save(&session).unwrap();
@@ -632,6 +637,11 @@ async fn compact_folds_the_persisted_conversation_with_focus_instructions() {
     let reloaded = store.load("to-compact").unwrap();
     assert_eq!(reloaded.turns.len(), 1);
     assert_eq!(reloaded.turns[0].user, "/compact");
+    // The synthetic turn rolls up the prior turns' usage/cost and is stamped, so
+    // cross-session `stats` (incl. a `--days` window) still sees them post-compact.
+    assert_eq!(reloaded.turns[0].usage, Usage { input: 500, output: 200, ..Default::default() });
+    assert!((reloaded.turns[0].cost_usd - 0.42).abs() < 1e-9);
+    assert!(reloaded.turns[0].ended_at.is_some(), "compact turn is timestamped for stats --days");
     let compacted = &reloaded.turns[0].messages;
     assert_eq!(compacted.len(), 1 + 6, "marker + keep_recent tail: {compacted:#?}");
     assert!(compacted[0].text().contains("FOCUSED SUMMARY"), "got: {:?}", compacted[0]);

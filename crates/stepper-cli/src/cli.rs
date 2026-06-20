@@ -117,6 +117,29 @@ pub enum Command {
     Session(SessionArgs),
     /// Manage MCP server OAuth: `stepper mcp auth <name>` / `logout <name>` / `status`.
     Mcp(McpArgs),
+    /// Cross-session token & cost statistics: `stepper stats`.
+    Stats(StatsArgs),
+}
+
+#[derive(Args)]
+pub struct StatsArgs {
+    /// Only count turns from the last N days (turns without a timestamp — saved
+    /// before stats tracking — are excluded once this is set).
+    #[arg(long)]
+    pub days: Option<u64>,
+    /// Emit the full `SessionStats` as JSON instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+    /// Include the per-model breakdown in the human summary.
+    #[arg(long)]
+    pub models: bool,
+    /// Include the top-N tools by call count in the human summary.
+    #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "10")]
+    pub tools: Option<usize>,
+    /// Write the stats to a file instead of stdout. The format is taken from the
+    /// extension: `.csv` → CSV (per-model table), anything else → JSON.
+    #[arg(long, value_name = "PATH")]
+    pub export: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -291,6 +314,37 @@ impl From<ModeArg> for Mode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stats_args_parse() {
+        // Bare `stats` → all defaults.
+        let cli = Cli::try_parse_from(["stepper", "stats"]).unwrap();
+        match cli.command {
+            Some(Command::Stats(a)) => {
+                assert_eq!(a.days, None);
+                assert!(!a.json && !a.models);
+                assert_eq!(a.tools, None);
+                assert!(a.export.is_none());
+            }
+            _ => panic!("expected stats"),
+        }
+        // Flags: --days, --json, --models, --tools (with and without N), --export/--format.
+        let cli = Cli::try_parse_from(["stepper", "stats", "--days", "7", "--json", "--models"]).unwrap();
+        match cli.command {
+            Some(Command::Stats(a)) => {
+                assert_eq!(a.days, Some(7));
+                assert!(a.json && a.models);
+            }
+            _ => panic!("expected stats"),
+        }
+        // `--tools` alone defaults to 10; `--tools N` takes the value.
+        let cli = Cli::try_parse_from(["stepper", "stats", "--tools"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Stats(a)) if a.tools == Some(10)));
+        let cli = Cli::try_parse_from(["stepper", "stats", "--tools", "3"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Stats(a)) if a.tools == Some(3)));
+        let cli = Cli::try_parse_from(["stepper", "stats", "--export", "/tmp/s.csv"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Stats(a)) if a.export.as_deref() == Some(std::path::Path::new("/tmp/s.csv"))));
+    }
 
     #[test]
     fn continue_flag_parses_short_and_long() {

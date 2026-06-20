@@ -5,6 +5,7 @@ use crate::openai_compat::OpenAiCompatAdapter;
 use crate::responses::OpenAiResponsesAdapter;
 use crate::error;
 use std::time::Duration;
+use stepper_config::ProxyConfig;
 use stepper_provider::{LlmProvider, ProviderError};
 
 /// Which dialect an adapter speaks.
@@ -70,6 +71,12 @@ pub struct ProviderFactory {
 
 impl ProviderFactory {
     pub fn new() -> Result<Self, ProviderError> {
+        Self::with_proxy(None)
+    }
+
+    /// Like `new`, but routes both clients through an explicit `proxy` from
+    /// config (`None` keeps reqwest's `HTTP(S)_PROXY`/`NO_PROXY` env default).
+    pub fn with_proxy(proxy: Option<&ProxyConfig>) -> Result<Self, ProviderError> {
         // The streaming client deliberately carries no overall `.timeout()` — it
         // would kill long-lived SSE streams. But a `read_timeout` bounds the gap
         // BETWEEN reads (it resets on every chunk), so it never kills an active
@@ -77,7 +84,7 @@ impl ProviderFactory {
         // before sending response headers, on a non-2xx body, or mid-stream. That
         // stall was otherwise unbounded (the SSE idle timeout in `sse::drive` only
         // runs once frames are flowing) and hung the whole turn with no way out.
-        let client = apply_extra_ca(reqwest::Client::builder())
+        let client = apply_proxy(apply_extra_ca(reqwest::Client::builder()), proxy)
             .user_agent(concat!("stepper/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(30))
             .read_timeout(Duration::from_secs(120))
@@ -85,7 +92,7 @@ impl ProviderFactory {
             .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .map_err(error::transport)?;
-        let auth_client = apply_extra_ca(reqwest::Client::builder())
+        let auth_client = apply_proxy(apply_extra_ca(reqwest::Client::builder()), proxy)
             .user_agent(concat!("stepper/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(30))
             .timeout(crate::codex::auth_http_timeout())
@@ -228,6 +235,43 @@ pub(crate) fn apply_extra_ca(builder: reqwest::ClientBuilder) -> reqwest::Client
     }
 }
 
+/// Apply an explicit proxy from config. `None`/inactive leaves the builder
+/// untouched so reqwest's `HTTP(S)_PROXY`/`NO_PROXY` env default applies. An
+/// explicit proxy REPLACES the env proxy (reqwest disables env auto-proxy once a
+/// `.proxy()`/`.no_proxy()` is set); `disabled: true` forces a direct connection.
+/// Fail-open: a malformed proxy URL is logged and skipped, never aborting startup.
+pub(crate) fn apply_proxy(mut builder: reqwest::ClientBuilder, proxy: Option<&ProxyConfig>) -> reqwest::ClientBuilder {
+    let Some(proxy) = proxy.filter(|p| p.is_active()) else {
+        return builder;
+    };
+    if proxy.disabled {
+        return builder.no_proxy();
+    }
+    let no_proxy = || proxy.no_proxy.as_deref().and_then(reqwest::NoProxy::from_string);
+    // reqwest uses the FIRST added proxy whose scheme matches, so register the
+    // scheme-specific ones before the catch-all `all` (which matches everything) —
+    // otherwise a configured `all` would shadow `http`/`https` (dead config).
+    if let Some(url) = proxy.http.as_deref() {
+        match reqwest::Proxy::http(url) {
+            Ok(p) => builder = builder.proxy(p.no_proxy(no_proxy())),
+            Err(e) => tracing::warn!("proxy: ignoring invalid `http` proxy {url:?}: {e}"),
+        }
+    }
+    if let Some(url) = proxy.https.as_deref() {
+        match reqwest::Proxy::https(url) {
+            Ok(p) => builder = builder.proxy(p.no_proxy(no_proxy())),
+            Err(e) => tracing::warn!("proxy: ignoring invalid `https` proxy {url:?}: {e}"),
+        }
+    }
+    if let Some(url) = proxy.all.as_deref() {
+        match reqwest::Proxy::all(url) {
+            Ok(p) => builder = builder.proxy(p.no_proxy(no_proxy())),
+            Err(e) => tracing::warn!("proxy: ignoring invalid `all` proxy {url:?}: {e}"),
+        }
+    }
+    builder
+}
+
 /// Known commercial OpenAI-compatible hosts that require an API key, so a keyless
 /// build fails closed instead of sending an unauthorized request. Self-hosted and
 /// localhost servers (oMLX, vLLM, a local Ollama) are intentionally excluded and
@@ -300,6 +344,41 @@ IASKmoilz1GrAGEFfwEnc0L5PrhPs/eX8Q==\n\
 
     fn build(builder: reqwest::ClientBuilder) -> bool {
         builder.build().is_ok()
+    }
+
+    #[test]
+    fn apply_proxy_is_noop_disabled_and_explicit_all_build_ok() {
+        // None → untouched (env auto-proxy preserved).
+        assert!(build(apply_proxy(reqwest::Client::builder(), None)));
+        // An all-None config is inactive → also a no-op.
+        let inactive = ProxyConfig::default();
+        assert!(!inactive.is_active());
+        assert!(build(apply_proxy(reqwest::Client::builder(), Some(&inactive))));
+        // disabled → forced direct connection.
+        let disabled = ProxyConfig { disabled: true, ..Default::default() };
+        assert!(disabled.is_active());
+        assert!(build(apply_proxy(reqwest::Client::builder(), Some(&disabled))));
+        // A valid explicit proxy (with a noProxy bypass) builds.
+        let explicit = ProxyConfig {
+            all: Some("http://127.0.0.1:8080".into()),
+            no_proxy: Some("localhost,127.0.0.1".into()),
+            ..Default::default()
+        };
+        assert!(build(apply_proxy(reqwest::Client::builder(), Some(&explicit))));
+        // Separate http/https entries also build.
+        let split = ProxyConfig {
+            http: Some("http://proxy.internal:3128".into()),
+            https: Some("http://proxy.internal:3128".into()),
+            ..Default::default()
+        };
+        assert!(build(apply_proxy(reqwest::Client::builder(), Some(&split))));
+    }
+
+    #[test]
+    fn apply_proxy_fails_open_on_a_garbage_url() {
+        // A malformed proxy URL is skipped (logged), never aborting the build.
+        let garbage = ProxyConfig { all: Some("not a url".into()), ..Default::default() };
+        assert!(build(apply_proxy(reqwest::Client::builder(), Some(&garbage))));
     }
 
     #[test]

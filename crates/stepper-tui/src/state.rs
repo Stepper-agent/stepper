@@ -266,6 +266,9 @@ pub struct ListPickerItem {
     pub id: String,
     /// The rendered row.
     pub label: String,
+    /// Whether this row can be acted on. Disabled rows (e.g. a `/connect`
+    /// provider with no resolvable API base) render dimmed and ignore Enter.
+    pub connectable: bool,
 }
 
 impl ListPicker {
@@ -334,8 +337,24 @@ impl ListPicker {
         self.selected = (((self.selected as i32 + delta) % n + n) % n) as usize;
     }
 
+    /// Whether the row under the cursor exists but is disabled (an unsupported
+    /// `/connect` provider). Distinct from an empty match set, so the caller can
+    /// keep the picker open on a no-op Enter yet still close an empty picker.
+    fn is_selected_disabled(&self) -> bool {
+        match self.matches.get(self.selected) {
+            Some(&idx) => self.items.get(idx).map(|it| !it.connectable).unwrap_or(false),
+            None => false,
+        }
+    }
+
     fn selection(&self) -> Option<Action> {
         let item = self.items.get(*self.matches.get(self.selected)?)?;
+        // A disabled row (an unsupported `/connect` provider) is shown for context
+        // but can't be acted on — Enter is a no-op rather than firing a doomed
+        // connect that the resolver would only reject.
+        if !item.connectable {
+            return None;
+        }
         Some(match self.kind {
             PickerKind::Rewind => Action::Rewind {
                 checkpoint_id: item.id.clone(),
@@ -968,6 +987,12 @@ impl AppState {
     pub fn overlay_picker_select(&mut self) -> Effects {
         let mut effects = Effects::new();
         if let Some(Overlay::Picker(p)) = &self.overlay {
+            // A disabled row under the cursor (unsupported `/connect` provider) is a
+            // no-op: keep the picker open so the user can move to a usable row. An
+            // empty picker (no matches) still closes on Enter, as before.
+            if p.is_selected_disabled() {
+                return effects;
+            }
             if let Some(action) = p.selection() {
                 effects.push(Effect::Send(action));
             }
@@ -1104,6 +1129,7 @@ impl AppState {
                     .map(|c: CheckpointView| ListPickerItem {
                         label: format!("turn {}", c.turn),
                         id: c.id,
+                        connectable: true,
                     })
                     .collect();
                 self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Rewind, items)));
@@ -1120,6 +1146,7 @@ impl AppState {
                             s.digest
                         ),
                         id: s.id,
+                        connectable: true,
                     })
                     .collect();
                 self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Resume, items)));
@@ -1130,6 +1157,7 @@ impl AppState {
                     .map(|m: ModelChoiceView| ListPickerItem {
                         label: m.label,
                         id: m.model_ref,
+                        connectable: true,
                     })
                     .collect();
                 self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Model, items)));
@@ -1137,7 +1165,11 @@ impl AppState {
             AppEvent::ProviderList(providers) => {
                 let items = providers
                     .into_iter()
-                    .map(|p: ProviderChoiceView| ListPickerItem { label: p.label, id: p.id })
+                    .map(|p: ProviderChoiceView| ListPickerItem {
+                        label: p.label,
+                        id: p.id,
+                        connectable: p.connectable,
+                    })
                     .collect();
                 self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Connect, items)));
             }
@@ -2338,9 +2370,9 @@ mod tests {
     fn provider_picker_filters_on_query_and_selects_via_connect() {
         let mut s = test_state();
         s.apply_event(AppEvent::ProviderList(vec![
-            ProviderChoiceView { id: "anthropic".into(), label: "anthropic  ·  Anthropic".into() },
-            ProviderChoiceView { id: "openai".into(), label: "openai  ·  OpenAI".into() },
-            ProviderChoiceView { id: "openrouter".into(), label: "openrouter  ·  OpenRouter".into() },
+            ProviderChoiceView { id: "anthropic".into(), label: "anthropic  ·  Anthropic".into(), connectable: true },
+            ProviderChoiceView { id: "openai".into(), label: "openai  ·  OpenAI".into(), connectable: true },
+            ProviderChoiceView { id: "openrouter".into(), label: "openrouter  ·  OpenRouter".into(), connectable: true },
         ]));
         assert!(s.overlay_picker_searchable(), "the connect picker is searchable");
         // Type "openr" → only openrouter remains.
@@ -2363,6 +2395,32 @@ mod tests {
                 assert_eq!(args, "openrouter");
             }
             _ => panic!("expected a /connect send for the filtered selection"),
+        }
+    }
+
+    #[test]
+    fn unconnectable_provider_row_is_not_selectable() {
+        let mut s = test_state();
+        s.apply_event(AppEvent::ProviderList(vec![
+            ProviderChoiceView {
+                id: "google-vertex-anthropic".into(),
+                label: "google-vertex-anthropic  ·  (unsupported — set baseUrl manually)".into(),
+                connectable: false,
+            },
+            ProviderChoiceView { id: "anthropic".into(), label: "anthropic  ·  Anthropic".into(), connectable: true },
+        ]));
+        // The disabled row sits at index 0 (selected by default) → Enter is a no-op.
+        let effects = s.overlay_picker_select();
+        assert!(effects.is_empty(), "selecting an unconnectable row emits nothing");
+        assert!(matches!(s.overlay, Some(Overlay::Picker(_))), "the picker stays open");
+        // The connectable row still fires `/connect`.
+        s.overlay_picker_move(1);
+        match s.overlay_picker_select().as_slice() {
+            [Effect::Send(Action::SlashCommand { name, args })] => {
+                assert_eq!(name, "connect");
+                assert_eq!(args, "anthropic");
+            }
+            _ => panic!("expected /connect for the connectable row"),
         }
     }
 

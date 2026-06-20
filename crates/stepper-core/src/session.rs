@@ -7,12 +7,27 @@ use stepper_provider::Message;
 /// human-readable digest for pickers), and the full normalized message
 /// transcript (assistant blocks, tool calls/results) for full-fidelity resume.
 /// `messages` defaults empty so session files saved before it existed still load.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The trailing `usage`/`cost_usd`/`model_ref`/`ended_at` fields feed cross-session
+/// `stepper stats`; all default so older session files keep loading (they simply
+/// contribute zeros and no timestamp).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TurnRecord {
     pub user: String,
     pub summaries: Vec<(String, String)>,
     #[serde(default)]
     pub messages: Vec<Message>,
+    /// Token accounting for this turn (summed across its layers/steps).
+    #[serde(default)]
+    pub usage: stepper_provider::Usage,
+    /// USD cost of this turn (0 for local/keyless models).
+    #[serde(default)]
+    pub cost_usd: f64,
+    /// The turn's primary model ref (`provider/model-id`); empty for old files.
+    #[serde(default)]
+    pub model_ref: String,
+    /// Turn-completion time (unix epoch seconds); `None` for old files.
+    #[serde(default)]
+    pub ended_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -208,6 +223,7 @@ mod tests {
                 },
                 Message::assistant("planned it"),
             ],
+            ..Default::default()
         });
         store.save(&record).unwrap();
 
@@ -248,6 +264,13 @@ mod tests {
         assert!(loaded.turns[0].messages.is_empty());
         assert!(!loaded.has_messages(), "old files fall back to the digest path");
         assert!(loaded.resume_context().contains("decided on --verbose"));
+        // The stats fields (added later) default cleanly on an old file: zero
+        // usage/cost, no model, no timestamp — so stats just count it as a turn.
+        let t = &loaded.turns[0];
+        assert_eq!(t.usage, stepper_provider::Usage::default());
+        assert_eq!(t.cost_usd, 0.0);
+        assert!(t.model_ref.is_empty());
+        assert_eq!(t.ended_at, None);
 
         // A digest-only turn still seeds a synthesized message pair.
         let seed = loaded.seed_messages();
@@ -304,7 +327,7 @@ mod tests {
         let original = SessionRecord {
             id: "orig".into(),
             name: Some("spike".into()),
-            turns: vec![TurnRecord { user: "do a thing".into(), summaries: vec![], messages: vec![] }],
+            turns: vec![TurnRecord { user: "do a thing".into(), ..Default::default() }],
         };
         let fork = original.forked();
         assert_ne!(fork.id, original.id, "the fork gets a fresh id");

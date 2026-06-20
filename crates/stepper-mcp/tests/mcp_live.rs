@@ -105,7 +105,7 @@ async fn external_mcp_server_lists_and_optionally_calls_a_tool() {
     let mut servers = BTreeMap::new();
     servers.insert(name.clone(), cfg);
 
-    let manager = McpManager::connect(&servers, std::path::Path::new(".")).await;
+    let manager = McpManager::connect(&servers, std::path::Path::new("."), None).await;
     let names = manager.tool_names();
     eprintln!("{name} tools: {names:?}");
     assert!(!manager.is_empty(), "expected the MCP server to expose tools");

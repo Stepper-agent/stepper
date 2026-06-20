@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 stepper-provider = { path = "../stepper-provider" }
+stepper-config = { path = "../stepper-config" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

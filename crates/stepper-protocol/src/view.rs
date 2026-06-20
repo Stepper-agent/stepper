@@ -184,4 +184,12 @@ pub struct ProviderChoiceView {
     pub id: String,
     /// Rendered row (id + display name + expected key env var).
     pub label: String,
+    /// Whether `/connect <id>` can actually wire this provider (its API base is
+    /// resolvable). Unconnectable rows are shown dimmed so the user knows why.
+    #[serde(default = "default_true")]
+    pub connectable: bool,
+}
+
+fn default_true() -> bool {
+    true
 }

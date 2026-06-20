@@ -16,8 +16,14 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// Every built-in tool.
+    /// Every built-in tool (with `web_fetch` on reqwest's env-proxy default).
     pub fn builtins() -> Self {
+        Self::builtins_with_proxy(None)
+    }
+
+    /// Every built-in tool, with `web_fetch` routed through an explicit `proxy`
+    /// from config (`None` keeps the env-proxy default).
+    pub fn builtins_with_proxy(proxy: Option<stepper_config::ProxyConfig>) -> Self {
         let mut r = Self::new();
         r.register(Arc::new(files::ReadFile::default()));
         r.register(Arc::new(files::WriteFile::default()));
@@ -28,7 +34,7 @@ impl ToolRegistry {
         r.register(Arc::new(search::GlobTool::default()));
         r.register(Arc::new(search::ListDir::default()));
         r.register(Arc::new(todo::TodoWrite::default()));
-        r.register(Arc::new(fetch::WebFetch::default()));
+        r.register(Arc::new(fetch::WebFetch::with_proxy(proxy)));
         r
     }
 
