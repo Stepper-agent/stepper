@@ -64,6 +64,8 @@ open = "5"
 gray_matter = "0.2"
 schemars = "1"
 regex = "1"
+# JSONC (comments + trailing commas) parsing for `setting.json`.
+jsonc-parser = { version = "0.32", features = ["serde"] }
 # Codex `config.toml` parsing for `stepper import`.
 toml = "0.9"
 shell-words = "1"

@@ -82,6 +82,16 @@ impl Config {
             deep_merge(&mut merged, project);
         }
 
+        // Env override layers win over the discovered config (CI/testing/multi-root).
+        apply_env_overrides(
+            &mut merged,
+            std::env::var_os("STEPPER_CONFIG").map(PathBuf::from),
+            std::env::var("STEPPER_CONFIG_CONTENT").ok(),
+        )?;
+
+        // Expand `{env:VAR}` / `{file:path}` across all config string values.
+        substitute_env_file(&mut merged);
+
         let settings: SettingsFile = serde_json::from_value(merged).map_err(|e| {
             ConfigError::Parse {
                 path: dirs
@@ -345,6 +355,70 @@ fn read_md_files(dir: &Path) -> Vec<(String, String)> {
     files
 }
 
+/// Parse JSONC (JSON plus comments and trailing commas) text into a value.
+fn parse_jsonc(raw: &str, path: &Path) -> Result<Value, ConfigError> {
+    jsonc_parser::parse_to_serde_value::<Value>(raw, &jsonc_parser::ParseOptions::default())
+        .map_err(|e| ConfigError::Parse {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })
+}
+
+/// Apply the env config-override layers (highest precedence), mirroring
+/// opencode's `OPENCODE_CONFIG` / `OPENCODE_CONFIG_CONTENT`: a custom JSONC file
+/// (`STEPPER_CONFIG=<path>`) then inline JSONC (`STEPPER_CONFIG_CONTENT=<json>`),
+/// each deep-merged on top of the discovered config.
+fn apply_env_overrides(
+    merged: &mut Value,
+    config_path: Option<PathBuf>,
+    config_content: Option<String>,
+) -> Result<(), ConfigError> {
+    if let Some(path) = config_path
+        && let Some(extra) = read_value(&path)?
+    {
+        deep_merge(merged, extra);
+    }
+    if let Some(content) = config_content {
+        let extra = parse_jsonc(&content, Path::new("STEPPER_CONFIG_CONTENT"))?;
+        deep_merge(merged, extra);
+    }
+    Ok(())
+}
+
+fn substitution_regex() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\{(env|file):([^}]+)\}").unwrap())
+}
+
+/// Expand `{env:VAR}` / `{file:path}` occurrences in a string. An unresolved
+/// reference (missing env var / unreadable file) is left verbatim, mirroring the
+/// permissive `apiKey` template handling (so e.g. an absent `apiKey` env stays
+/// `{env:…}` and resolves to "no key" rather than silently becoming empty).
+fn expand_string(s: &str) -> String {
+    substitution_regex()
+        .replace_all(s, |caps: &regex::Captures| -> String {
+            let arg = caps[2].trim();
+            match &caps[1] {
+                "env" => std::env::var(arg).unwrap_or_else(|_| caps[0].to_string()),
+                "file" => std::fs::read_to_string(arg)
+                    .map(|c| c.trim_end_matches('\n').to_string())
+                    .unwrap_or_else(|_| caps[0].to_string()),
+                _ => caps[0].to_string(),
+            }
+        })
+        .into_owned()
+}
+
+/// Recursively expand `{env:}`/`{file:}` in every string value of a config tree.
+fn substitute_env_file(value: &mut Value) {
+    match value {
+        Value::String(s) => *s = expand_string(s),
+        Value::Array(arr) => arr.iter_mut().for_each(substitute_env_file),
+        Value::Object(map) => map.values_mut().for_each(substitute_env_file),
+        _ => {}
+    }
+}
+
 fn read_value(path: &Path) -> Result<Option<Value>, ConfigError> {
     if !path.is_file() {
         return Ok(None);
@@ -353,11 +427,9 @@ fn read_value(path: &Path) -> Result<Option<Value>, ConfigError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let value = serde_json::from_str(&raw).map_err(|e| ConfigError::Parse {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
-    Ok(Some(value))
+    // Parse as JSONC (JSON plus comments and trailing commas) so users can
+    // annotate `setting.json`.
+    Ok(Some(parse_jsonc(&raw, path)?))
 }
 
 /// `STEPPER_<PROVIDER>_API_KEY` env override wins; otherwise the config
@@ -394,6 +466,54 @@ fn resolve_template(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_overrides_deep_merge_on_top_of_config() {
+        // STEPPER_CONFIG_CONTENT (inline JSONC) deep-merges, overriding only its keys.
+        let mut merged = serde_json::json!({ "mode": "auto", "defaultModel": "a/b" });
+        apply_env_overrides(&mut merged, None, Some("{ // inline\n \"mode\": \"plan\", }".to_string())).unwrap();
+        assert_eq!(merged["mode"], "plan", "content overrides the key");
+        assert_eq!(merged["defaultModel"], "a/b", "other keys are preserved");
+        // No env layers → unchanged.
+        let mut bare = serde_json::json!({ "mode": "auto" });
+        apply_env_overrides(&mut bare, None, None).unwrap();
+        assert_eq!(bare["mode"], "auto");
+    }
+
+    #[test]
+    fn substitute_expands_env_file_and_leaves_unresolved_as_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("secret.txt");
+        std::fs::write(&f, "s3cr3t\n").unwrap();
+        let mut v = serde_json::json!({
+            "token": format!("{{file:{}}}", f.display()),
+            "url": "https://{env:HOME}/x",
+            "missing": "{env:STEPPER_DEFINITELY_UNSET_XYZ}",
+            "missingFile": "{file:/no/such/path}",
+        });
+        substitute_env_file(&mut v);
+        assert_eq!(v["token"], "s3cr3t", "file content, trailing newline trimmed");
+        assert_eq!(v["missing"], "{env:STEPPER_DEFINITELY_UNSET_XYZ}", "unresolved env left verbatim");
+        assert_eq!(v["missingFile"], "{file:/no/such/path}", "missing file left verbatim");
+        // env expansion as a substring (HOME exists on the unix dev/CI targets).
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(v["url"], format!("https://{home}/x"));
+        }
+    }
+
+    #[test]
+    fn read_value_parses_jsonc_comments_and_trailing_commas() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("setting.json");
+        std::fs::write(
+            &path,
+            "{\n  // a line comment\n  \"defaultModel\": \"openai/gpt-5\", /* inline */\n  \"mode\": \"auto\",\n}",
+        )
+        .unwrap();
+        let value = read_value(&path).unwrap().unwrap();
+        assert_eq!(value["defaultModel"], "openai/gpt-5");
+        assert_eq!(value["mode"], "auto", "trailing comma after the last key parses");
+    }
 
     #[test]
     fn deep_merge_replaces_arrays_and_merges_objects() {
