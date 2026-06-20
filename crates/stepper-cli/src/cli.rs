@@ -52,6 +52,10 @@ pub struct GlobalArgs {
     /// prompt (repeatable). Relative paths resolve against the working directory.
     #[arg(long, global = true)]
     pub file: Vec<PathBuf>,
+    /// (headless `-p`) Output format: `text` (default, streams the reply) or
+    /// `json` (one JSON event per line — tool calls, the final text, done/error).
+    #[arg(long, value_enum, global = true)]
+    pub format: Option<OutputFormat>,
     /// Project working directory (defaults to the current dir).
     #[arg(long, global = true)]
     pub cwd: Option<PathBuf>,
@@ -229,6 +233,14 @@ pub enum ConfigAction {
     },
 }
 
+/// `--format` choices for a headless `-p` run: stream the assistant text
+/// (default) or emit one JSON event per line (stepper's own minimal schema).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    Text,
+    Json,
+}
+
 /// `--mode` choices. `Bypass` is deliberately absent — it is only reachable via
 /// the explicit `--dangerously-skip-permissions` flag.
 #[derive(Clone, Copy, ValueEnum)]
@@ -321,6 +333,13 @@ mod tests {
         let cli = Cli::try_parse_from(["stepper", "-p", "x", "--file", "a.txt", "--file", "b.rs"]).unwrap();
         assert_eq!(cli.global.file, vec![PathBuf::from("a.txt"), PathBuf::from("b.rs")]);
         assert!(Cli::try_parse_from(["stepper"]).unwrap().global.file.is_empty());
+    }
+
+    #[test]
+    fn format_flag_parses() {
+        let cli = Cli::try_parse_from(["stepper", "-p", "x", "--format", "json"]).unwrap();
+        assert_eq!(cli.global.format, Some(OutputFormat::Json));
+        assert!(Cli::try_parse_from(["stepper"]).unwrap().global.format.is_none());
     }
 
     #[test]

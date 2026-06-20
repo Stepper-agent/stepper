@@ -507,14 +507,26 @@ async fn oneshot(
     let mut event_rx = spawn_core(orchestrator, session, action_rx, cancel);
 
     action_tx.send(Action::SubmitInput(prompt)).await?;
+    let json = global.format == Some(cli::OutputFormat::Json);
     let mut stdout = std::io::stdout();
     let mut turn_error: Option<String> = None;
+    // In JSON mode the assistant text is buffered and emitted as one `text` event
+    // at the end (a stream of per-token JSON lines would be unusable).
+    let mut assistant = String::new();
 
     while let Some(event) = event_rx.recv().await {
+        // Tool/error events become one JSON line each (text/done are handled below).
+        if json && let Some(line) = json_event(&event) {
+            println!("{line}");
+        }
         match event {
             AppEvent::AssistantTokenDelta(t) => {
-                print!("{t}");
-                stdout.flush().ok();
+                if json {
+                    assistant.push_str(&t);
+                } else {
+                    print!("{t}");
+                    stdout.flush().ok();
+                }
             }
             AppEvent::ApprovalRequested(req) => {
                 if global.dangerously_auto_approve {
@@ -527,23 +539,39 @@ async fn oneshot(
                     let _ = req.reply.send(ApprovalDecision::Deny);
                 }
             }
-            AppEvent::ToolCallStarted(view) => eprintln!("\n[tool] {}", view.summary),
+            // JSON mode already emitted this above; otherwise note it on stderr.
+            AppEvent::ToolCallStarted(view) if !json => {
+                eprintln!("\n[tool] {}", view.summary);
+            }
             AppEvent::Error(e) => {
-                eprintln!("\nerror: {e}");
+                if !json {
+                    eprintln!("\nerror: {e}");
+                }
                 turn_error = Some(e);
             }
             // A wall-clock timeout stops the turn as a silent `Cancelled`; surface
             // it as a failure so a headless/CI caller exits non-zero, like the
             // --max-turns / --max-budget-usd caps do.
             AppEvent::Notice { text, .. } if text.starts_with(stepper_core::TURN_TIMEOUT_NOTICE) => {
-                eprintln!("\n{text}");
+                if json {
+                    println!("{}", serde_json::json!({ "type": "error", "message": text }));
+                } else {
+                    eprintln!("\n{text}");
+                }
                 turn_error = Some(text);
             }
             AppEvent::TurnComplete { .. } => break,
             _ => {}
         }
     }
-    println!();
+    if json {
+        if !assistant.is_empty() {
+            println!("{}", serde_json::json!({ "type": "text", "text": assistant }));
+        }
+        println!("{}", serde_json::json!({ "type": "done" }));
+    } else {
+        println!();
+    }
     let _ = action_tx.send(Action::Quit).await;
     if let Some(e) = turn_error {
         anyhow::bail!("turn failed: {e}");
@@ -580,6 +608,21 @@ fn agent_prompt(agent: &str, prompt: &str, known: &[String]) -> anyhow::Result<S
         anyhow::bail!("unknown agent '{agent}' (configured: {list})");
     }
     Ok(format!("#{agent} {prompt}"))
+}
+
+/// One JSON line for a headless `--format json` event (stepper's own minimal
+/// schema: `{type, ...}`), or `None` for events the headless stream doesn't
+/// surface this way. Streaming text and the terminal `done` are emitted by
+/// `oneshot` directly (they need the accumulated turn text / loop control).
+fn json_event(event: &AppEvent) -> Option<String> {
+    let value = match event {
+        AppEvent::ToolCallStarted(v) => {
+            serde_json::json!({ "type": "tool", "name": v.name, "summary": v.summary })
+        }
+        AppEvent::Error(e) => serde_json::json!({ "type": "error", "message": e }),
+        _ => return None,
+    };
+    Some(value.to_string())
 }
 
 /// Name the action a headless run is denying, for the stderr note.
@@ -766,6 +809,23 @@ mod tests {
         assert_eq!(attach_files(&[], "just this", dir.path()).unwrap(), "just this");
         // A missing file errors.
         assert!(attach_files(&[std::path::PathBuf::from("nope.txt")], "x", dir.path()).is_err());
+    }
+
+    #[test]
+    fn json_event_maps_tool_and_error_only() {
+        let tool = json_event(&AppEvent::ToolCallStarted(stepper_protocol::ToolCallView {
+            id: "1".into(),
+            name: "bash".into(),
+            summary: "ls -la".into(),
+        }))
+        .unwrap();
+        assert!(tool.contains("\"type\":\"tool\""), "{tool}");
+        assert!(tool.contains("bash") && tool.contains("ls -la"));
+        let err = json_event(&AppEvent::Error("boom".into())).unwrap();
+        assert!(err.contains("\"type\":\"error\"") && err.contains("boom"));
+        // Other events aren't surfaced as JSON lines (text/done handled by oneshot).
+        assert!(json_event(&AppEvent::TurnComplete { turn_id: 1 }).is_none());
+        assert!(json_event(&AppEvent::AssistantTokenDelta("hi".into())).is_none());
     }
 
     #[test]
