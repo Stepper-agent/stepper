@@ -28,8 +28,8 @@ pub use scaffold::{get_scalar, set_scalar};
 pub use schema::{settings_schema, validate_settings, validate_settings_values};
 pub use settings::{
     deep_merge, ApprovalRule, FormatterConfig, FormatterEntry, HookEntry, LimitsConfig, LspConfig,
-    LspServerEntry, McpServerConfig, OrchestratorConfig, Permissions, ProviderConfig, SandboxConfig,
-    SettingsFile, ThemeConfig, PROVIDER_KINDS,
+    LspServerEntry, McpServerConfig, ModelOverride, OrchestratorConfig, Permissions, ProviderConfig,
+    SandboxConfig, SettingsFile, ThemeConfig, PROVIDER_KINDS,
 };
 pub use substitution::{substitute, CommandArgs, SubstitutionIo};
 
@@ -56,6 +56,9 @@ pub struct ResolvedProvider {
     pub auth: Option<String>,
     pub model: String,
     pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub input_per_mtok: Option<f64>,
+    pub output_per_mtok: Option<f64>,
 }
 
 impl Config {
@@ -325,14 +328,21 @@ impl Config {
                 provider: resolved.provider.clone(),
             })?;
 
+        // A per-model entry (`providers.<p>.models.<id>`) wins over provider-wide.
+        let model_override = provider.models.get(&resolved.model_id);
         Ok(ResolvedProvider {
             api_key: resolve_api_key(&resolved.provider, provider),
             name: resolved.provider,
             kind: provider.kind.clone(),
             base_url: provider.base_url.clone(),
             auth: provider.auth.clone(),
+            context_window: model_override
+                .and_then(|m| m.context_window)
+                .or(provider.context_window),
+            max_output_tokens: model_override.and_then(|m| m.max_output_tokens),
+            input_per_mtok: model_override.and_then(|m| m.input_per_mtok),
+            output_per_mtok: model_override.and_then(|m| m.output_per_mtok),
             model: resolved.model_id,
-            context_window: provider.context_window,
         })
     }
 }
@@ -683,6 +693,32 @@ mod tests {
         .unwrap();
         let cfg = Config::from_settings(settings);
         assert_eq!(cfg.resolve_provider("acme/m").unwrap().context_window, Some(64000));
+    }
+
+    #[test]
+    fn resolve_provider_applies_per_model_overrides_over_provider_wide() {
+        let settings: SettingsFile = serde_json::from_value(serde_json::json!({
+            "providers": { "acme": {
+                "kind": "openai-compat",
+                "contextWindow": 64000,
+                "models": {
+                    "big": { "contextWindow": 200000, "maxOutputTokens": 8000, "inputPerMtok": 3.0, "outputPerMtok": 15.0 }
+                }
+            } }
+        }))
+        .unwrap();
+        let cfg = Config::from_settings(settings);
+        // A model with an override gets the per-model figures.
+        let big = cfg.resolve_provider("acme/big").unwrap();
+        assert_eq!(big.context_window, Some(200_000), "per-model context beats provider-wide");
+        assert_eq!(big.max_output_tokens, Some(8000));
+        assert_eq!(big.input_per_mtok, Some(3.0));
+        assert_eq!(big.output_per_mtok, Some(15.0));
+        // A model without an override falls back to provider-wide context, no cost.
+        let other = cfg.resolve_provider("acme/small").unwrap();
+        assert_eq!(other.context_window, Some(64_000));
+        assert_eq!(other.max_output_tokens, None);
+        assert_eq!(other.input_per_mtok, None);
     }
 
     #[test]

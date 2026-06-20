@@ -237,6 +237,26 @@ pub struct ProviderConfig {
     /// auto-probe is provider-specific and left as a follow-up.
     #[serde(default)]
     pub context_window: Option<u64>,
+    /// Per-model overrides keyed by model id (the part after `provider/`). A
+    /// model's entry wins over the provider-wide `contextWindow` — useful for
+    /// per-model limits / pricing the catalog doesn't carry.
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelOverride>,
+}
+
+/// Per-model overrides in a provider's `models` map: limits and pricing that win
+/// over the catalog/registry estimate (and the provider-wide `contextWindow`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverride {
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub input_per_mtok: Option<f64>,
+    #[serde(default)]
+    pub output_per_mtok: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]

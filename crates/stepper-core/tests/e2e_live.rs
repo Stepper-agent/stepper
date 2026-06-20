@@ -39,6 +39,7 @@ fn compat_provider(base_url: &str) -> ProviderConfig {
         auth: None,
         default_model: None,
         context_window: None,
+        models: Default::default(),
     }
 }
 

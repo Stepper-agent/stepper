@@ -105,6 +105,17 @@ impl ProviderResolver for ConfigProviderResolver {
                         info.max_output_tokens = 0;
                     }
                 }
+                // Per-model output cap / pricing overrides (config `models.<id>`):
+                // trusted as explicit, so they win over catalog/registry figures.
+                if let Some(mo) = rp.max_output_tokens {
+                    info.max_output_tokens = mo;
+                }
+                if let Some(ip) = rp.input_per_mtok {
+                    info.input_per_mtok = ip;
+                }
+                if let Some(op) = rp.output_per_mtok {
+                    info.output_per_mtok = op;
+                }
                 info
             }
             Err(_) => self.registry.lookup("", model_ref),
@@ -376,6 +387,7 @@ mod tests {
                 auth: None,
                 default_model: None,
                 context_window: ctx,
+                models: Default::default(),
             },
         );
         ConfigProviderResolver::new(
@@ -400,6 +412,7 @@ mod tests {
                 auth: None,
                 default_model: None,
                 context_window: ctx,
+                models: Default::default(),
             },
         );
         ConfigProviderResolver::new(
@@ -439,6 +452,46 @@ mod tests {
         assert_eq!(info.context_window, 50_000, "provider context_window beats the catalog");
         assert_eq!(info.input_per_mtok, 7.0, "pricing still comes from the catalog");
         assert!(!info.estimated);
+    }
+
+    #[test]
+    fn model_info_applies_per_model_output_and_pricing_overrides() {
+        // A per-model `models.<id>` entry overrides the catalog output cap + pricing.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::load(dir.path()).unwrap();
+        let models = std::collections::BTreeMap::from([(
+            "some-model".to_string(),
+            stepper_config::ModelOverride {
+                context_window: Some(200_000),
+                max_output_tokens: Some(8_000),
+                input_per_mtok: Some(3.0),
+                output_per_mtok: Some(15.0),
+            },
+        )]);
+        config.settings.providers.insert(
+            "acme".into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("http://localhost/v1".into()),
+                api_key: None,
+                auth: None,
+                default_model: None,
+                context_window: None,
+                models,
+            },
+        );
+        let resolver = ConfigProviderResolver::new(
+            config,
+            ProviderFactory::new().unwrap(),
+            ModelRegistry::builtin(),
+            None,
+            Some(catalog_with("some-model", 300_000, 7.0, 21.0)),
+        );
+        let info = resolver.model_info("acme/some-model");
+        assert_eq!(info.context_window, 200_000, "per-model context beats catalog");
+        assert_eq!(info.max_output_tokens, 8_000, "per-model output cap wins");
+        assert_eq!(info.input_per_mtok, 3.0, "per-model pricing wins");
+        assert_eq!(info.output_per_mtok, 15.0);
     }
 
     #[test]
@@ -499,6 +552,7 @@ mod tests {
                 auth: None,
                 default_model: None,
                 context_window: None,
+                models: Default::default(),
             },
         );
         let resolver = ConfigProviderResolver::new(
@@ -601,6 +655,7 @@ mod tests {
                 auth: None,
                 default_model: None,
                 context_window: None,
+                models: Default::default(),
             },
         );
         let resolver = ConfigProviderResolver::new(
@@ -680,6 +735,7 @@ mod tests {
                 auth: Some("codex-oauth".into()),
                 default_model: Some("acme-1".into()),
                 context_window: Some(123_000),
+                models: Default::default(),
             },
         );
         let resolver = ConfigProviderResolver::new(

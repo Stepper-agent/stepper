@@ -372,6 +372,7 @@ fn convention_provider(name: &str) -> Option<ProviderConfig> {
         auth: None,
         default_model: None,
         context_window: None,
+        models: Default::default(),
     };
     match name {
         "anthropic" => pc.kind = "anthropic".into(),
