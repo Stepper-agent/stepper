@@ -116,6 +116,13 @@ impl ProviderResolver for ConfigProviderResolver {
                 if let Some(op) = rp.output_per_mtok {
                     info.output_per_mtok = op;
                 }
+                // Re-assert the invariant after a per-model output override: an
+                // output cap can never reach the context window (else the wire
+                // `max_tokens` exceeds the model limit → provider 400, and the
+                // compaction budget saturates to its floor).
+                if info.context_window > 0 && info.max_output_tokens >= info.context_window {
+                    info.max_output_tokens = 0;
+                }
                 info
             }
             Err(_) => self.registry.lookup("", model_ref),
@@ -492,6 +499,45 @@ mod tests {
         assert_eq!(info.max_output_tokens, 8_000, "per-model output cap wins");
         assert_eq!(info.input_per_mtok, 3.0, "per-model pricing wins");
         assert_eq!(info.output_per_mtok, 15.0);
+    }
+
+    #[test]
+    fn model_info_per_model_output_cap_cannot_exceed_context() {
+        // A per-model maxOutputTokens >= context must clamp to 0 (provider-400 guard),
+        // mirroring the provider-wide context override path.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::load(dir.path()).unwrap();
+        let models = std::collections::BTreeMap::from([(
+            "tiny".to_string(),
+            stepper_config::ModelOverride {
+                context_window: Some(32_000),
+                max_output_tokens: Some(64_000),
+                input_per_mtok: None,
+                output_per_mtok: None,
+            },
+        )]);
+        config.settings.providers.insert(
+            "acme".into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("http://localhost/v1".into()),
+                api_key: None,
+                auth: None,
+                default_model: None,
+                context_window: None,
+                models,
+            },
+        );
+        let resolver = ConfigProviderResolver::new(
+            config,
+            ProviderFactory::new().unwrap(),
+            ModelRegistry::builtin(),
+            None,
+            None,
+        );
+        let info = resolver.model_info("acme/tiny");
+        assert_eq!(info.context_window, 32_000);
+        assert_eq!(info.max_output_tokens, 0, "an output cap >= context is dropped to 0");
     }
 
     #[test]

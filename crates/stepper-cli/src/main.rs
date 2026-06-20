@@ -603,6 +603,11 @@ fn attach_files(files: &[std::path::PathBuf], prompt: &str, cwd: &std::path::Pat
 /// against the configured agents (an unknown one errors, listing the known
 /// names) and prefix the prompt with the `#<name>` sub-agent trigger.
 fn agent_prompt(agent: &str, prompt: &str, known: &[String]) -> anyhow::Result<String> {
+    // The `#name` route splits on the first whitespace, so a space-containing
+    // name could never round-trip — fail loudly rather than silently drop it.
+    if agent.contains(char::is_whitespace) {
+        anyhow::bail!("agent name '{agent}' must not contain whitespace");
+    }
     if !known.iter().any(|n| n == agent) {
         let list = if known.is_empty() { "none".to_string() } else { known.join(", ") };
         anyhow::bail!("unknown agent '{agent}' (configured: {list})");
@@ -717,7 +722,10 @@ fn resume_or_fresh(
 /// picker.
 fn session_cmd(args: cli::SessionArgs, global: GlobalArgs) -> anyhow::Result<()> {
     let cwd = global.cwd.clone().map(Ok).unwrap_or_else(std::env::current_dir)?;
-    let store = SessionStore::new(&cwd);
+    // Resolve the project root (as resume does) so `session` works from any
+    // subdirectory, not only where `.stepper/` lives.
+    let root = stepper_config::discovery::discover(&cwd).project_root.unwrap_or(cwd);
+    let store = SessionStore::new(&root);
     match args.cmd {
         cli::SessionCmd::List { limit, json } => {
             let recent = store.list_recent(limit.unwrap_or(usize::MAX));
@@ -836,6 +844,12 @@ mod tests {
         assert!(err.contains("unknown agent 'nope'"), "{err}");
         assert!(err.contains("reviewer"), "lists configured agents: {err}");
         assert!(agent_prompt("x", "p", &[]).unwrap_err().to_string().contains("none"));
+        // A space-containing name can't round-trip through `#name` routing → error,
+        // even if such a directory name were configured.
+        let spaced = vec!["my agent".to_string()];
+        assert!(
+            agent_prompt("my agent", "p", &spaced).unwrap_err().to_string().contains("whitespace"),
+        );
     }
 
     struct FakeResolver {

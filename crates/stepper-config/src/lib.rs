@@ -367,11 +367,16 @@ fn read_md_files(dir: &Path) -> Vec<(String, String)> {
 
 /// Parse JSONC (JSON plus comments and trailing commas) text into a value.
 fn parse_jsonc(raw: &str, path: &Path) -> Result<Value, ConfigError> {
-    jsonc_parser::parse_to_serde_value::<Value>(raw, &jsonc_parser::ParseOptions::default())
+    let value = jsonc_parser::parse_to_serde_value::<Value>(raw, &jsonc_parser::ParseOptions::default())
         .map_err(|e| ConfigError::Parse {
             path: path.to_path_buf(),
             message: e.to_string(),
-        })
+        })?;
+    // Empty / comment-only / literal `null` input parses to Null; treat it as an
+    // empty object so an all-commented `setting.json` (or an empty STEPPER_CONFIG
+    // override) loads as "no settings" instead of failing `from_value` or wiping
+    // an already-merged config to Null via deep_merge's non-object fallback.
+    Ok(if value.is_null() { Value::Object(Default::default()) } else { value })
 }
 
 /// Apply the env config-override layers (highest precedence), mirroring
@@ -509,6 +514,20 @@ mod tests {
         if let Ok(home) = std::env::var("HOME") {
             assert_eq!(v["url"], format!("https://{home}/x"));
         }
+    }
+
+    #[test]
+    fn read_value_treats_comment_only_or_empty_file_as_empty_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("setting.json");
+        std::fs::write(&path, "// everything commented out\n").unwrap();
+        let value = read_value(&path).unwrap().unwrap();
+        assert!(
+            value.as_object().is_some_and(|m| m.is_empty()),
+            "a comment-only file is an empty object, not Null: got {value:?}"
+        );
+        // It deserializes to a default SettingsFile — load must not fail.
+        let _settings: SettingsFile = serde_json::from_value(value).unwrap();
     }
 
     #[test]
