@@ -482,6 +482,19 @@ async fn oneshot(
         limits,
     )
     .await?;
+    // --file: inline attachments as leading context, then --agent prefixes the
+    // `#name` trigger (which must stay at the very start of the prompt).
+    let prompt = attach_files(&global.file, &prompt, &orchestrator.project_root)?;
+    // --agent: route this headless run to a named sub-agent via the `#agent`
+    // trigger; an unknown name is an error here (the interactive `#name` falls
+    // through to a normal turn, but an explicit flag should fail loudly).
+    let prompt = match global.agent.as_deref() {
+        Some(agent) => {
+            let known: Vec<String> = orchestrator.agents.iter().map(|a| a.name.clone()).collect();
+            agent_prompt(agent, &prompt, &known)?
+        }
+        None => prompt,
+    };
     let session = resume_or_fresh(
         &orchestrator.project_root,
         global.resume.as_deref(),
@@ -536,6 +549,37 @@ async fn oneshot(
         anyhow::bail!("turn failed: {e}");
     }
     Ok(())
+}
+
+/// Inline `--file` attachments into the prompt as tagged blocks. stepper runs
+/// the agent in-process, so it folds the file contents directly into the message
+/// (rather than passing a `file://` URL like opencode). Relative paths resolve
+/// against `cwd`; a missing or non-UTF-8 file errors. The prompt follows the
+/// files so they read as leading context.
+fn attach_files(files: &[std::path::PathBuf], prompt: &str, cwd: &std::path::Path) -> anyhow::Result<String> {
+    if files.is_empty() {
+        return Ok(prompt.to_string());
+    }
+    let mut out = String::new();
+    for file in files {
+        let path = if file.is_absolute() { file.clone() } else { cwd.join(file) };
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("--file {}: {e}", path.display()))?;
+        out.push_str(&format!("<file path=\"{}\">\n{content}\n</file>\n\n", file.display()));
+    }
+    out.push_str(prompt);
+    Ok(out)
+}
+
+/// Build the prompt for a headless `--agent <name>` run: validate the name
+/// against the configured agents (an unknown one errors, listing the known
+/// names) and prefix the prompt with the `#<name>` sub-agent trigger.
+fn agent_prompt(agent: &str, prompt: &str, known: &[String]) -> anyhow::Result<String> {
+    if !known.iter().any(|n| n == agent) {
+        let list = if known.is_empty() { "none".to_string() } else { known.join(", ") };
+        anyhow::bail!("unknown agent '{agent}' (configured: {list})");
+    }
+    Ok(format!("#{agent} {prompt}"))
 }
 
 /// Name the action a headless run is denying, for the stderr note.
@@ -709,6 +753,30 @@ fn split_model(model: Option<&str>) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attach_files_inlines_contents_then_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello from a").unwrap();
+        let out = attach_files(&[std::path::PathBuf::from("a.txt")], "do it", dir.path()).unwrap();
+        assert!(out.contains("<file path=\"a.txt\">"), "tagged block: {out}");
+        assert!(out.contains("hello from a"));
+        assert!(out.trim_end().ends_with("do it"), "the prompt follows the files: {out}");
+        // No files → the prompt is unchanged.
+        assert_eq!(attach_files(&[], "just this", dir.path()).unwrap(), "just this");
+        // A missing file errors.
+        assert!(attach_files(&[std::path::PathBuf::from("nope.txt")], "x", dir.path()).is_err());
+    }
+
+    #[test]
+    fn agent_prompt_validates_and_prefixes_the_trigger() {
+        let known = vec!["reviewer".to_string(), "researcher".to_string()];
+        assert_eq!(agent_prompt("reviewer", "do it", &known).unwrap(), "#reviewer do it");
+        let err = agent_prompt("nope", "do it", &known).unwrap_err().to_string();
+        assert!(err.contains("unknown agent 'nope'"), "{err}");
+        assert!(err.contains("reviewer"), "lists configured agents: {err}");
+        assert!(agent_prompt("x", "p", &[]).unwrap_err().to_string().contains("none"));
+    }
 
     struct FakeResolver {
         auth_err: bool,

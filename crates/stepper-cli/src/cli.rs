@@ -44,6 +44,14 @@ pub struct GlobalArgs {
     /// original untouched (no effect without `--resume`/`--continue`).
     #[arg(long, global = true)]
     pub fork: bool,
+    /// (headless `-p`) Route the run to a named sub-agent (`.stepper/agents/<name>`),
+    /// the same as prefixing the prompt with `#<name>`. An unknown name errors.
+    #[arg(long, global = true)]
+    pub agent: Option<String>,
+    /// (headless `-p`) Attach file(s) — their text contents are inlined into the
+    /// prompt (repeatable). Relative paths resolve against the working directory.
+    #[arg(long, global = true)]
+    pub file: Vec<PathBuf>,
     /// Project working directory (defaults to the current dir).
     #[arg(long, global = true)]
     pub cwd: Option<PathBuf>,
@@ -299,6 +307,20 @@ mod tests {
         assert!(cli.global.fork);
         assert_eq!(cli.global.resume.as_deref(), Some("abc"));
         assert!(!Cli::try_parse_from(["stepper"]).unwrap().global.fork);
+    }
+
+    #[test]
+    fn agent_flag_parses() {
+        let cli = Cli::try_parse_from(["stepper", "-p", "do it", "--agent", "reviewer"]).unwrap();
+        assert_eq!(cli.global.agent.as_deref(), Some("reviewer"));
+        assert!(Cli::try_parse_from(["stepper"]).unwrap().global.agent.is_none());
+    }
+
+    #[test]
+    fn file_flag_parses_repeatable() {
+        let cli = Cli::try_parse_from(["stepper", "-p", "x", "--file", "a.txt", "--file", "b.rs"]).unwrap();
+        assert_eq!(cli.global.file, vec![PathBuf::from("a.txt"), PathBuf::from("b.rs")]);
+        assert!(Cli::try_parse_from(["stepper"]).unwrap().global.file.is_empty());
     }
 
     #[test]
