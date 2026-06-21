@@ -12,7 +12,7 @@ pub mod event;
 pub mod mode;
 pub mod view;
 
-pub use action::Action;
+pub use action::{Action, RewindScope};
 pub use approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
 pub use event::AppEvent;
 pub use mode::Mode;

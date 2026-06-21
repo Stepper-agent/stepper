@@ -1457,7 +1457,7 @@ mod tests {
         use crate::state::{ListPicker, ListPickerItem, PickerKind};
         let mut s = base_state();
         let mut picker = ListPicker::new(
-            PickerKind::Rewind,
+            PickerKind::Rewind(stepper_protocol::RewindScope::Both),
             vec![
                 ListPickerItem { id: "turn-2".into(), label: "turn 2".into(), connectable: true },
                 ListPickerItem { id: "turn-1".into(), label: "turn 1".into(), connectable: true },

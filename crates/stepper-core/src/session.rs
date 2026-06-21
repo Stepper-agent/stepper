@@ -90,6 +90,35 @@ impl SessionRecord {
         out
     }
 
+    /// Render the whole session as a portable Markdown transcript (`/export`):
+    /// each turn's request, its per-layer summaries, and the assistant's final
+    /// message text. Excludes raw thinking/tool payloads (kept readable).
+    pub fn to_transcript_md(&self) -> String {
+        let title = self.name.clone().unwrap_or_else(|| format!("session {}", self.id));
+        let mut out = format!("# {title}\n\nid: {}\nturns: {}\n", self.id, self.turns.len());
+        for (i, turn) in self.turns.iter().enumerate() {
+            out.push_str(&format!("\n## Turn {}\n\n### Request\n\n{}\n", i + 1, turn.user.trim()));
+            if !turn.summaries.is_empty() {
+                out.push_str("\n### Layers\n\n");
+                for (layer, summary) in &turn.summaries {
+                    out.push_str(&format!("- **{layer}**: {summary}\n"));
+                }
+            }
+            // The final assistant text (last assistant message of the turn), if any.
+            if let Some(reply) = turn
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, stepper_provider::Role::Assistant))
+                .map(|m| m.text())
+                .filter(|t| !t.trim().is_empty())
+            {
+                out.push_str(&format!("\n### Reply\n\n{}\n", reply.trim()));
+            }
+        }
+        out
+    }
+
     /// Render prior turns as resume context to seed a continued session.
     pub fn resume_context(&self) -> String {
         if self.turns.is_empty() {
@@ -190,6 +219,31 @@ impl SessionStore {
 mod tests {
     use super::*;
     use stepper_provider::{ContentBlock, Role, ToolContent};
+
+    #[test]
+    fn to_transcript_md_renders_requests_layers_and_final_reply() {
+        let record = SessionRecord {
+            id: "s1".into(),
+            name: Some("My Work".into()),
+            turns: vec![TurnRecord {
+                user: "add a feature".into(),
+                summaries: vec![("plan".into(), "designed it".into())],
+                messages: vec![
+                    Message::user("add a feature"),
+                    Message::assistant("done — added the feature"),
+                ],
+                ..Default::default()
+            }],
+        };
+        let md = record.to_transcript_md();
+        assert!(md.starts_with("# My Work"), "uses the session name as title: {md}");
+        assert!(md.contains("### Request\n\nadd a feature"));
+        assert!(md.contains("- **plan**: designed it"));
+        assert!(md.contains("### Reply\n\ndone — added the feature"));
+        // Nameless session falls back to its id in the title.
+        let anon = SessionRecord { id: "x9".into(), name: None, turns: vec![] };
+        assert!(anon.to_transcript_md().starts_with("# session x9"));
+    }
 
     #[test]
     fn save_and_load_round_trips() {

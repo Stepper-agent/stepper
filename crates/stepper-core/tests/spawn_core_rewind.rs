@@ -378,13 +378,11 @@ async fn rewind_prunes_later_files_and_truncates_session() {
     assert!(root.join("pruned.txt").exists());
 
     action_tx
-        .send(Action::Rewind {
-            checkpoint_id: "turn-2".into(),
-        })
+        .send(Action::Rewind { checkpoint_id: "turn-2".into(), scope: stepper_protocol::RewindScope::Both })
         .await
         .unwrap();
     let notice = wait_notice(&mut events).await;
-    assert!(notice.contains("rewound to turn-2"), "got notice: {notice}");
+    assert!(notice.contains("rewound files + conversation to turn-2"), "got notice: {notice}");
 
     assert!(
         root.join("kept.txt").exists(),
@@ -456,11 +454,11 @@ async fn rewind_uses_the_recorded_turn_count_when_the_turn_id_has_drifted() {
     wait_turn_complete(&mut events, 3).await;
 
     action_tx
-        .send(Action::Rewind { checkpoint_id: "turn-3".into() })
+        .send(Action::Rewind { checkpoint_id: "turn-3".into(), scope: stepper_protocol::RewindScope::Both })
         .await
         .unwrap();
     let notice = wait_notice(&mut events).await;
-    assert!(notice.contains("rewound to turn-3"), "got notice: {notice}");
+    assert!(notice.contains("rewound files + conversation to turn-3"), "got notice: {notice}");
 
     let reloaded = SessionStore::new(&root).load(&session_id).expect("session persisted");
     assert_eq!(

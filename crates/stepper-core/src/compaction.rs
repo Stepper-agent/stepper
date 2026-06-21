@@ -67,7 +67,46 @@ impl Compactor {
         messages.insert(0, marker(&heuristic_summary(&dropped)));
         Some(cut)
     }
+
+    /// A cheap first pass before the full cut: when over the soft threshold, elide
+    /// only the OVERSIZED tool RESULTS in messages older than `keep_recent`,
+    /// replacing each with a tiny marker. This reclaims context from verbose tool
+    /// output (usually the bulk) while preserving every conversation turn and tool
+    /// call — so the heavier message-dropping `plan`/`maybe_compact` is deferred or
+    /// avoided. Returns the estimated tokens reclaimed (0 = nothing changed).
+    pub fn microcompact(&self, messages: &mut [Message], used_tokens: u64) -> u64 {
+        if self.context_limit == 0 {
+            return 0;
+        }
+        let threshold = (self.context_limit as f64 * self.soft_ratio) as u64;
+        if used_tokens < threshold {
+            return 0;
+        }
+        // Only touch messages strictly older than the recent window.
+        let cutoff = messages.len().saturating_sub(self.keep_recent);
+        let mut reclaimed_chars = 0usize;
+        for msg in messages.iter_mut().take(cutoff) {
+            for block in msg.content.iter_mut() {
+                if let ContentBlock::ToolResult { content, .. } = block {
+                    let chars = tool_result_chars(content);
+                    if chars > MICRO_TOOL_RESULT_CAP {
+                        // The marker's own bytes are negligible vs. what was elided.
+                        reclaimed_chars += chars.saturating_sub(64);
+                        *content = vec![ToolContent::Text {
+                            text: format!("[earlier tool output elided: {chars} chars]"),
+                        }];
+                    }
+                }
+            }
+        }
+        (reclaimed_chars / 4) as u64
+    }
 }
+
+/// Tool results in old messages larger than this (chars) are elided by
+/// [`Compactor::microcompact`]. Big enough to keep short results intact, small
+/// enough that a few large reads/greps don't dominate the window.
+const MICRO_TOOL_RESULT_CAP: usize = 2_000;
 
 /// chars/4 token estimate over every block kind (text, thinking, tool inputs
 /// and results), so tool-heavy histories — usually the bulk — are counted.
@@ -291,6 +330,47 @@ mod tests {
         let mut m = convo(20);
         assert_eq!(c.maybe_compact(&mut m, 100), None);
         assert_eq!(m.len(), 20);
+    }
+
+    #[test]
+    fn microcompact_elides_only_old_oversized_tool_results() {
+        let big = |id: &str| Message {
+            role: Role::Tool,
+            content: vec![ContentBlock::ToolResult {
+                tool_call_id: id.into(),
+                content: vec![ToolContent::text("x".repeat(3_000))],
+                is_error: false,
+            }],
+        };
+        // One OLD oversized tool result, then 6 recent messages (keep_recent = 6).
+        let mut m = vec![big("old")];
+        for i in 0..6 {
+            m.push(Message::user(format!("recent {i}")));
+        }
+        m.push(big("recent-tool")); // also recent (within the keep window)
+        let c = Compactor::new(1000); // threshold = 700
+        // Below threshold → nothing changes.
+        assert_eq!(c.microcompact(&mut m, 100), 0);
+        assert_eq!(tool_result_chars_of(&m[0]), 3_000, "old result intact below threshold");
+        // Over threshold → the OLD oversized result is elided; the recent one isn't.
+        let reclaimed = c.microcompact(&mut m, 800);
+        assert!(reclaimed > 0, "reclaimed tokens");
+        let old_text = match &m[0].content[0] {
+            ContentBlock::ToolResult { content, .. } => match &content[0] {
+                ToolContent::Text { text } => text.clone(),
+                _ => panic!("elided to text"),
+            },
+            _ => panic!("still a tool result"),
+        };
+        assert!(old_text.contains("elided"), "old result elided: {old_text}");
+        assert_eq!(tool_result_chars_of(m.last().unwrap()), 3_000, "recent result untouched");
+    }
+
+    fn tool_result_chars_of(m: &Message) -> usize {
+        match &m.content[0] {
+            ContentBlock::ToolResult { content, .. } => tool_result_chars(content),
+            _ => 0,
+        }
     }
 
     #[test]

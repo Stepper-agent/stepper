@@ -286,6 +286,13 @@ pub enum SessionCmd {
     Delete {
         id: String,
     },
+    /// Rename a saved session (the name shown by session pickers).
+    Rename {
+        /// The session id (see `session list`).
+        id: String,
+        /// The new name.
+        name: String,
+    },
 }
 
 #[derive(Args)]
@@ -530,6 +537,10 @@ mod tests {
         let cli = Cli::try_parse_from(["stepper", "session", "delete", "abc"]).unwrap();
         let Some(Command::Session(args)) = cli.command else { panic!("expected session command") };
         assert!(matches!(args.cmd, SessionCmd::Delete { id } if id == "abc"));
+
+        let cli = Cli::try_parse_from(["stepper", "session", "rename", "abc", "My Work"]).unwrap();
+        let Some(Command::Session(args)) = cli.command else { panic!("expected session command") };
+        assert!(matches!(args.cmd, SessionCmd::Rename { id, name } if id == "abc" && name == "My Work"));
     }
 
     #[test]

@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use stepper_protocol::{
     Action, AppEvent, ApprovalRequest, CheckpointView, ContextBreakdownView, LayerStatus,
     LayerView, Mode, ModelChoiceView, ModelView, NoticeLevel, PermissionsSnapshotView,
-    ProviderChoiceView, SessionView, SettingsSnapshotView, TodoItemView, UsageView, WorkerView,
+    ProviderChoiceView, RewindScope, SessionView, SettingsSnapshotView, TodoItemView, UsageView,
+    WorkerView,
 };
 
 use crate::{AgentInfo, CommandInfo, TuiInit};
@@ -294,7 +295,9 @@ pub struct ApiKeyOverlay {
 /// What a list-picker selection turns into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
-    Rewind,
+    /// `/rewind` checkpoint picker; carries the restore scope from `/rewind
+    /// [code|conversation]` so the selection applies it.
+    Rewind(RewindScope),
     Resume,
     Model,
     Connect,
@@ -338,7 +341,7 @@ impl ListPicker {
 
     pub fn title(&self) -> &'static str {
         match self.kind {
-            PickerKind::Rewind => " rewind ",
+            PickerKind::Rewind(_) => " rewind ",
             PickerKind::Resume => " resume ",
             PickerKind::Model => " models ",
             PickerKind::Connect => " connect ",
@@ -410,8 +413,9 @@ impl ListPicker {
             return None;
         }
         Some(match self.kind {
-            PickerKind::Rewind => Action::Rewind {
+            PickerKind::Rewind(scope) => Action::Rewind {
                 checkpoint_id: item.id.clone(),
+                scope,
             },
             PickerKind::Resume => Action::Resume {
                 session_id: item.id.clone(),
@@ -1421,7 +1425,7 @@ impl AppState {
             AppEvent::SettingsSnapshot(snapshot) => {
                 self.open_overlay(Overlay::Settings(SettingsView { snapshot, tab: 0 }));
             }
-            AppEvent::CheckpointList(checkpoints) => {
+            AppEvent::CheckpointList { checkpoints, scope } => {
                 let items = checkpoints
                     .into_iter()
                     .map(|c: CheckpointView| ListPickerItem {
@@ -1430,7 +1434,7 @@ impl AppState {
                         connectable: true,
                     })
                     .collect();
-                self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Rewind, items)));
+                self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Rewind(scope), items)));
             }
             AppEvent::SessionList(sessions) => {
                 let items = sessions
@@ -2712,11 +2716,14 @@ mod tests {
     }
 
     fn checkpoint_list() -> AppEvent {
-        AppEvent::CheckpointList(vec![
-            CheckpointView { id: "turn-3".into(), turn: 3 },
-            CheckpointView { id: "turn-2".into(), turn: 2 },
-            CheckpointView { id: "turn-1".into(), turn: 1 },
-        ])
+        AppEvent::CheckpointList {
+            checkpoints: vec![
+                CheckpointView { id: "turn-3".into(), turn: 3 },
+                CheckpointView { id: "turn-2".into(), turn: 2 },
+                CheckpointView { id: "turn-1".into(), turn: 1 },
+            ],
+            scope: RewindScope::Both,
+        }
     }
 
     #[test]
@@ -2725,7 +2732,7 @@ mod tests {
         assert!(s.apply_event(checkpoint_list()).is_empty());
         match &s.overlay {
             Some(Overlay::Picker(p)) => {
-                assert_eq!(p.kind, PickerKind::Rewind);
+                assert_eq!(p.kind, PickerKind::Rewind(RewindScope::Both));
                 assert_eq!(p.items.len(), 3);
                 assert_eq!(p.items[0].label, "turn 3");
                 assert_eq!(p.selected, 0);
@@ -2736,7 +2743,7 @@ mod tests {
         s.overlay_picker_move(1);
         let effects = s.overlay_picker_select();
         match effects.as_slice() {
-            [Effect::Send(Action::Rewind { checkpoint_id })] => {
+            [Effect::Send(Action::Rewind { checkpoint_id, .. })] => {
                 assert_eq!(checkpoint_id, "turn-2")
             }
             _ => panic!("expected a Rewind send"),

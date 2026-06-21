@@ -1,3 +1,4 @@
+use crate::action::RewindScope;
 use crate::approval::ApprovalRequest;
 use crate::view::{
     CheckpointView, ContextBreakdownView, DiffView, LayerStatus, ModelChoiceView, ModelView,
@@ -83,8 +84,12 @@ pub enum AppEvent {
     /// with a jump opens that setting's editor (e.g. `/permissions`, `/theme`).
     SettingsSnapshot(SettingsSnapshotView),
     /// `/rewind` (or Esc-Esc) — available checkpoints, newest first; the TUI
-    /// opens a picker whose selection comes back as `Action::Rewind`.
-    CheckpointList(Vec<CheckpointView>),
+    /// opens a picker whose selection comes back as `Action::Rewind`. `scope`
+    /// (from `/rewind [code|conversation]`) rides through to that selection.
+    CheckpointList {
+        checkpoints: Vec<CheckpointView>,
+        scope: RewindScope,
+    },
     /// `/resume` — recent sessions, newest first; the TUI opens a picker whose
     /// selection comes back as `Action::Resume`.
     SessionList(Vec<SessionView>),

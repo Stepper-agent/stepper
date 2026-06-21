@@ -47,7 +47,9 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("ask", "<spec>", "add an ask rule"),
     ("deny", "<spec>", "add a deny rule"),
     ("resume", "", "pick a session"),
-    ("rewind", "", "pick a checkpoint, also Esc-Esc"),
+    ("rename", "<name>", "rename this session"),
+    ("export", "[path]", "write the session transcript to a file"),
+    ("rewind", "[code|conversation]", "pick a checkpoint, also Esc-Esc"),
     ("undo", "", "revert the last turn (files + message)"),
     ("redo", "", "re-apply an undone turn"),
 ];
@@ -193,7 +195,14 @@ pub async fn handle(
             true
         }
         "rewind" => {
-            handle_rewind(&orchestrator.project_root, tx).await;
+            // `/rewind code` restores files only, `/rewind conversation` the
+            // transcript only; bare `/rewind` (and Esc-Esc) restores both.
+            let scope = match args.trim().to_ascii_lowercase().as_str() {
+                "code" | "files" => stepper_protocol::RewindScope::CodeOnly,
+                "conversation" | "convo" | "chat" => stepper_protocol::RewindScope::ConversationOnly,
+                _ => stepper_protocol::RewindScope::Both,
+            };
+            handle_rewind(&orchestrator.project_root, scope, tx).await;
             true
         }
         _ => false,
@@ -1033,8 +1042,8 @@ fn read_settings(dir: &Path) -> Option<stepper_config::SettingsFile> {
 
 /// `/rewind` (and the TUI's Esc-Esc): list the `turn-N` working-tree
 /// checkpoints, newest first; the TUI picker sends the selection back as
-/// `Action::Rewind`.
-async fn handle_rewind(project_root: &Path, tx: &EventTx) {
+/// `Action::Rewind` carrying `scope` (files / conversation / both).
+async fn handle_rewind(project_root: &Path, scope: stepper_protocol::RewindScope, tx: &EventTx) {
     let dir = project_root.join(".stepper").join("checkpoints");
     let mut turns: Vec<u64> = std::fs::read_dir(&dir)
         .into_iter()
@@ -1060,7 +1069,7 @@ async fn handle_rewind(project_root: &Path, tx: &EventTx) {
             turn,
         })
         .collect();
-    let _ = tx.send(AppEvent::CheckpointList(checkpoints)).await;
+    let _ = tx.send(AppEvent::CheckpointList { checkpoints, scope }).await;
 }
 
 /// How many sessions the `/resume` picker lists.

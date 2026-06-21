@@ -20,8 +20,8 @@ pub use discovery::{discover, Discovery};
 pub use error::ConfigError;
 pub use import::{apply_plan, build_plan, render_preview, ImportFrom, ImportPlan, ImportSummary};
 pub use frontmatter::{
-    parse_command, parse_layer, parse_output_style, parse_skill, CommandDef, LayerDef,
-    LayerFrontmatter, McpAllow, OutputStyleDef, SkillDef, ToolFilter,
+    parse_command, parse_layer, parse_output_style, parse_rule, parse_skill, CommandDef, LayerDef,
+    LayerFrontmatter, McpAllow, OutputStyleDef, RuleDef, SkillDef, ToolFilter,
 };
 pub use model::ResolvedModel;
 pub use scaffold::{get_scalar, set_scalar};

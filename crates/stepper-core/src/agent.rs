@@ -124,6 +124,17 @@ impl AgentLoop<'_> {
 
             let projected = last_context
                 + crate::compaction::estimate_tokens(&messages[accounted.min(messages.len())..]);
+            // Microcompaction first: elide oversized OLD tool results (cheap, keeps
+            // every turn). If it reclaims anything the prefix changed, so re-estimate
+            // from scratch — that may now be under the soft threshold, skipping the
+            // heavier message-dropping cut below.
+            let projected = if compactor.microcompact(&mut messages, projected) > 0 {
+                last_context = 0;
+                accounted = 0;
+                crate::compaction::estimate_tokens(&messages)
+            } else {
+                projected
+            };
             if let Some(cut) = compactor.plan(&messages, projected) {
                 // A worker still compacts its own context, but silently: the
                 // compaction notice is a shared global surface (N workers would

@@ -184,6 +184,25 @@ pub fn parse_output_style(stem: &str, content: &str) -> Result<OutputStyleDef, C
     })
 }
 
+/// A path-scoped rule file (`.stepper/rules/*.md`): an optional `paths:` glob
+/// list (relative to the project root) plus the rule body. With no `paths` the
+/// rule always applies; otherwise it loads only when the working directory
+/// matches one of the globs.
+#[derive(Debug, Clone)]
+pub struct RuleDef {
+    pub paths: Vec<String>,
+    pub body: String,
+}
+
+/// Parse a `.stepper/rules/*.md` file into its `paths` scope + body.
+pub fn parse_rule(content: &str) -> Result<RuleDef, ConfigError> {
+    let (data, body) = split_frontmatter(content, "rule")?;
+    Ok(RuleDef {
+        paths: string_or_list(data.get("paths")),
+        body,
+    })
+}
+
 pub fn parse_command(name: &str, content: &str) -> Result<CommandDef, ConfigError> {
     let (data, body) = split_frontmatter(content, "command")?;
     Ok(CommandDef {

@@ -64,12 +64,52 @@ pub fn compose_system(base_context: &str, role_prompt: &str) -> String {
     out
 }
 
-/// The base/pinned context, first-found wins. stepper's own config takes
-/// precedence (project `.stepper/stepper.md`, then user `~/.stepper/stepper.md`);
-/// a local `CLAUDE.md` is read as a fallback for users who haven't migrated —
-/// project root `./CLAUDE.md`, then global `~/.claude/CLAUDE.md` (opencode-style:
-/// project context beats global). Empty when none exists.
-pub fn load_base_context(config: &Config) -> String {
+/// The directories strictly below `root` down to `cwd` (inclusive), topmost
+/// first — the chain whose `CLAUDE.md` files accumulate onto the project base.
+/// Empty when `cwd` is `root` itself or not within it.
+fn subdir_chain(root: &std::path::Path, cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(rel) = cwd.strip_prefix(root) else {
+        return Vec::new();
+    };
+    let mut dir = root.to_path_buf();
+    let mut out = Vec::new();
+    for comp in rel.components() {
+        dir = dir.join(comp);
+        out.push(dir.clone());
+    }
+    out
+}
+
+/// Whether a path-scoped rule with these `paths` globs applies at `rel_cwd` (the
+/// working dir relative to the project root, `/`-normalized, `""` at the root).
+/// No globs → always. A glob is a directory scope: a trailing `/**` or `/*` (or a
+/// bare directory) matches that directory and everything beneath it; `*`/`**`
+/// match everywhere.
+fn rule_applies(paths: &[String], rel_cwd: &str) -> bool {
+    if paths.is_empty() {
+        return true;
+    }
+    paths.iter().any(|p| {
+        let p = p.trim().trim_matches('/');
+        if p.is_empty() || p == "*" || p == "**" {
+            return true;
+        }
+        // Reduce a `dir/**`, `dir/*`, or bare `dir` glob to its directory prefix,
+        // then match the cwd as that directory or any descendant of it.
+        let base = p.trim_end_matches("**").trim_end_matches('*').trim_end_matches('/');
+        !base.is_empty() && (rel_cwd == base || rel_cwd.starts_with(&format!("{base}/")))
+    })
+}
+
+/// The base/pinned context. The PROJECT base is first-found-wins: stepper's own
+/// config takes precedence (project `.stepper/stepper.md`, then user
+/// `~/.stepper/stepper.md`); a local `CLAUDE.md` is the fallback for users who
+/// haven't migrated — project root `./CLAUDE.md`, then global `~/.claude/CLAUDE.md`
+/// (opencode-style: project beats global). ON TOP of that, Claude-Code-style
+/// hierarchical `CLAUDE.md` files in every directory from below the project root
+/// down to `cwd` are accumulated (most specific last), so a subtree can add its
+/// own rules. Project memory is appended after. Empty when none exists.
+pub fn load_base_context(config: &Config, cwd: &std::path::Path) -> String {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     // (file, base dir for `@import` resolution), in precedence order.
     let mut candidates: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
@@ -93,6 +133,58 @@ pub fn load_base_context(config: &Config) -> String {
             // rule files keeps working.
             context = stepper_config::imports::resolve_imports(&text, &base, home.as_deref());
             break;
+        }
+    }
+    // Hierarchical accumulation: append each subdirectory's `CLAUDE.md` from below
+    // the project root down to `cwd` (most specific last). The root's own
+    // `CLAUDE.md` is left to the first-found base above (so a migrated user with
+    // `.stepper/stepper.md` doesn't double-load it).
+    if let Some(root) = config.project_root.as_ref() {
+        for dir in subdir_chain(root, cwd) {
+            if let Ok(text) = std::fs::read_to_string(dir.join("CLAUDE.md")) {
+                let resolved = stepper_config::imports::resolve_imports(&text, &dir, home.as_deref());
+                if !resolved.trim().is_empty() {
+                    if !context.is_empty() {
+                        context.push_str("\n\n");
+                    }
+                    context.push_str(&resolved);
+                }
+            }
+        }
+    }
+    // Path-scoped rules (`.stepper/rules/*.md`): each carries an optional `paths:`
+    // glob list (relative to the project root). A rule with no `paths` always
+    // applies; otherwise it loads only when `cwd` matches one of its globs — so a
+    // subtree's conventions don't burden unrelated work.
+    if let Some(rules_dir) = config.project_dir.as_ref().map(|d| d.join("rules"))
+        && let Ok(entries) = std::fs::read_dir(&rules_dir)
+    {
+        let rel_cwd = config
+            .project_root
+            .as_ref()
+            .and_then(|root| cwd.strip_prefix(root).ok())
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let mut files: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+            .collect();
+        files.sort();
+        for file in files {
+            if let Ok(text) = std::fs::read_to_string(&file)
+                && let Ok(rule) = stepper_config::parse_rule(&text)
+                && rule_applies(&rule.paths, &rel_cwd)
+            {
+                let resolved =
+                    stepper_config::imports::resolve_imports(&rule.body, &rules_dir, home.as_deref());
+                if !resolved.trim().is_empty() {
+                    if !context.is_empty() {
+                        context.push_str("\n\n");
+                    }
+                    context.push_str(&resolved);
+                }
+            }
         }
     }
     // Project memory (written by the agent via `memory_write`) is ADDITIVE: it is
@@ -470,7 +562,7 @@ mod tests {
         cfg.project_dir = Some(stepper_dir);
         cfg.project_root = Some(root);
         // No stepper.md anywhere → falls back to the project-root CLAUDE.md.
-        let ctx = load_base_context(&cfg);
+        let ctx = load_base_context(&cfg, cfg.project_root.as_deref().unwrap());
         assert!(ctx.contains("PROJECT CLAUDE RULES"), "reads ./CLAUDE.md fallback: {ctx}");
     }
 
@@ -490,7 +582,7 @@ mod tests {
         let mut cfg = Config::from_settings(Default::default());
         cfg.project_dir = Some(stepper_dir);
         cfg.project_root = Some(root);
-        let ctx = load_base_context(&cfg);
+        let ctx = load_base_context(&cfg, cfg.project_root.as_deref().unwrap());
         // The pinned context wins the first-found candidate, and the agent's memory
         // is appended after it (the auto-memory reload).
         assert!(ctx.contains("PINNED CONTEXT"), "keeps the pinned context: {ctx}");
@@ -518,7 +610,7 @@ mod tests {
         let mut cfg = Config::from_settings(Default::default());
         cfg.project_dir = Some(stepper_dir);
         cfg.project_root = Some(root);
-        let ctx = load_base_context(&cfg);
+        let ctx = load_base_context(&cfg, cfg.project_root.as_deref().unwrap());
         assert!(ctx.len() < 64 * 1024, "the loaded memory is bounded, not {}B", ctx.len());
         assert!(ctx.starts_with("BASE"), "pinned context kept first");
         assert!(ctx.contains("(older memory truncated)"), "marks the truncation: tail-only");
@@ -554,6 +646,68 @@ mod tests {
     }
 
     #[test]
+    fn base_context_accumulates_subdirectory_claude_md_from_root_to_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let stepper_dir = root.join(".stepper");
+        let sub = root.join("src").join("widgets");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&stepper_dir).unwrap();
+        std::fs::write(stepper_dir.join("stepper.md"), "PROJECT BASE").unwrap();
+        std::fs::write(root.join("src").join("CLAUDE.md"), "SRC RULES").unwrap();
+        std::fs::write(sub.join("CLAUDE.md"), "WIDGET RULES").unwrap();
+
+        let mut cfg = Config::from_settings(Default::default());
+        cfg.project_dir = Some(stepper_dir);
+        cfg.project_root = Some(root.clone());
+        // From cwd = root/src/widgets, both subdir CLAUDE.md files accumulate onto
+        // the project base, most specific last.
+        let ctx = load_base_context(&cfg, &sub);
+        assert!(ctx.contains("PROJECT BASE"), "project base kept: {ctx}");
+        let src_at = ctx.find("SRC RULES").expect("src CLAUDE.md loaded");
+        let widget_at = ctx.find("WIDGET RULES").expect("widget CLAUDE.md loaded");
+        assert!(src_at < widget_at, "topmost subdir first, most specific last: {ctx}");
+        // From the root itself, no subdir files are pulled in.
+        let at_root = load_base_context(&cfg, &root);
+        assert!(!at_root.contains("SRC RULES"), "no subdir accumulation at the root: {at_root}");
+    }
+
+    #[test]
+    fn rule_applies_matches_directory_scopes() {
+        assert!(rule_applies(&[], "anywhere"), "no globs → always");
+        assert!(rule_applies(&["**".into()], "src/widgets"));
+        assert!(rule_applies(&["src".into()], "src"), "bare dir matches itself");
+        assert!(rule_applies(&["src".into()], "src/widgets"), "and descendants");
+        assert!(rule_applies(&["src/**".into()], "src/a/b"));
+        assert!(!rule_applies(&["src".into()], "tests"));
+        assert!(!rule_applies(&["src".into()], "srcfoo"), "prefix must be a path boundary");
+        assert!(rule_applies(&["a".into(), "b".into()], "b/x"), "any glob matches");
+    }
+
+    #[test]
+    fn path_scoped_rules_load_only_when_cwd_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let rules = root.join(".stepper").join("rules");
+        let sub = root.join("src");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(rules.join("always.md"), "ALWAYS RULE").unwrap();
+        std::fs::write(rules.join("src.md"), "---\npaths: src\n---\nSRC RULE").unwrap();
+
+        let mut cfg = Config::from_settings(Default::default());
+        cfg.project_dir = Some(root.join(".stepper"));
+        cfg.project_root = Some(root.clone());
+        // At the root: only the unscoped rule loads.
+        let at_root = load_base_context(&cfg, &root);
+        assert!(at_root.contains("ALWAYS RULE"), "unscoped rule always loads: {at_root}");
+        assert!(!at_root.contains("SRC RULE"), "src-scoped rule not loaded at root: {at_root}");
+        // Inside src/: both load.
+        let in_src = load_base_context(&cfg, &sub);
+        assert!(in_src.contains("ALWAYS RULE") && in_src.contains("SRC RULE"), "{in_src}");
+    }
+
+    #[test]
     fn base_context_prefers_stepper_md_over_claude_md() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
@@ -565,7 +719,7 @@ mod tests {
         let mut cfg = Config::from_settings(Default::default());
         cfg.project_dir = Some(stepper_dir);
         cfg.project_root = Some(root);
-        let ctx = load_base_context(&cfg);
+        let ctx = load_base_context(&cfg, cfg.project_root.as_deref().unwrap());
         assert!(ctx.contains("STEPPER WINS"), "stepper.md wins over CLAUDE.md: {ctx}");
         assert!(!ctx.contains("CLAUDE FALLBACK"), "CLAUDE.md unused when stepper.md exists");
     }

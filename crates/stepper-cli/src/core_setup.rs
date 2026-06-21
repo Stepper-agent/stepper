@@ -230,7 +230,7 @@ pub async fn build_orchestrator_with_fallback(
     // The selected `outputStyle` body is folded into the base context so it
     // reaches every layer's system prompt (via `compose_system`) and is counted
     // honestly by `/context` (as part of `base_context`).
-    let base_context = with_output_style(&config, load_base_context(&config));
+    let base_context = with_output_style(&config, load_base_context(&config, &cwd));
     let project_root = config.project_root.clone().unwrap_or_else(|| cwd.clone());
 
     let approvals: Vec<String> = config

@@ -240,35 +240,49 @@ pub fn spawn_core(
                         break;
                     }
                 }
-                Action::Rewind { checkpoint_id } => {
+                Action::Rewind { checkpoint_id, scope } => {
+                    use stepper_protocol::RewindScope;
                     // Jumping to an arbitrary checkpoint forks the timeline — any
                     // pending /redo forward snapshots are now unreachable.
                     clear_redo(&mut redo_stack, &snapshotter);
-                    let (level, text) = match snapshotter.restore(&checkpoint_id) {
-                        Ok(()) => {
-                            // A `turn-N` checkpoint is the tree *before* turn N —
-                            // drop turn N onward from the session and reset the
-                            // counter so later turns/checkpoints stay consistent.
-                            // Prefer the turn-count recorded with the checkpoint
-                            // (robust to a drifted turn-id after failed turns or
-                            // /compact); fall back to parsing N-1 from the id.
-                            let keep = snapshotter.checkpoint_turns(&checkpoint_id).or_else(|| {
-                                checkpoint_id
-                                    .strip_prefix("turn-")
-                                    .and_then(|s| s.parse::<usize>().ok())
-                                    .map(|n| n.saturating_sub(1))
-                            });
-                            if let Some(keep) = keep {
-                                session.turns.truncate(keep);
-                                turn_id = keep as u64;
-                                let _ = store.save(&session);
-                                // Reseed the live conversation to the rewound point
-                                // so the next turn's context matches the tree.
-                                orchestrator.resume_seed = session.seed_messages();
-                            }
-                            (NoticeLevel::Info, format!("rewound to {checkpoint_id}"))
+                    // A `turn-N` checkpoint is the tree *before* turn N — the turn
+                    // count to keep when rewinding the conversation. Prefer the count
+                    // recorded with the checkpoint (robust to a drifted turn-id after
+                    // failed turns or /compact); fall back to parsing N-1 from the id.
+                    let keep = snapshotter.checkpoint_turns(&checkpoint_id).or_else(|| {
+                        checkpoint_id
+                            .strip_prefix("turn-")
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .map(|n| n.saturating_sub(1))
+                    });
+                    let restore_files = !matches!(scope, RewindScope::ConversationOnly);
+                    let restore_convo = !matches!(scope, RewindScope::CodeOnly);
+                    // Restore the working tree first (skipped for conversation-only).
+                    let file_err = if restore_files {
+                        snapshotter.restore(&checkpoint_id).err()
+                    } else {
+                        None
+                    };
+                    // Truncate the conversation (skipped for code-only) — but not if
+                    // the file restore failed, so the two never drift out of sync.
+                    if restore_convo && file_err.is_none() && let Some(keep) = keep {
+                        session.turns.truncate(keep);
+                        turn_id = keep as u64;
+                        let _ = store.save(&session);
+                        // Reseed the live conversation to the rewound point so the
+                        // next turn's context matches the tree.
+                        orchestrator.resume_seed = session.seed_messages();
+                    }
+                    let (level, text) = match file_err {
+                        Some(e) => (NoticeLevel::Warn, format!("rewind failed: {e}")),
+                        None => {
+                            let what = match scope {
+                                RewindScope::Both => "files + conversation",
+                                RewindScope::CodeOnly => "files",
+                                RewindScope::ConversationOnly => "conversation",
+                            };
+                            (NoticeLevel::Info, format!("rewound {what} to {checkpoint_id}"))
                         }
-                        Err(e) => (NoticeLevel::Warn, format!("rewind failed: {e}")),
                     };
                     let _ = tx.send(AppEvent::Notice { level, text }).await;
                 }
@@ -327,6 +341,20 @@ pub fn spawn_core(
                             &tx,
                         )
                         .await;
+                        continue;
+                    }
+                    // `/rename <name>` and `/export [path]` act on the LIVE session
+                    // (which `builtins::handle` can mutate, but these also touch the
+                    // store / write a file), so handle them here, before builtins.
+                    if cmd_def.is_none() && (name == "rename" || name == "export") {
+                        let (level, text) = handle_session_meta(
+                            &name,
+                            &args,
+                            &mut session,
+                            &store,
+                            &orchestrator.project_root,
+                        );
+                        let _ = tx.send(AppEvent::Notice { level, text }).await;
                         continue;
                     }
                     if cmd_def.is_none()
@@ -767,6 +795,47 @@ struct RedoEntry {
 fn clear_redo(stack: &mut Vec<RedoEntry>, snapshotter: &Snapshotter) {
     for entry in stack.drain(..) {
         snapshotter.remove(&entry.snapshot_id);
+    }
+}
+
+/// `/rename <name>` sets the live session's name and persists it; `/export
+/// [path]` writes the session's Markdown transcript to `path` (or a default
+/// `.stepper/exports/<id>.md` under the project root). Returns a status notice.
+fn handle_session_meta(
+    name: &str,
+    args: &str,
+    session: &mut SessionRecord,
+    store: &SessionStore,
+    project_root: &std::path::Path,
+) -> (NoticeLevel, String) {
+    if name == "rename" {
+        let new_name = args.trim();
+        if new_name.is_empty() {
+            return (NoticeLevel::Warn, "usage: /rename <name>".into());
+        }
+        session.name = Some(new_name.to_string());
+        return match store.save(session) {
+            Ok(()) => (NoticeLevel::Info, format!("renamed session to '{new_name}'")),
+            Err(e) => (NoticeLevel::Warn, format!("rename failed to persist: {e}")),
+        };
+    }
+    // /export
+    if session.turns.is_empty() {
+        return (NoticeLevel::Warn, "nothing to export yet (no turns)".into());
+    }
+    let dest = if args.trim().is_empty() {
+        let dir = project_root.join(".stepper").join("exports");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return (NoticeLevel::Warn, format!("export failed: {e}"));
+        }
+        dir.join(format!("{}.md", session.id))
+    } else {
+        let p = std::path::PathBuf::from(args.trim());
+        if p.is_absolute() { p } else { project_root.join(p) }
+    };
+    match std::fs::write(&dest, session.to_transcript_md()) {
+        Ok(()) => (NoticeLevel::Info, format!("exported transcript to {}", dest.display())),
+        Err(e) => (NoticeLevel::Warn, format!("export failed: {e}")),
     }
 }
 

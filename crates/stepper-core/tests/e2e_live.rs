@@ -231,9 +231,7 @@ async fn two_layer_pipeline_writes_a_file_and_rewinds() {
     // /rewind to the pre-turn checkpoint must prune the file the run produced and
     // truncate the session back to zero turns — the real production path.
     action_tx
-        .send(Action::Rewind {
-            checkpoint_id: "turn-1".into(),
-        })
+        .send(Action::Rewind { checkpoint_id: "turn-1".into(), scope: stepper_protocol::RewindScope::Both })
         .await
         .unwrap();
     let notice = loop {

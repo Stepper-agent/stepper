@@ -1205,6 +1205,14 @@ fn session_cmd(args: cli::SessionArgs, global: GlobalArgs) -> anyhow::Result<()>
                 anyhow::bail!("no session '{id}' found");
             }
         }
+        cli::SessionCmd::Rename { id, name } => {
+            let mut record = store
+                .load(&id)
+                .ok_or_else(|| anyhow::anyhow!("no session '{id}' found"))?;
+            record.name = Some(name.clone());
+            store.save(&record).map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("renamed session {id} to '{name}'");
+        }
     }
     Ok(())
 }

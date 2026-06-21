@@ -796,7 +796,7 @@ async fn rewind_lists_checkpoints_newest_first_and_warns_when_none() {
     action_tx.send(slash("rewind", "")).await.unwrap();
     let checkpoints = loop {
         match events.recv().await.expect("event stream stays open") {
-            AppEvent::CheckpointList(list) => break list,
+            AppEvent::CheckpointList { checkpoints, .. } => break checkpoints,
             AppEvent::TurnStarted { .. } => panic!("/rewind must not start a turn"),
             _ => {}
         }
@@ -804,6 +804,28 @@ async fn rewind_lists_checkpoints_newest_first_and_warns_when_none() {
     let ids: Vec<&str> = checkpoints.iter().map(|c| c.id.as_str()).collect();
     assert_eq!(ids, vec!["turn-2", "turn-1"], "newest first");
     assert_eq!(checkpoints[0].turn, 2);
+
+    // `/rewind code` carries the CodeOnly scope through to the picker list.
+    action_tx.send(slash("rewind", "code")).await.unwrap();
+    let scope = loop {
+        if let AppEvent::CheckpointList { scope, .. } =
+            events.recv().await.expect("event stream stays open")
+        {
+            break scope;
+        }
+    };
+    assert_eq!(scope, stepper_protocol::RewindScope::CodeOnly);
+
+    // `/rewind conversation` → ConversationOnly.
+    action_tx.send(slash("rewind", "conversation")).await.unwrap();
+    let scope = loop {
+        if let AppEvent::CheckpointList { scope, .. } =
+            events.recv().await.expect("event stream stays open")
+        {
+            break scope;
+        }
+    };
+    assert_eq!(scope, stepper_protocol::RewindScope::ConversationOnly);
 }
 
 #[tokio::test(flavor = "multi_thread")]

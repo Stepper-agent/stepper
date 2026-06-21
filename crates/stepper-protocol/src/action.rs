@@ -31,6 +31,8 @@ pub enum Action {
     RemoveLastQueued,
     Rewind {
         checkpoint_id: String,
+        /// What to restore (files, conversation, or both).
+        scope: RewindScope,
     },
     Resume {
         session_id: String,
@@ -65,4 +67,17 @@ pub enum Action {
     OpenEditor,
     Quit,
     Redraw,
+}
+
+/// What a `/rewind` restores. Threaded from `/rewind [code|conversation]` through
+/// the checkpoint picker to the eventual [`Action::Rewind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RewindScope {
+    /// Restore both the file tree and the conversation (the default).
+    #[default]
+    Both,
+    /// Restore the file tree only; keep the conversation transcript.
+    CodeOnly,
+    /// Truncate the conversation only; keep the working tree as-is.
+    ConversationOnly,
 }
