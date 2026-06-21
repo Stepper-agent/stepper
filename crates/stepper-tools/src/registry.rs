@@ -55,6 +55,17 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.spec().clone()).collect()
     }
 
+    /// Names of the tools sourced from MCP servers (those with an `mcp_server()`).
+    /// The agent's tool-search hides these behind the `tool_search` meta-tool when
+    /// there are many, then reveals matches on demand.
+    pub fn mcp_names(&self) -> std::collections::HashSet<String> {
+        self.tools
+            .iter()
+            .filter(|(_, t)| t.mcp_server().is_some())
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// A layer's view: if `allow` is non-empty, keep only those tools; then drop
     /// anything in `deny` (deny wins). Empty `allow` means "inherit all".
     pub fn filtered(&self, allow: &[String], deny: &[String]) -> ToolRegistry {
@@ -178,6 +189,15 @@ mod tests {
             .filter_mcp(&[], &[])
             .names();
         assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn mcp_names_lists_only_mcp_sourced_tools() {
+        let r = registry_with(&["read_file", "mcp__alpha__x", "mcp__beta__y"]);
+        let mcp = r.mcp_names();
+        assert_eq!(mcp.len(), 2);
+        assert!(mcp.contains("mcp__alpha__x") && mcp.contains("mcp__beta__y"));
+        assert!(!mcp.contains("read_file"), "built-ins are not MCP-sourced");
     }
 
     #[test]

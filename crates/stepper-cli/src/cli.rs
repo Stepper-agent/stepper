@@ -74,6 +74,16 @@ pub struct GlobalArgs {
     /// `json` (one JSON event per line — tool calls, the final text, done/error).
     #[arg(long, value_enum, global = true)]
     pub format: Option<OutputFormat>,
+    /// (headless `-p`) Require the final reply to be JSON matching this JSON
+    /// Schema — an inline schema string or a path to a `.json` schema file. On a
+    /// mismatch the run re-prompts the model with the validation error (up to
+    /// `--output-schema-retries` times) and exits non-zero if it never conforms.
+    #[arg(long, global = true)]
+    pub output_schema: Option<String>,
+    /// (headless `-p`) How many times to re-prompt when the reply fails the
+    /// `--output-schema` (default 2).
+    #[arg(long, global = true, default_value_t = 2)]
+    pub output_schema_retries: u32,
     /// Project working directory (defaults to the current dir).
     #[arg(long, global = true)]
     pub cwd: Option<PathBuf>,
@@ -570,6 +580,16 @@ mod tests {
         let cli = Cli::try_parse_from(["stepper", "-p", "x", "--format", "json"]).unwrap();
         assert_eq!(cli.global.format, Some(OutputFormat::Json));
         assert!(Cli::try_parse_from(["stepper"]).unwrap().global.format.is_none());
+    }
+
+    #[test]
+    fn output_schema_flags_parse_with_default_retries() {
+        let cli = Cli::try_parse_from(["stepper", "-p", "x", "--output-schema", "{\"type\":\"object\"}"]).unwrap();
+        assert_eq!(cli.global.output_schema.as_deref(), Some("{\"type\":\"object\"}"));
+        assert_eq!(cli.global.output_schema_retries, 2, "default retries");
+        let cli = Cli::try_parse_from(["stepper", "-p", "x", "--output-schema", "s.json", "--output-schema-retries", "5"]).unwrap();
+        assert_eq!(cli.global.output_schema_retries, 5);
+        assert!(Cli::try_parse_from(["stepper"]).unwrap().global.output_schema.is_none());
     }
 
     #[test]

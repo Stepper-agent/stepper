@@ -68,6 +68,8 @@ schemars = "1"
 regex = "1"
 # JSONC (comments + trailing commas) parsing for `setting.json`.
 jsonc-parser = { version = "0.32", features = ["serde"] }
+# JSON Schema validation for headless `-p --output-schema` structured outputs.
+jsonschema = { version = "0.46", default-features = false }
 # Codex `config.toml` parsing for `stepper import`.
 toml = "0.9"
 shell-words = "1"

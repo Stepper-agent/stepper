@@ -24,6 +24,49 @@ const TOOL_RESULT_CALL_CAP: usize = 16_384;
 const TOOL_RESULT_TURN_BUDGET: usize = 65_536;
 /// Smallest excerpt kept for an over-budget result (head + tail).
 const TOOL_RESULT_MIN_KEEP: usize = 2_048;
+/// Above this many advertised tools, hide the MCP ones behind `tool_search` to
+/// keep the prompt lean (only engages when MCP tools are actually present).
+const TOOL_SEARCH_THRESHOLD: usize = 40;
+
+/// The `tool_search` meta-tool spec, advertised when tool-search is engaged. The
+/// model calls it to discover the hidden MCP tools by keyword; matches are then
+/// revealed (advertised) so it can call them directly.
+fn tool_search_spec() -> stepper_provider::ToolSpec {
+    stepper_provider::ToolSpec {
+        name: "tool_search".to_string(),
+        description: "Search for additional tools (from connected MCP servers) by keyword when you \
+            need a capability that isn't in the current tool list. Returns matching tools with \
+            their input schemas; after searching you can call any returned tool directly."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "keywords matched against tool names and descriptions; empty lists all" }
+            },
+            "required": ["query"]
+        }),
+        read_only: true,
+        parallel_safe: true,
+    }
+}
+
+/// Render `tool_search` matches as a compact, model-readable catalog (name,
+/// description, and input schema for each), so the model can call them next.
+fn render_tool_search(matches: &[&stepper_provider::ToolSpec]) -> String {
+    if matches.is_empty() {
+        return "No matching tools found.".to_string();
+    }
+    let mut out = format!("Found {} tool(s); you can now call any of them:\n", matches.len());
+    for s in matches {
+        out.push_str(&format!(
+            "\n- {}: {}\n  input schema: {}\n",
+            s.name,
+            s.description,
+            s.input_schema
+        ));
+    }
+    out
+}
 
 pub struct LayerOutcome {
     pub summary: String,
@@ -88,7 +131,15 @@ impl AgentLoop<'_> {
         mut messages: Vec<Message>,
     ) -> Result<LayerOutcome, CoreError> {
         let mut total = Usage::default();
-        let tool_specs = self.tools.specs();
+        let all_specs = self.tools.specs();
+        // tool-search: when a layer carries many tools (typically lots of MCP
+        // tools), advertising every spec floods the prompt. Above a threshold we
+        // hide the MCP tools behind a single `tool_search` meta-tool and reveal
+        // matches on demand for the rest of the turn — so the provider always sees
+        // any tool it is asked to call. Built-ins stay always-advertised.
+        let mcp_names = self.tools.mcp_names();
+        let tool_search_on = all_specs.len() > TOOL_SEARCH_THRESHOLD && !mcp_names.is_empty();
+        let mut revealed: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Plan against the window minus the output cap so the reply always fits.
         let compactor = Compactor::with_output_reserve(
             self.model_info.context_window,
@@ -168,11 +219,25 @@ impl AgentLoop<'_> {
                 }
             }
 
+            // The advertised tool set for this step. With tool-search on, the MCP
+            // tools are hidden until revealed; a `tool_search` meta-tool is offered.
+            let tool_specs: Vec<stepper_provider::ToolSpec> = if tool_search_on {
+                let mut v: Vec<stepper_provider::ToolSpec> = all_specs
+                    .iter()
+                    .filter(|s| !mcp_names.contains(&s.name) || revealed.contains(&s.name))
+                    .cloned()
+                    .collect();
+                v.push(tool_search_spec());
+                v
+            } else {
+                all_specs.clone()
+            };
+
             let request = ChatRequest {
                 model: self.provider.model().to_string(),
                 system: Some(system.clone()),
                 messages: messages.clone(),
-                tools: tool_specs.clone(),
+                tools: tool_specs,
                 tool_choice: Default::default(),
                 // The registry's per-model output cap (0 = provider default), so
                 // Anthropic isn't silently capped at its 4096 wire default.
@@ -286,7 +351,55 @@ impl AgentLoop<'_> {
                     }
                 }
             }
-            let mut results = self.run_tools(tool_calls).await;
+            // tool-search calls are answered here (not via `run_tools`) so they can
+            // reveal matching tools into `revealed` for the next request. Results
+            // are reassembled in the original order to keep tool_call_id pairing.
+            let mut results: Vec<ContentBlock> = if tool_search_on
+                && tool_calls.iter().any(|(_, name, _)| name == "tool_search")
+            {
+                let mut slots: Vec<Option<ContentBlock>> = (0..tool_calls.len()).map(|_| None).collect();
+                let mut to_run: Vec<(usize, String, String, Value)> = Vec::new();
+                for (i, (id, name, input)) in tool_calls.into_iter().enumerate() {
+                    if name == "tool_search" {
+                        self.emit_tool_started(&id, &name, &input).await;
+                        let query = input
+                            .get("query")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_lowercase();
+                        let matches: Vec<&stepper_provider::ToolSpec> = all_specs
+                            .iter()
+                            .filter(|s| mcp_names.contains(&s.name))
+                            .filter(|s| {
+                                query.is_empty()
+                                    || s.name.to_lowercase().contains(&query)
+                                    || s.description.to_lowercase().contains(&query)
+                            })
+                            .collect();
+                        for s in &matches {
+                            revealed.insert(s.name.clone());
+                        }
+                        self.emit_tool_finished(&id, true).await;
+                        slots[i] = Some(ContentBlock::ToolResult {
+                            tool_call_id: id,
+                            content: vec![stepper_provider::ToolContent::text(render_tool_search(&matches))],
+                            is_error: false,
+                        });
+                    } else {
+                        to_run.push((i, id, name, input));
+                    }
+                }
+                let indices: Vec<usize> = to_run.iter().map(|(i, ..)| *i).collect();
+                let ran = self
+                    .run_tools(to_run.into_iter().map(|(_, id, name, input)| (id, name, input)).collect())
+                    .await;
+                for (slot, block) in indices.into_iter().zip(ran) {
+                    slots[slot] = Some(block);
+                }
+                slots.into_iter().map(|b| b.expect("every slot filled")).collect()
+            } else {
+                self.run_tools(tool_calls).await
+            };
             self.shrink_oversized_results(&mut results, &mut running_tool_bytes);
             messages.push(Message {
                 role: Role::Tool,
@@ -810,9 +923,32 @@ fn summarize(name: &str, input: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{looks_unfinished, retry_delay};
+    use super::{looks_unfinished, render_tool_search, retry_delay, tool_search_spec};
     use std::time::Duration;
     use stepper_provider::ProviderError;
+
+    #[test]
+    fn tool_search_spec_is_read_only_with_a_query_arg() {
+        let s = tool_search_spec();
+        assert_eq!(s.name, "tool_search");
+        assert!(s.read_only && s.parallel_safe);
+        assert_eq!(s.input_schema["required"][0], "query");
+    }
+
+    #[test]
+    fn render_tool_search_lists_matches_or_reports_none() {
+        assert_eq!(render_tool_search(&[]), "No matching tools found.");
+        let spec = stepper_provider::ToolSpec {
+            name: "mcp__fs__write".into(),
+            description: "write a file".into(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            read_only: false,
+            parallel_safe: false,
+        };
+        let out = render_tool_search(&[&spec]);
+        assert!(out.contains("mcp__fs__write") && out.contains("write a file"));
+        assert!(out.contains("input schema"));
+    }
 
     fn api(retry_after: Option<Duration>) -> ProviderError {
         ProviderError::Api {

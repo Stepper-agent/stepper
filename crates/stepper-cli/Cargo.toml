@@ -24,6 +24,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 tokio-util = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
+# JSON Schema validation for `-p --output-schema` (structured outputs).
+jsonschema = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }

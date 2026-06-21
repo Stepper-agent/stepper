@@ -891,34 +891,110 @@ async fn oneshot(
         global.name.as_deref(),
         global.fork,
     );
+    // `--output-schema`: compile the JSON Schema (inline string or a file path)
+    // once; the run then requires the reply to validate against it, re-prompting
+    // on a mismatch. None = no structured-output enforcement.
+    let validator = match global.output_schema.as_deref() {
+        Some(spec) => Some(compile_output_schema(spec)?),
+        None => None,
+    };
+
     let (action_tx, action_rx) = tokio::sync::mpsc::channel(64);
     let cancel = CancellationToken::new();
     let mut event_rx = spawn_core(orchestrator, session, action_rx, cancel);
 
-    action_tx.send(Action::SubmitInput(prompt)).await?;
     let json = global.format == Some(cli::OutputFormat::Json);
-    let mut stdout = std::io::stdout();
-    let mut turn_error: Option<String> = None;
-    // In JSON mode the assistant text is buffered and emitted as one `text` event
-    // at the end (a stream of per-token JSON lines would be unusable).
-    let mut assistant = String::new();
+    // In schema mode the reply is buffered and validated, then the final (valid)
+    // JSON is printed once — never streamed live, and `--format` json events are
+    // suppressed (the JSON document itself is the output).
+    let stream_live = !json && validator.is_none();
+    let emit_json = json && validator.is_none();
 
+    let mut input = Action::SubmitInput(prompt);
+    let mut assistant = String::new();
+    let mut turn_error: Option<String> = None;
+    // attempt 0 = the original prompt; up to `output_schema_retries` corrections.
+    let max_attempts = if validator.is_some() { global.output_schema_retries + 1 } else { 1 };
+    for _attempt in 0..max_attempts {
+        let (reply, err) = drive_one_turn(
+            &mut event_rx,
+            &action_tx,
+            std::mem::replace(&mut input, Action::Redraw),
+            stream_live,
+            emit_json,
+            global.dangerously_auto_approve,
+        )
+        .await;
+        assistant = reply;
+        turn_error = err;
+        // A hard turn error (cap/timeout/provider) is terminal — don't retry.
+        if turn_error.is_some() {
+            break;
+        }
+        let Some(validator) = validator.as_ref() else {
+            break; // no schema → one turn only
+        };
+        match validate_output(validator, &assistant) {
+            Ok(()) => break,
+            Err(reason) => {
+                // Re-prompt with the validation error so the model can correct.
+                input = Action::SubmitInput(format!(
+                    "Your previous reply did not satisfy the required JSON schema: {reason}\n\
+                     Respond with ONLY a JSON value that conforms to the schema — no prose, no code fences.",
+                ));
+                turn_error = Some(format!("output did not match the schema: {reason}"));
+            }
+        }
+    }
+
+    if emit_json {
+        if !assistant.is_empty() {
+            println!("{}", serde_json::json!({ "type": "text", "text": assistant }));
+        }
+        println!("{}", serde_json::json!({ "type": "done" }));
+    } else if validator.is_some() {
+        // Print the final structured result (the valid JSON, or the last attempt).
+        println!("{}", assistant.trim());
+    } else {
+        println!();
+    }
+    let _ = action_tx.send(Action::Quit).await;
+    if let Some(e) = turn_error {
+        anyhow::bail!("turn failed: {e}");
+    }
+    Ok(())
+}
+
+/// Drive one headless turn: submit `input`, then collect events until the turn
+/// completes, returning the accumulated assistant text and any terminal error.
+/// `stream_live` prints text deltas to stdout as they arrive; `emit_json` writes
+/// one JSON event per tool/error line; `auto_approve` blindly allows approvals.
+async fn drive_one_turn(
+    event_rx: &mut stepper_protocol::EventRx,
+    action_tx: &stepper_protocol::ActionTx,
+    input: Action,
+    stream_live: bool,
+    emit_json: bool,
+    auto_approve: bool,
+) -> (String, Option<String>) {
+    let _ = action_tx.send(input).await;
+    let mut stdout = std::io::stdout();
+    let mut assistant = String::new();
+    let mut turn_error = None;
     while let Some(event) = event_rx.recv().await {
-        // Tool/error events become one JSON line each (text/done are handled below).
-        if json && let Some(line) = json_event(&event) {
+        if emit_json && let Some(line) = json_event(&event) {
             println!("{line}");
         }
         match event {
             AppEvent::AssistantTokenDelta(t) => {
-                if json {
-                    assistant.push_str(&t);
-                } else {
+                assistant.push_str(&t);
+                if stream_live {
                     print!("{t}");
                     stdout.flush().ok();
                 }
             }
             AppEvent::ApprovalRequested(req) => {
-                if global.dangerously_auto_approve {
+                if auto_approve {
                     let _ = req.reply.send(ApprovalDecision::AllowOnce);
                 } else {
                     eprintln!(
@@ -928,12 +1004,11 @@ async fn oneshot(
                     let _ = req.reply.send(ApprovalDecision::Deny);
                 }
             }
-            // JSON mode already emitted this above; otherwise note it on stderr.
-            AppEvent::ToolCallStarted(view) if !json => {
+            AppEvent::ToolCallStarted(view) if !emit_json => {
                 eprintln!("\n[tool] {}", view.summary);
             }
             AppEvent::Error(e) => {
-                if !json {
+                if !emit_json {
                     eprintln!("\nerror: {e}");
                 }
                 turn_error = Some(e);
@@ -942,7 +1017,7 @@ async fn oneshot(
             // it as a failure so a headless/CI caller exits non-zero, like the
             // --max-turns / --max-budget-usd caps do.
             AppEvent::Notice { text, .. } if text.starts_with(stepper_core::TURN_TIMEOUT_NOTICE) => {
-                if json {
+                if emit_json {
                     println!("{}", serde_json::json!({ "type": "error", "message": text }));
                 } else {
                     eprintln!("\n{text}");
@@ -953,19 +1028,43 @@ async fn oneshot(
             _ => {}
         }
     }
-    if json {
-        if !assistant.is_empty() {
-            println!("{}", serde_json::json!({ "type": "text", "text": assistant }));
-        }
-        println!("{}", serde_json::json!({ "type": "done" }));
+    (assistant, turn_error)
+}
+
+/// Compile a `--output-schema` spec (an inline JSON Schema string, or a path to a
+/// `.json` schema file) into a reusable validator.
+fn compile_output_schema(spec: &str) -> anyhow::Result<jsonschema::Validator> {
+    let text = if std::path::Path::new(spec).is_file() {
+        std::fs::read_to_string(spec).map_err(|e| anyhow::anyhow!("--output-schema {spec}: {e}"))?
     } else {
-        println!();
+        spec.to_string()
+    };
+    let schema: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("--output-schema is not valid JSON: {e}"))?;
+    jsonschema::validator_for(&schema).map_err(|e| anyhow::anyhow!("invalid JSON Schema: {e}"))
+}
+
+/// Validate a reply against the output schema. The reply must be a single JSON
+/// value (a leading/trailing ```` ```json ```` fence is tolerated) that conforms.
+fn validate_output(validator: &jsonschema::Validator, reply: &str) -> Result<(), String> {
+    let trimmed = strip_code_fence(reply.trim());
+    let value: serde_json::Value =
+        serde_json::from_str(trimmed).map_err(|e| format!("reply is not valid JSON ({e})"))?;
+    match validator.validate(&value) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(error.to_string()),
     }
-    let _ = action_tx.send(Action::Quit).await;
-    if let Some(e) = turn_error {
-        anyhow::bail!("turn failed: {e}");
-    }
-    Ok(())
+}
+
+/// Strip a single Markdown code fence (```` ``` ```` or ```` ```json ````) around
+/// `s`, so a fenced JSON reply still validates. Returns `s` unchanged otherwise.
+fn strip_code_fence(s: &str) -> &str {
+    let Some(rest) = s.strip_prefix("```") else {
+        return s;
+    };
+    // Drop the optional language tag on the opening fence's line.
+    let rest = rest.split_once('\n').map(|(_, body)| body).unwrap_or(rest);
+    rest.trim_end().strip_suffix("```").unwrap_or(rest).trim()
 }
 
 /// Inline `--file` attachments into the prompt as tagged blocks. stepper runs
@@ -1528,5 +1627,35 @@ mod tests {
         let s = scaffold_setting_json(Some("a\"b/c"), "accept-edits", None);
         let parsed: stepper_config::SettingsFile = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.default_model.as_deref(), Some("a\"b/c"));
+    }
+
+    #[test]
+    fn strip_code_fence_unwraps_fenced_json() {
+        assert_eq!(strip_code_fence("{\"a\":1}"), "{\"a\":1}");
+        assert_eq!(strip_code_fence("```json\n{\"a\":1}\n```"), "{\"a\":1}");
+        assert_eq!(strip_code_fence("```\n{\"a\":1}\n```"), "{\"a\":1}");
+    }
+
+    #[test]
+    fn validate_output_enforces_the_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": { "name": { "type": "string" } }
+        });
+        let v = jsonschema::validator_for(&schema).unwrap();
+        // Conforming (bare and fenced).
+        assert!(validate_output(&v, "{\"name\":\"ok\"}").is_ok());
+        assert!(validate_output(&v, "```json\n{\"name\":\"ok\"}\n```").is_ok());
+        // Missing required key, wrong type, and non-JSON all fail.
+        assert!(validate_output(&v, "{\"other\":1}").is_err());
+        assert!(validate_output(&v, "{\"name\":5}").is_err());
+        assert!(validate_output(&v, "not json at all").is_err());
+    }
+
+    #[test]
+    fn compile_output_schema_accepts_inline_and_rejects_bad_json() {
+        assert!(compile_output_schema("{\"type\":\"string\"}").is_ok());
+        assert!(compile_output_schema("{not json}").is_err());
     }
 }
