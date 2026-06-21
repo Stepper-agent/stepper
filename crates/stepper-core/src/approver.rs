@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use stepper_permission::{Decision, Rule, RuleSet};
 use stepper_protocol::{
     AppEvent, ApprovalDecision, ApprovalKind, ApprovalRequest, DiffView, EventTx, NoticeLevel,
+    QuestionRequest,
 };
 use stepper_tools::{Approval, Approver};
 use tokio::sync::oneshot;
@@ -50,6 +51,26 @@ impl Approver for ChannelApprover {
                 Decision::Allow
             }
         }
+    }
+
+    async fn ask(&self, question: &str, options: &[String]) -> Option<usize> {
+        let (reply, rx) = oneshot::channel();
+        let request = QuestionRequest {
+            id: Uuid::new_v4(),
+            question: question.to_string(),
+            options: options.to_vec(),
+            reply,
+        };
+        if self
+            .event_tx
+            .send(AppEvent::QuestionAsked(request))
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        // The TUI sends back the chosen index, or `None` (Esc / dropped channel).
+        rx.await.unwrap_or(None)
     }
 }
 

@@ -1,5 +1,6 @@
 use crate::action::RewindScope;
 use crate::approval::ApprovalRequest;
+use crate::question::QuestionRequest;
 use crate::view::{
     CheckpointView, ContextBreakdownView, DiffView, LayerStatus, ModelChoiceView, ModelView,
     NoticeLevel, PermissionsSnapshotView, ProviderChoiceView, SessionView, SettingsSnapshotView,
@@ -34,6 +35,9 @@ pub enum AppEvent {
         diff: DiffView,
     },
     ApprovalRequested(ApprovalRequest),
+    /// The `ask_user_question` tool — surface a multiple-choice picker; the chosen
+    /// index returns through the embedded oneshot (like `ApprovalRequested`).
+    QuestionAsked(QuestionRequest),
     TodoUpdated(Vec<TodoItemView>),
     LayerStarted {
         index: usize,

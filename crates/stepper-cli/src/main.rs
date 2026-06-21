@@ -777,6 +777,7 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
     let mut theme_preset: Option<String> = None;
     let mut theme_colors: Vec<(String, String)> = Vec::new();
     let mut effort_setting: Option<String> = None;
+    let mut status_line_cmd: Option<Vec<String>> = None;
     // (on_complete, on_approval, on_error) terminal-bell triggers; silent default.
     let mut notify = (false, false, false);
     if let Ok(cfg) = stepper_config::Config::load(&cwd) {
@@ -801,6 +802,12 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         if let Some(notification) = &cfg.settings.notification {
             notify = notification.resolve();
         }
+        status_line_cmd = cfg
+            .settings
+            .status_line
+            .as_ref()
+            .map(|s| s.command.clone())
+            .filter(|c| !c.is_empty());
     }
     // `--effort` wins over the setting; "off"/absent shows no footer indicator.
     let effort = global.effort.clone().or(effort_setting).filter(|e| e != "off");
@@ -820,6 +827,7 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         notify_on_approval: notify.1,
         notify_on_error: notify.2,
         history_path,
+        status_line_cmd,
     };
     run_tui(event_rx, action_tx, init, cancel).await
 }

@@ -30,7 +30,7 @@ pub use settings::{
     deep_merge, ApprovalRule, FallbackModels, FormatterConfig, FormatterEntry, HookEntry,
     LimitsConfig, LspConfig, LspServerEntry, McpOAuthConfig, McpServerConfig, ModelOverride,
     NotificationConfig, NotificationDetail, OrchestratorConfig, Permissions, ProviderConfig,
-    ProxyConfig, SandboxConfig, SettingsFile, ThemeConfig, PROVIDER_KINDS,
+    ProxyConfig, SandboxConfig, SettingsFile, StatusLineConfig, ThemeConfig, PROVIDER_KINDS,
 };
 pub use substitution::{substitute, CommandArgs, SubstitutionIo};
 

@@ -99,6 +99,19 @@ pub struct SettingsFile {
     /// the environment; `disabled: true` forces a direct connection.
     #[serde(default)]
     pub proxy: Option<ProxyConfig>,
+    /// Custom TUI status line: a command run periodically with a JSON context
+    /// (model / mode / cwd / tokens / cost) piped to stdin; its first line of
+    /// stdout replaces the built-in footer. Omitted = the built-in status line.
+    #[serde(default)]
+    pub status_line: Option<StatusLineConfig>,
+}
+
+/// `setting.json` `statusLine`: the command (program + args) whose stdout renders
+/// as the TUI footer, fed a JSON context on stdin. Mirrors Claude Code's hook.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusLineConfig {
+    pub command: Vec<String>,
 }
 
 /// `setting.json` `fallbackModel`: a single `provider/model-id` string or an
@@ -635,6 +648,14 @@ mod tests {
         assert!(s.sandbox.as_ref().unwrap().enabled);
         let back = serde_json::to_value(&s).unwrap();
         assert_eq!(back["sandbox"]["enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn status_line_parses_the_command() {
+        assert!(serde_json::from_str::<SettingsFile>("{}").unwrap().status_line.is_none());
+        let s: SettingsFile =
+            serde_json::from_str(r#"{"statusLine":{"command":["my-status","--short"]}}"#).unwrap();
+        assert_eq!(s.status_line.unwrap().command, vec!["my-status", "--short"]);
     }
 
     #[test]

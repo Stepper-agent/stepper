@@ -1608,3 +1608,36 @@ async fn memory_write_appends_to_project_memory_file() {
     // An empty note is rejected.
     assert!(reg.get("memory_write").unwrap().call(json!({"note": "  "}), &cx).await.is_err());
 }
+
+/// An approver whose `ask` returns a fixed option index, for the ask_user_question test.
+struct Picks(Option<usize>);
+#[async_trait]
+impl Approver for Picks {
+    async fn request(&self, _approval: Approval) -> Decision {
+        Decision::Deny
+    }
+    async fn ask(&self, _question: &str, _options: &[String]) -> Option<usize> {
+        self.0
+    }
+}
+
+#[tokio::test]
+async fn ask_user_question_returns_the_picked_option_or_no_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = ToolRegistry::builtins();
+    let args = json!({ "question": "Which?", "options": ["alpha", "beta"] });
+
+    // A pick comes back as the chosen option text.
+    let cx = cx_with(dir.path(), PermissionMode::AcceptEdits, Arc::new(Picks(Some(1))));
+    let out = reg.get("ask_user_question").unwrap().call(args.clone(), &cx).await.unwrap();
+    assert!(out.content_text().contains("beta"), "selected option returned: {:?}", out.content_text());
+
+    // No answer (default approver / dismissed) → a proceed-anyway message, not an error.
+    let cx = cx_with(dir.path(), PermissionMode::AcceptEdits, Arc::new(Picks(None)));
+    let out = reg.get("ask_user_question").unwrap().call(args.clone(), &cx).await.unwrap();
+    assert!(out.content_text().to_lowercase().contains("did not answer"));
+
+    // Fewer than 2 options is rejected.
+    let cx = cx_with(dir.path(), PermissionMode::AcceptEdits, Arc::new(Picks(Some(0))));
+    assert!(reg.get("ask_user_question").unwrap().call(json!({"question":"q","options":["only"]}), &cx).await.is_err());
+}

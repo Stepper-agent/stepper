@@ -48,6 +48,10 @@ pub struct TuiInit {
     /// Where to persist the prompt history (`~/.stepper/history/<project>.json`).
     /// `None` keeps history in memory only (no `$HOME`). Loaded by the event loop.
     pub history_path: Option<PathBuf>,
+    /// Custom status-line command (program + args) from `settings.statusLine`.
+    /// `None` = the built-in footer. The event loop runs it with a JSON context
+    /// on stdin and renders its first stdout line in place of the footer.
+    pub status_line_cmd: Option<Vec<String>>,
 }
 
 /// A slash command shown in the `/` palette: its name, a one-line description,

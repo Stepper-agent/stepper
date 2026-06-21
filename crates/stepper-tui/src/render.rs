@@ -11,7 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::state::{
     AgentPicker, ApiKeyOverlay, AppState, FilePicker, HistorySearch, ListPicker, Overlay,
-    ProcStatus, SettingsView, ShellView, ThemeState,
+    ProcStatus, QuestionView, SettingsView, ShellView, ThemeState,
 };
 use crate::theme::Theme;
 
@@ -77,6 +77,7 @@ fn ui(frame: &mut Frame, state: &AppState, theme: &Theme) {
             Overlay::Theme(ts) => render_theme(frame, rows[0], ts, theme),
             Overlay::Settings(v) => render_settings(frame, rows[0], v, theme),
             Overlay::HistorySearch(s) => render_history_search(frame, rows[0], state, s, theme),
+            Overlay::Question(q) => render_question(frame, rows[0], q, theme),
         }
     } else if state.palette_active() {
         render_palette(frame, rows[0], state, theme);
@@ -409,6 +410,42 @@ fn render_list_picker(frame: &mut Frame, area: Rect, picker: &ListPicker, theme:
             style,
         )));
     }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// `ask_user_question`: the question, then its numbered options with the
+/// highlighted one reversed. Number keys / ↑↓+Enter pick, Esc cancels.
+fn render_question(frame: &mut Frame, area: Rect, q: &QuestionView, theme: &Theme) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" question ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            truncate(&q.req.question, inner.width as usize),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+    ];
+    for (i, opt) in q.req.options.iter().enumerate() {
+        let style = if i == q.selected {
+            Style::default().fg(theme.accent).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {}. {}", i + 1, truncate(opt, inner.width.saturating_sub(5) as usize)),
+            style,
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "  1-9 / ↑↓+Enter to choose · Esc to skip",
+        Style::default().fg(theme.muted),
+    )));
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
@@ -926,6 +963,15 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
 }
 
 fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    // A custom `statusLine` command's output replaces the built-in footer.
+    if let Some(line) = &state.status_line {
+        let truncated = truncate(line, area.width as usize);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(truncated, Style::default().fg(theme.muted)))),
+            area,
+        );
+        return;
+    }
     // LEFT: active-layer badge + mode (§4.6.1).
     let mut left: Vec<Span> = Vec::new();
     match &state.active_layer {
@@ -1207,6 +1253,7 @@ mod tests {
             notify_on_approval: false,
             notify_on_error: false,
             history_path: None,
+            status_line_cmd: None,
         })
     }
 

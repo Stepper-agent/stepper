@@ -14,7 +14,7 @@ uuid = { workspace = true }
 # Prompt-history persistence (a JSON array of strings at ~/.stepper/history/…).
 # std + serde only — no http/upper-layer, so the isolation invariant holds.
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-std"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-std", "io-util", "process"] }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }
 smallvec = { workspace = true }

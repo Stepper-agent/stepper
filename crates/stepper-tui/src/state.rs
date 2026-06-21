@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use stepper_protocol::{
     Action, AppEvent, ApprovalRequest, CheckpointView, ContextBreakdownView, LayerStatus,
     LayerView, Mode, ModelChoiceView, ModelView, NoticeLevel, PermissionsSnapshotView,
-    ProviderChoiceView, RewindScope, SessionView, SettingsSnapshotView, TodoItemView, UsageView,
-    WorkerView,
+    ProviderChoiceView, QuestionRequest, RewindScope, SessionView, SettingsSnapshotView,
+    TodoItemView, UsageView, WorkerView,
 };
 
 use crate::{AgentInfo, CommandInfo, TuiInit};
@@ -107,6 +107,24 @@ pub enum Overlay {
     /// Esc cancels. Holds query + selection; the matched entries live in
     /// `AppState.history` (indexed by `matches`).
     HistorySearch(HistorySearch),
+    /// `ask_user_question` — a model-asked multiple-choice question. Number keys /
+    /// ↑↓+Enter pick an option (replying through the embedded oneshot); Esc cancels.
+    Question(QuestionView),
+}
+
+/// `ask_user_question` overlay state: the live request plus the highlighted option.
+pub struct QuestionView {
+    pub req: QuestionRequest,
+    pub selected: usize,
+}
+
+impl QuestionView {
+    fn move_sel(&mut self, delta: i32) {
+        let n = self.req.options.len() as i32;
+        if n > 0 {
+            self.selected = (((self.selected as i32 + delta) % n + n) % n) as usize;
+        }
+    }
 }
 
 /// Reverse-search overlay state (Ctrl+R). `matches` are indices into
@@ -552,6 +570,9 @@ pub struct AppState {
     /// one at a time (without this, a later request would clobber the prior one's
     /// overlay → its worker auto-denied).
     pub pending_approvals: VecDeque<ApprovalRequest>,
+    /// `ask_user_question` requests that arrived while another overlay was open;
+    /// surfaced one at a time after approvals (their oneshots are time-sensitive).
+    pub pending_questions: VecDeque<QuestionRequest>,
     /// API-key prompts (provider names) that arrived while another overlay was on
     /// screen — surfaced one at a time on `overlay_close`, after approvals, so a
     /// prompt racing an approval (e.g. the auto `/login` on launch) is never lost.
@@ -615,6 +636,11 @@ pub struct AppState {
     /// The in-progress input stashed when ↑ first enters history browsing, so ↓
     /// past the newest entry restores what the user was typing.
     history_draft: Option<String>,
+    /// Custom status-line command (`settings.statusLine`); `None` = built-in footer.
+    pub status_line_cmd: Option<Vec<String>>,
+    /// Latest stdout (first line) from the status-line command, rendered in place
+    /// of the built-in footer. `None` until the first run produces output.
+    pub status_line: Option<String>,
 }
 
 /// Cap on persisted prompt history (newest kept). Bounds the on-disk file and
@@ -649,6 +675,7 @@ impl AppState {
             todos: Vec::new(),
             overlay: None,
             pending_approvals: VecDeque::new(),
+            pending_questions: VecDeque::new(),
             pending_prompts: VecDeque::new(),
             picker: None,
             agents: init.agents,
@@ -673,6 +700,8 @@ impl AppState {
             history_path: init.history_path,
             history_nav: None,
             history_draft: None,
+            status_line_cmd: init.status_line_cmd,
+            status_line: None,
             commands: init.commands,
             palette_selected: 0,
             esc_armed: false,
@@ -746,6 +775,22 @@ impl AppState {
 
     pub fn input_text(&self) -> String {
         self.textarea.lines().join("\n")
+    }
+
+    /// The JSON context piped to the custom status-line command's stdin: the live
+    /// model, mode, cwd, token usage, and session cost (Claude-Code-style).
+    pub fn status_line_context(&self) -> serde_json::Value {
+        serde_json::json!({
+            "model": { "provider": self.model.provider, "model": self.model.model },
+            "mode": self.mode.label(),
+            "cwd": self.cwd.display().to_string(),
+            "tokens": {
+                "used": self.usage.context_used,
+                "limit": self.usage.context_limit,
+            },
+            "cost_usd": self.usage.cost_usd,
+            "turn_active": self.turn_active,
+        })
     }
 
     /// Take the pending `/editor`/Ctrl+E request (the seed text), if any. The
@@ -1139,6 +1184,7 @@ impl AppState {
                     | Overlay::Theme(_)
                     | Overlay::Settings(_)
                     | Overlay::HistorySearch(_)
+                    | Overlay::Question(_)
             )
         )
     }
@@ -1236,13 +1282,43 @@ impl AppState {
     /// Close the current non-approval overlay; a queued approval (one that
     /// arrived while it was open) surfaces immediately so it is never stranded.
     pub fn overlay_close(&mut self) {
+        // A queued approval wins (its oneshot is time-sensitive); then a queued
+        // question (also a live oneshot); then a queued api-key prompt — so none
+        // is ever stranded behind the overlay that just closed.
         self.overlay = self.pending_approvals.pop_front().map(Overlay::Approval);
-        // A queued approval wins (its oneshot is time-sensitive); otherwise
-        // surface a queued api-key prompt so it is never stranded.
+        if self.overlay.is_none()
+            && let Some(req) = self.pending_questions.pop_front()
+        {
+            self.overlay = Some(Overlay::Question(QuestionView { req, selected: 0 }));
+        }
         if self.overlay.is_none()
             && let Some(provider) = self.pending_prompts.pop_front()
         {
             self.overlay = Some(Overlay::ApiKey(ApiKeyOverlay { provider, input: String::new() }));
+        }
+    }
+
+    /// Reply to the open question with the chosen option index (or `None` on
+    /// cancel), then surface the next queued overlay.
+    pub fn answer_question(&mut self, choice: Option<usize>) {
+        if let Some(Overlay::Question(q)) = self.overlay.take() {
+            let _ = q.req.reply.send(choice);
+        }
+        self.overlay_close();
+    }
+
+    /// Move the highlighted option in the question overlay.
+    pub fn question_move(&mut self, delta: i32) {
+        if let Some(Overlay::Question(q)) = &mut self.overlay {
+            q.move_sel(delta);
+        }
+    }
+
+    /// The currently highlighted option index in the question overlay, if open.
+    pub fn question_selected(&self) -> Option<usize> {
+        match &self.overlay {
+            Some(Overlay::Question(q)) => Some(q.selected),
+            _ => None,
         }
     }
 
@@ -1293,7 +1369,9 @@ impl AppState {
     /// Open a builtin overlay unless an approval is on screen (its oneshot must
     /// not be clobbered — the breakdown/picker is droppable, the approval isn't).
     fn open_overlay(&mut self, overlay: Overlay) {
-        if matches!(self.overlay, Some(Overlay::Approval(_))) {
+        // Don't clobber a live oneshot overlay (approval / question) with a
+        // user-opened one — its awaiting tool would be stranded.
+        if matches!(self.overlay, Some(Overlay::Approval(_) | Overlay::Question(_))) {
             return;
         }
         self.overlay = Some(overlay);
@@ -1350,6 +1428,20 @@ impl AppState {
                     }
                 } else {
                     self.pending_approvals.push_back(req);
+                }
+            }
+            AppEvent::QuestionAsked(req) => {
+                if self.overlay.is_none() {
+                    // Same rationale as approvals: drop the transient @/# pickers so
+                    // the question is visible and answerable, not hidden behind them.
+                    self.picker = None;
+                    self.agent_picker = None;
+                    self.overlay = Some(Overlay::Question(QuestionView { req, selected: 0 }));
+                    if self.notify_on_approval {
+                        effects.push(Effect::Bell);
+                    }
+                } else {
+                    self.pending_questions.push_back(req);
                 }
             }
             AppEvent::TodoUpdated(items) => self.todos = items,
@@ -1774,6 +1866,7 @@ mod tests {
             notify_on_approval: false,
             notify_on_error: false,
             history_path: None,
+            status_line_cmd: None,
         })
     }
 
@@ -1889,6 +1982,54 @@ mod tests {
         s.history_search_accept();
         assert_eq!(s.input_text(), "test all");
         assert!(s.overlay.is_none(), "accepting closes the overlay");
+    }
+
+    #[test]
+    fn question_overlay_opens_navigates_and_replies_with_the_choice() {
+        let mut s = test_state();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<usize>>();
+        s.apply_event(AppEvent::QuestionAsked(stepper_protocol::QuestionRequest {
+            id: uuid::Uuid::new_v4(),
+            question: "Which?".into(),
+            options: vec!["a".into(), "b".into(), "c".into()],
+            reply: tx,
+        }));
+        assert!(matches!(s.overlay, Some(Overlay::Question(_))), "question overlay opened");
+        s.question_move(1); // highlight option 2 (index 1)
+        assert_eq!(s.question_selected(), Some(1));
+        s.answer_question(s.question_selected());
+        assert!(s.overlay.is_none(), "answering closes the overlay");
+        assert_eq!(rx.blocking_recv().unwrap(), Some(1), "the chosen index is sent back");
+    }
+
+    #[test]
+    fn question_esc_replies_none_without_a_choice() {
+        let mut s = test_state();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<usize>>();
+        s.apply_event(AppEvent::QuestionAsked(stepper_protocol::QuestionRequest {
+            id: uuid::Uuid::new_v4(),
+            question: "Which?".into(),
+            options: vec!["a".into(), "b".into()],
+            reply: tx,
+        }));
+        s.answer_question(None);
+        assert_eq!(rx.blocking_recv().unwrap(), None, "cancel sends None");
+    }
+
+    #[test]
+    fn status_line_context_carries_model_mode_cwd_and_usage() {
+        let mut s = test_state();
+        s.usage.context_used = 1234;
+        s.usage.context_limit = 200_000;
+        s.usage.cost_usd = 0.5;
+        let ctx = s.status_line_context();
+        assert_eq!(ctx["model"]["provider"], "p");
+        assert_eq!(ctx["model"]["model"], "m");
+        assert_eq!(ctx["mode"], "auto");
+        assert_eq!(ctx["cwd"], "/tmp");
+        assert_eq!(ctx["tokens"]["used"], 1234);
+        assert_eq!(ctx["tokens"]["limit"], 200_000);
+        assert_eq!(ctx["cost_usd"], 0.5);
     }
 
     #[test]

@@ -43,6 +43,11 @@ pub async fn run(
     let (input_tx, mut input_rx) = mpsc::channel::<Event>(256);
     let mut reader = spawn_reader(running.clone(), input_tx);
 
+    // Custom status-line command output arrives here from a throttled background
+    // run (so a slow/hung script never blocks the UI loop).
+    let (status_tx, mut status_rx) = mpsc::channel::<String>(4);
+    let mut status_tick: u32 = 0;
+
     let mut tick = tokio::time::interval(Duration::from_millis(33));
     let mut dirty = true;
     // Force a full repaint on the next draw. Needed because overwriting a wide
@@ -83,6 +88,15 @@ pub async fn run(
                     state.spinner = state.spinner.wrapping_add(1);
                     dirty = true;
                 }
+                // Refresh the custom status line ~every 2s (and immediately on the
+                // first tick), running the command off the loop with the live JSON
+                // context so its output lands via `status_rx`.
+                if let Some(cmd) = state.status_line_cmd.clone() {
+                    if status_tick.is_multiple_of(60) {
+                        tokio::spawn(run_status_line(cmd, state.status_line_context(), status_tx.clone()));
+                    }
+                    status_tick = status_tick.wrapping_add(1);
+                }
                 if dirty {
                     if force_clear {
                         let _ = guard.terminal.clear();
@@ -100,6 +114,10 @@ pub async fn run(
                     }
                     dirty = true;
                 }
+            }
+            Some(line) = status_rx.recv() => {
+                state.status_line = Some(line);
+                dirty = true;
             }
             _ = cancel.cancelled() => break,
         }
@@ -124,6 +142,44 @@ pub async fn run(
     drop(input_rx);
     let _ = reader.join();
     Ok(())
+}
+
+/// Run the custom status-line command off the UI loop: pipe the JSON `ctx` to its
+/// stdin, capture the first line of stdout, and send it back. Bounded at 5s and
+/// killed on drop, so a slow or hung script can never wedge the UI or leak.
+async fn run_status_line(cmd: Vec<String>, ctx: serde_json::Value, tx: mpsc::Sender<String>) {
+    let Some((prog, args)) = cmd.split_first() else {
+        return;
+    };
+    let child = tokio::process::Command::new(prog)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdin.write_all(ctx.to_string().as_bytes()).await;
+        // Drop closes stdin so the command sees EOF and can finish.
+    }
+    let output = match tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await {
+        Ok(Ok(o)) => o,
+        _ => return, // timeout (child killed on drop) or spawn/io error
+    };
+    let line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !line.is_empty() {
+        let _ = tx.send(line).await;
+    }
 }
 
 /// Load the persisted prompt history (a JSON array of strings). A missing or
@@ -546,6 +602,25 @@ fn handle_overlay_key(state: &mut AppState, action_tx: &ActionTx, ev: &Event) {
         }
         return;
     }
+    // `ask_user_question`: number keys pick an option directly, ↑/↓ + Enter pick
+    // the highlighted one, Esc cancels. The chosen index replies through the
+    // request's oneshot (handled in `answer_question`).
+    if matches!(state.overlay, Some(Overlay::Question(_))) {
+        if let Event::Key(k) = ev {
+            match k.code {
+                KeyCode::Up => state.question_move(-1),
+                KeyCode::Down => state.question_move(1),
+                KeyCode::Enter => state.answer_question(state.question_selected()),
+                KeyCode::Esc => state.answer_question(None),
+                KeyCode::Char(c @ '1'..='9') => {
+                    let idx = c as usize - '1' as usize;
+                    state.answer_question(Some(idx));
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
     if let Event::Key(k) = ev
         && matches!(
             k.code,
@@ -789,6 +864,7 @@ mod tests {
             notify_on_approval: false,
             notify_on_error: false,
             history_path: None,
+            status_line_cmd: None,
         });
         s.overlay = Some(Overlay::ApiKey(ApiKeyOverlay {
             provider: "anthropic".into(),

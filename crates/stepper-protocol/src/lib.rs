@@ -10,11 +10,13 @@ pub mod action;
 pub mod approval;
 pub mod event;
 pub mod mode;
+pub mod question;
 pub mod view;
 
 pub use action::{Action, RewindScope};
 pub use approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
 pub use event::AppEvent;
+pub use question::QuestionRequest;
 pub use mode::Mode;
 pub use view::{
     ApprovalRuleView, CheckpointView, ContextBreakdownView, DiffView, LayerStatus, LayerView,

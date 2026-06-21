@@ -20,6 +20,13 @@ pub enum Approval {
 #[async_trait]
 pub trait Approver: Send + Sync {
     async fn request(&self, approval: Approval) -> Decision;
+
+    /// Ask the user a multiple-choice question (the `ask_user_question` tool),
+    /// returning the chosen option index. The default is "unavailable" (`None`) —
+    /// headless runs, tests, and sub-agents without a UI fall through to it.
+    async fn ask(&self, _question: &str, _options: &[String]) -> Option<usize> {
+        None
+    }
 }
 
 /// Everything a tool needs to run: where it runs, the permission policy, the
