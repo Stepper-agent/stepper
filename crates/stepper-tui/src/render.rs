@@ -10,8 +10,8 @@ use stepper_protocol::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::state::{
-    AgentPicker, ApiKeyOverlay, AppState, FilePicker, ListPicker, Overlay, ProcStatus, ShellView,
-    ThemeState,
+    AgentPicker, ApiKeyOverlay, AppState, FilePicker, ListPicker, Overlay, ProcStatus, SettingsView,
+    ShellView, ThemeState,
 };
 use crate::theme::Theme;
 
@@ -38,6 +38,12 @@ fn ui(frame: &mut Frame, state: &AppState, theme: &Theme) {
     // footer so an error is visible regardless of turn/tool/assistant state.
     let notice_h = if state.notice.is_some() { 1 } else { 0 };
     let total = frame.area();
+    // Paint the inline viewport as a coloured surface panel (the live app region),
+    // so the active turn reads as a card. Committed turns keep the terminal's own
+    // background (they live in native scrollback). `None` leaves the terminal bg.
+    if let Some(bg) = Theme::preset_bg(&state.theme_preset) {
+        frame.render_widget(Block::default().style(Style::default().bg(bg)), total);
+    }
     let content_rows = input_display_rows(&state.input_text(), total.width.saturating_sub(2));
     let max_input_h = total
         .height
@@ -69,6 +75,7 @@ fn ui(frame: &mut Frame, state: &AppState, theme: &Theme) {
             Overlay::ApiKey(o) => render_api_key(frame, rows[0], o, theme),
             Overlay::Shell(s) => render_shell(frame, rows[0], state, s, theme),
             Overlay::Theme(ts) => render_theme(frame, rows[0], ts, theme),
+            Overlay::Settings(v) => render_settings(frame, rows[0], v, theme),
         }
     } else if state.palette_active() {
         render_palette(frame, rows[0], state, theme);
@@ -381,6 +388,9 @@ fn render_list_picker(frame: &mut Frame, area: Rect, picker: &ListPicker, theme:
         "   ↑↓ select · Enter choose · Esc cancel".to_string()
     };
     let mut lines = vec![Line::from(Span::styled(hint, Style::default().fg(theme.muted)))];
+    if picker.matches.is_empty() {
+        lines.push(Line::from(Span::styled("  (no matches)", Style::default().fg(theme.muted))));
+    }
     let rows = (inner.height as usize).saturating_sub(1);
     let offset = scroll_offset(picker.selected, picker.matches.len(), rows);
     for (row, &idx) in picker.matches.iter().enumerate().skip(offset).take(rows) {
@@ -600,6 +610,63 @@ fn render_permissions(
     );
 }
 
+fn render_settings(frame: &mut Frame, area: Rect, view: &SettingsView, theme: &Theme) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" settings ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Pinned tab bar (top) + scrollable focused-tab body + fixed footer hint.
+    let split = Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let (tabs_area, body_area, foot_area) = (split[0], split[1], split[2]);
+
+    let mut tab_spans = Vec::new();
+    for (i, tab) in view.snapshot.tabs.iter().enumerate() {
+        if i > 0 {
+            tab_spans.push(Span::raw("  "));
+        }
+        let style = if i == view.tab {
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        tab_spans.push(Span::styled(tab.title.clone(), style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(tab_spans)), tabs_area);
+
+    let mut lines = Vec::new();
+    if let Some(tab) = view.snapshot.tabs.get(view.tab) {
+        if tab.rows.is_empty() {
+            lines.push(Line::from(Span::styled("  (nothing to show)", Style::default().fg(theme.muted))));
+        }
+        for r in &tab.rows {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<18}", r.label), Style::default().fg(theme.muted)),
+                Span::styled(r.value.clone(), Style::default().fg(theme.accent)),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), body_area);
+
+    let jump_hint = view
+        .snapshot
+        .tabs
+        .get(view.tab)
+        .and_then(|t| t.jump.as_ref())
+        .map(|j| format!("Enter open /{j}  ·  "))
+        .unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("{jump_hint}←/→ tabs  ·  Esc close"),
+            Style::default().fg(theme.muted),
+        ))),
+        foot_area,
+    );
+}
+
 fn truncate(s: &str, max: usize) -> String {
     let first = s.lines().next().unwrap_or("");
     if first.width() <= max {
@@ -681,7 +748,7 @@ fn render_live(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // back to borderless there.
     if area.height >= 3 {
         let title = if state.turn_active {
-            format!(" {} working… ", spinner_frame(state.spinner))
+            format!(" {} working… · esc to interrupt ", spinner_frame(state.spinner))
         } else {
             " result ".to_string()
         };
@@ -836,10 +903,14 @@ fn render_status(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         None => left.push(Span::styled("idle", Style::default().fg(theme.muted))),
     }
     left.push(Span::raw("  "));
-    left.push(Span::styled(
-        format!("[{}]", state.mode.label()),
-        Style::default().fg(theme.accent),
-    ));
+    // Colour the mode badge by how much it relaxes the guardrails: bypass/dont-ask
+    // run without any prompt (error red), accept-edits auto-applies edits (warning).
+    let mode_color = match state.mode.label() {
+        "bypass" | "dont-ask" => theme.error,
+        "accept-edits" => theme.warning,
+        _ => theme.accent,
+    };
+    left.push(Span::styled(format!("[{}]", state.mode.label()), Style::default().fg(mode_color)));
     left.push(sep(theme));
     let cwd_name = state.cwd.file_name().and_then(|s| s.to_str()).unwrap_or(".");
     left.push(Span::styled(cwd_name.to_string(), Style::default().fg(theme.muted)));

@@ -19,7 +19,8 @@ pub use mode::Mode;
 pub use view::{
     ApprovalRuleView, CheckpointView, ContextBreakdownView, DiffView, LayerStatus, LayerView,
     ModelChoiceView, ModelView, NoticeLevel, PermissionRuleView, PermissionsSnapshotView,
-    ProviderChoiceView, SessionView, TodoItemView, TodoStatus, ToolCallView, UsageView, WorkerView,
+    ProviderChoiceView, SessionView, SettingsRowView, SettingsSnapshotView, SettingsTabView,
+    TodoItemView, TodoStatus, ToolCallView, UsageView, WorkerView,
 };
 
 /// Channel aliases wired by the CLI between the TUI and core.

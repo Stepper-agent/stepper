@@ -23,11 +23,27 @@ pub struct GlobalArgs {
     /// Start in this mode (auto | plan | accept-edits | default | dont-ask).
     #[arg(long, value_enum, global = true)]
     pub mode: Option<ModeArg>,
-    /// Reasoning effort applied to every layer (off | low | medium | high).
-    /// Maps to OpenAI `reasoning_effort` + Anthropic extended-thinking budget;
-    /// a layer's own `reasoning-effort` frontmatter overrides it.
+    /// Reasoning effort applied to every layer (off | low | medium | high | xhigh
+    /// | max). Modern Claude maps it to adaptive thinking + `output_config.effort`;
+    /// OpenAI to `reasoning_effort` (xhigh/max clamp to high); a layer's own
+    /// `reasoning-effort` frontmatter overrides it.
     #[arg(long, global = true)]
     pub effort: Option<String>,
+    /// Replace the project base context (the `CLAUDE.md`/`stepper.md` slot) with
+    /// this text for the run. The universal agent directives and each layer's role
+    /// are kept. Useful for headless wrappers that inject their own context.
+    #[arg(long, global = true, conflicts_with = "system_prompt_file")]
+    pub system_prompt: Option<String>,
+    /// Like `--system-prompt`, but read the replacement text from a file.
+    #[arg(long, global = true)]
+    pub system_prompt_file: Option<PathBuf>,
+    /// Append this text to every layer's system message (after its role). Useful
+    /// for wrapping stepper as a headless linter/reviewer with extra instructions.
+    #[arg(long, global = true, conflicts_with = "append_system_prompt_file")]
+    pub append_system_prompt: Option<String>,
+    /// Like `--append-system-prompt`, but read the appended text from a file.
+    #[arg(long, global = true)]
+    pub append_system_prompt_file: Option<PathBuf>,
     /// One-shot non-interactive prompt (no inline viewport).
     #[arg(short = 'p', long, global = true)]
     pub print: Option<String>,
@@ -204,6 +220,32 @@ pub struct McpArgs {
 
 #[derive(Subcommand)]
 pub enum McpCmd {
+    /// List the MCP servers configured in `setting.json`.
+    List,
+    /// Show one server's config and connect to list its tools/resources/prompts.
+    Get {
+        /// The server name.
+        name: String,
+    },
+    /// Add an MCP server to `setting.json` (stdio via `--command`, http via `--url`).
+    Add {
+        /// The server name (the `mcpServers` key).
+        name: String,
+        /// stdio command to launch (the program; pass arguments with `--arg`).
+        #[arg(long, conflicts_with = "url")]
+        command: Option<String>,
+        /// An argument for the stdio `--command` (repeatable).
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        /// http(s) URL of a remote server (sets `"type": "http"`).
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Remove an MCP server from `setting.json`.
+    Remove {
+        /// The server name.
+        name: String,
+    },
     /// Authorize an OAuth MCP server in the browser and store its tokens.
     Auth {
         /// The server name from `mcpServers` in `.stepper/setting.json`.

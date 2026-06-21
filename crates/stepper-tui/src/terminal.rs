@@ -23,7 +23,10 @@ fn pop_keyboard_enhancement() {
 
 /// RAII wrapper around the inline-viewport terminal. `init_with_options` with a
 /// `Viewport::Inline(N)` keeps the native terminal scrollback (no alternate
-/// screen); finalized turns are pushed there via `Terminal::insert_before`.
+/// screen); finalized turns are pushed there via `Terminal::insert_before`. The
+/// live viewport is painted with a per-theme surface background (see
+/// `theme::Theme::preset_bg`) so the active region reads as a panel, while the
+/// committed scrollback above it keeps the terminal's own background.
 ///
 /// On init we opt into the Kitty keyboard protocol's `DISAMBIGUATE_ESCAPE_CODES`
 /// (when the terminal supports it) so modified keys like **Shift+Enter** arrive

@@ -1,8 +1,8 @@
 use crate::approval::ApprovalRequest;
 use crate::view::{
     CheckpointView, ContextBreakdownView, DiffView, LayerStatus, ModelChoiceView, ModelView,
-    NoticeLevel, PermissionsSnapshotView, ProviderChoiceView, SessionView, TodoItemView,
-    ToolCallView, UsageView,
+    NoticeLevel, PermissionsSnapshotView, ProviderChoiceView, SessionView, SettingsSnapshotView,
+    TodoItemView, ToolCallView, UsageView,
 };
 
 /// Everything core tells the TUI. The single item type of the core->TUI mpsc
@@ -79,6 +79,9 @@ pub enum AppEvent {
     ContextBreakdown(ContextBreakdownView),
     /// `/permissions` — the read-only rules/approvals snapshot overlay.
     PermissionsSnapshot(PermissionsSnapshotView),
+    /// `/settings` — the consolidated tabbed settings overview. Enter on a tab
+    /// with a jump opens that setting's editor (e.g. `/permissions`, `/theme`).
+    SettingsSnapshot(SettingsSnapshotView),
     /// `/rewind` (or Esc-Esc) — available checkpoints, newest first; the TUI
     /// opens a picker whose selection comes back as `Action::Rewind`.
     CheckpointList(Vec<CheckpointView>),
@@ -97,6 +100,12 @@ pub enum AppEvent {
     /// TUI fills the editor from its own current theme (colors live TUI-side); a
     /// save comes back as `Action::SetTheme`.
     OpenThemeEditor,
+    /// `/effort` (no arg) — ask the TUI to open its reasoning-effort picker.
+    /// `current` is the active level (`off|low|medium|high|xhigh|max`) so the TUI
+    /// highlights it; the choice comes back as `Action::SlashCommand { effort }`.
+    OpenEffortPicker {
+        current: String,
+    },
     /// `/editor [text]` — ask the TUI to compose the next prompt in `$VISUAL`/
     /// `$EDITOR`. `seed` is the text after `/editor` (empty for a bare `/editor`),
     /// written to the temp file as the starting buffer. The edited result replaces

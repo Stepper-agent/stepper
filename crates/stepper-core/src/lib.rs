@@ -37,6 +37,7 @@ pub use dispatch::{
 pub use error::CoreError;
 pub use fanout::{run_parallel, FanoutTask};
 pub use hooks::{HookDecision, HookHost};
+pub use stepper_tools::tools::memory::MEMORY_REL_PATH;
 pub use layer::{AgentDef, FailurePolicy, Handoff, StepDef, SubTask};
 pub use model::{ModelInfo, ModelRegistry};
 pub use orchestrator::{Orchestrator, SessionLimits, TurnOutput};
@@ -602,6 +603,12 @@ pub fn spawn_core(
                 _ => {}
             }
         }
+        // The action loop ended (Quit or the action channel closed) — fire
+        // SessionEnd once, distinct from the per-turn Stop, with a fresh token.
+        let _ = orchestrator
+            .hooks
+            .run("SessionEnd", None, &serde_json::json!({}), &CancellationToken::new())
+            .await;
     });
     rx
 }

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use stepper_protocol::{
     Action, AppEvent, ApprovalRequest, CheckpointView, ContextBreakdownView, LayerStatus,
     LayerView, Mode, ModelChoiceView, ModelView, NoticeLevel, PermissionsSnapshotView,
-    ProviderChoiceView, SessionView, TodoItemView, UsageView, WorkerView,
+    ProviderChoiceView, SessionView, SettingsSnapshotView, TodoItemView, UsageView, WorkerView,
 };
 
 use crate::{AgentInfo, CommandInfo, TuiInit};
@@ -95,6 +95,32 @@ pub enum Overlay {
     /// `/theme` — the color-theme editor: row 0 cycles the preset (←/→), the
     /// rest edit each color role's hex/name inline. Enter saves, Esc cancels.
     Theme(ThemeState),
+    /// `/settings` — the tabbed read-only settings overview. ←/→ switch tabs,
+    /// Enter opens the focused tab's editor (jump), Esc closes.
+    Settings(SettingsView),
+}
+
+/// `/settings` overlay state: the snapshot plus the focused tab index.
+pub struct SettingsView {
+    pub snapshot: SettingsSnapshotView,
+    pub tab: usize,
+}
+
+impl SettingsView {
+    fn move_tab(&mut self, delta: i32) {
+        let n = self.snapshot.tabs.len() as i32;
+        if n > 0 {
+            self.tab = (((self.tab as i32 + delta) % n + n) % n) as usize;
+        }
+    }
+
+    /// The slash command to open the focused tab's dedicated editor, if any.
+    fn jump(&self) -> Option<Action> {
+        self.snapshot.tabs.get(self.tab)?.jump.as_ref().map(|name| Action::SlashCommand {
+            name: name.clone(),
+            args: String::new(),
+        })
+    }
 }
 
 /// Color-theme editor state. Row 0 is the preset selector; rows `1..=colors.len`
@@ -246,6 +272,7 @@ pub enum PickerKind {
     Resume,
     Model,
     Connect,
+    Effort,
 }
 
 /// The generic list-picker overlay shared by `/rewind` (checkpoints) and
@@ -289,6 +316,7 @@ impl ListPicker {
             PickerKind::Resume => " resume ",
             PickerKind::Model => " models ",
             PickerKind::Connect => " connect ",
+            PickerKind::Effort => " effort ",
         }
     }
 
@@ -372,6 +400,11 @@ impl ListPicker {
             // the item id is the catalog provider id.
             PickerKind::Connect => Action::SlashCommand {
                 name: "connect".into(),
+                args: item.id.clone(),
+            },
+            // Reuse `/effort <level>`; the item id is the effort level string.
+            PickerKind::Effort => Action::SlashCommand {
+                name: "effort".into(),
                 args: item.id.clone(),
             },
         })
@@ -470,6 +503,10 @@ impl AgentPicker {
 pub struct AppState {
     pub live: StreamBuf,
     pub tool_lines: Vec<String>,
+    /// Maps a tool-call id to the index of its `▸ …` line in `tool_lines`, so a
+    /// `ToolCallFinished` flips that line's glyph (▸→✓/✗) in place instead of
+    /// appending a separate `✓ tool <uuid> finished` row.
+    tool_index: std::collections::HashMap<String, usize>,
     pub textarea: TextArea<'static>,
     pub mode: Mode,
     pub model: ModelView,
@@ -546,6 +583,7 @@ pub struct AppState {
 pub(crate) fn fresh_textarea() -> TextArea<'static> {
     let mut textarea = TextArea::default();
     textarea.set_cursor_style(Style::default());
+    textarea.set_cursor_line_style(Style::default());
     textarea.set_wrap_mode(WrapMode::WordOrGlyph);
     textarea
 }
@@ -555,6 +593,7 @@ impl AppState {
         Self {
             live: StreamBuf::default(),
             tool_lines: Vec::new(),
+            tool_index: std::collections::HashMap::new(),
             textarea: fresh_textarea(),
             mode: init.mode,
             model: init.model,
@@ -898,8 +937,31 @@ impl AppState {
                     | Overlay::ApiKey(_)
                     | Overlay::Shell(_)
                     | Overlay::Theme(_)
+                    | Overlay::Settings(_)
             )
         )
+    }
+
+    /// `/settings` overlay: move the focused tab by `delta` (wrapping).
+    pub fn settings_tab_move(&mut self, delta: i32) {
+        if let Some(Overlay::Settings(v)) = &mut self.overlay {
+            v.move_tab(delta);
+        }
+    }
+
+    /// `/settings` overlay: the slash command for the focused tab's editor, if any.
+    pub fn settings_jump(&self) -> Option<Action> {
+        match &self.overlay {
+            Some(Overlay::Settings(v)) => v.jump(),
+            _ => None,
+        }
+    }
+
+    /// Clear the live tool-call lines and the id→line index together (they must
+    /// always reset in lockstep, or a stale index would point past the cleared vec).
+    fn clear_tool_lines(&mut self) {
+        self.tool_lines.clear();
+        self.tool_index.clear();
     }
 
     // ── background-process shell view (Down key) ──
@@ -1045,7 +1107,7 @@ impl AppState {
                 self.errored_this_turn = false;
                 self.notice = None;
                 self.live.clear();
-                self.tool_lines.clear();
+                self.clear_tool_lines();
                 self.workers.clear();
                 // Snap back to live output for the new turn (but not on every
                 // token delta — that would fight a user scrolled up to read).
@@ -1054,12 +1116,22 @@ impl AppState {
             AppEvent::AssistantTokenDelta(s) => self.live.assistant.push_str(&s),
             AppEvent::ReasoningTokenDelta(s) => self.live.reasoning.push_str(&s),
             AppEvent::ToolCallStarted(v) => {
+                self.tool_index.insert(v.id, self.tool_lines.len());
                 self.tool_lines.push(format!("▸ {}: {}", v.name, v.summary));
             }
             AppEvent::ToolCallOutputDelta { .. } => {}
             AppEvent::ToolCallFinished { id, ok } => {
-                let mark = if ok { "✓" } else { "✗" };
-                self.tool_lines.push(format!("{mark} tool {id} finished"));
+                let mark = if ok { '✓' } else { '✗' };
+                // Flip the started line's leading glyph in place (no UUID row).
+                match self.tool_index.get(&id).and_then(|&i| self.tool_lines.get_mut(i)) {
+                    Some(line) => {
+                        if let Some(rest) = line.strip_prefix('▸') {
+                            *line = format!("{mark}{rest}");
+                        }
+                    }
+                    // No matching start (shouldn't happen) — a standalone fallback.
+                    None => self.tool_lines.push(format!("{mark} tool finished")),
+                }
             }
             AppEvent::DiffProposed { .. } => {}
             AppEvent::ApprovalRequested(req) => {
@@ -1149,6 +1221,9 @@ impl AppState {
             AppEvent::PermissionsSnapshot(snapshot) => {
                 self.open_overlay(Overlay::Permissions(snapshot));
             }
+            AppEvent::SettingsSnapshot(snapshot) => {
+                self.open_overlay(Overlay::Settings(SettingsView { snapshot, tab: 0 }));
+            }
             AppEvent::CheckpointList(checkpoints) => {
                 let items = checkpoints
                     .into_iter()
@@ -1200,6 +1275,20 @@ impl AppState {
                 self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Connect, items)));
             }
             AppEvent::OpenThemeEditor => self.open_theme_editor(),
+            AppEvent::OpenEffortPicker { current } => {
+                const LEVELS: [&str; 6] = ["off", "low", "medium", "high", "xhigh", "max"];
+                let items = LEVELS
+                    .iter()
+                    .map(|&lvl| ListPickerItem {
+                        label: lvl.to_string(),
+                        id: lvl.to_string(),
+                        connectable: true,
+                    })
+                    .collect();
+                let mut picker = ListPicker::new(PickerKind::Effort, items);
+                picker.selected = LEVELS.iter().position(|&l| l == current).unwrap_or(0);
+                self.open_overlay(Overlay::Picker(picker));
+            }
             // `/editor [text]` — the event loop opens $EDITOR (it owns the
             // terminal); the slash argument is the seed.
             AppEvent::OpenEditor { seed } => self.editor_request = Some(seed),
@@ -1221,7 +1310,7 @@ impl AppState {
             }
             AppEvent::SessionResumed { id, name, turns } => {
                 self.live.clear();
-                self.tool_lines.clear();
+                self.clear_tool_lines();
                 self.todos.clear();
                 self.workers.clear();
                 self.usage = UsageView::default();
@@ -1246,7 +1335,7 @@ impl AppState {
                 // Fresh session: drop all live + queued state and purge the
                 // terminal scrollback so the previous conversation is gone.
                 self.live.clear();
-                self.tool_lines.clear();
+                self.clear_tool_lines();
                 self.todos.clear();
                 self.workers.clear();
                 self.queue.clear();
@@ -1316,14 +1405,17 @@ impl AppState {
             // Esc: interrupt, and on EMPTY input a second consecutive Esc opens
             // the rewind picker instead (Esc-Esc) — data flows core-ward as the
             // /rewind built-in so the checkpoint list arrives as an AppEvent.
+            // While a turn is active, Esc-Esc must stay an interrupt: arming is
+            // gated on `!turn_active` so a user mashing Esc to stop the agent
+            // never trips rewind mid-turn.
             Action::Interrupt => {
-                if self.input_text().is_empty() && was_armed {
+                if self.input_text().is_empty() && was_armed && !self.turn_active {
                     effects.push(Effect::Send(Action::SlashCommand {
                         name: "rewind".into(),
                         args: String::new(),
                     }));
                 } else {
-                    self.esc_armed = self.input_text().is_empty();
+                    self.esc_armed = self.input_text().is_empty() && !self.turn_active;
                     effects.push(Effect::Send(Action::Interrupt));
                 }
             }
@@ -1422,7 +1514,7 @@ impl AppState {
         md.push_str(&self.live.assistant);
         effects.push(Effect::CommitToScrollback(md));
         self.live.clear();
-        self.tool_lines.clear();
+        self.clear_tool_lines();
     }
 }
 
@@ -1823,6 +1915,35 @@ mod tests {
     }
 
     #[test]
+    fn fresh_input_has_no_cursor_line_underline() {
+        // ratatui-textarea 0.9.1 defaults the cursor line to UNDERLINED, which
+        // drew a line under the whole prompt row. fresh_textarea must clear it.
+        assert_eq!(fresh_textarea().cursor_line_style(), Style::default());
+    }
+
+    #[test]
+    fn esc_esc_on_idle_opens_rewind() {
+        let mut s = test_state();
+        s.esc_armed = true; // a prior Esc armed it; input is empty; no turn running
+        let effects = s.apply_action(Action::Interrupt);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Send(Action::SlashCommand { name, .. })] if name == "rewind"
+        ));
+    }
+
+    #[test]
+    fn esc_esc_during_active_turn_interrupts_not_rewind() {
+        let mut s = test_state();
+        s.turn_active = true;
+        s.esc_armed = true; // even if armed, an in-flight turn must interrupt
+        let effects = s.apply_action(Action::Interrupt);
+        assert!(matches!(effects.as_slice(), [Effect::Send(Action::Interrupt)]));
+        // and it must not re-arm mid-turn, so a third Esc also interrupts.
+        assert!(!s.esc_armed);
+    }
+
+    #[test]
     fn slash_command_is_forwarded_unchanged() {
         let mut s = test_state();
         let effects = s.apply_action(Action::SlashCommand { name: "model".into(), args: "x".into() });
@@ -2103,12 +2224,26 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_finished_marks_success_and_failure() {
+    fn tool_call_finished_flips_glyph_in_place_without_a_uuid_line() {
         let mut s = test_state();
+        let started = |id: &str, name: &str| {
+            AppEvent::ToolCallStarted(stepper_protocol::ToolCallView {
+                id: id.into(),
+                name: name.into(),
+                summary: "x".into(),
+            })
+        };
+        s.apply_event(started("1", "read_file"));
+        s.apply_event(started("2", "bash"));
         s.apply_event(AppEvent::ToolCallFinished { id: "1".into(), ok: true });
         s.apply_event(AppEvent::ToolCallFinished { id: "2".into(), ok: false });
-        assert!(s.tool_lines[0].starts_with('✓'));
-        assert!(s.tool_lines[1].starts_with('✗'));
+        // Two lines only — the finish flips each started line's glyph in place,
+        // it does not append a separate `✓ tool <uuid> finished` row.
+        assert_eq!(s.tool_lines.len(), 2, "no extra UUID lines: {:?}", s.tool_lines);
+        assert!(s.tool_lines[0].starts_with('✓') && s.tool_lines[0].contains("read_file"));
+        assert!(s.tool_lines[1].starts_with('✗') && s.tool_lines[1].contains("bash"));
+        // No UUID leaked into the rendered lines.
+        assert!(!s.tool_lines.iter().any(|l| l.contains("finished")), "no UUID/finished text");
     }
 
     #[test]
@@ -2392,6 +2527,63 @@ mod tests {
             _ => panic!("expected a /model SlashCommand send"),
         }
         assert!(s.overlay.is_none(), "selection closes the picker");
+    }
+
+    #[test]
+    fn effort_picker_opens_with_current_and_selects_level() {
+        let mut s = test_state();
+        s.apply_event(AppEvent::OpenEffortPicker { current: "high".into() });
+        match &s.overlay {
+            Some(Overlay::Picker(p)) => {
+                assert_eq!(p.kind, PickerKind::Effort);
+                assert_eq!(p.items.len(), 6);
+                // [off, low, medium, high, xhigh, max] → "high" is index 3.
+                assert_eq!(p.selected, 3, "the current level starts highlighted");
+            }
+            _ => panic!("expected the effort picker overlay"),
+        }
+        // Move to "xhigh" (index 4) and select → routes back through /effort.
+        s.overlay_picker_move(1);
+        let effects = s.overlay_picker_select();
+        match effects.as_slice() {
+            [Effect::Send(Action::SlashCommand { name, args })] => {
+                assert_eq!(name, "effort");
+                assert_eq!(args, "xhigh");
+            }
+            _ => panic!("expected an /effort SlashCommand send"),
+        }
+        assert!(s.overlay.is_none(), "selection closes the picker");
+    }
+
+    #[test]
+    fn settings_snapshot_opens_tabbed_overlay_and_jumps() {
+        use stepper_protocol::{SettingsRowView, SettingsTabView};
+        let mut s = test_state();
+        s.apply_event(AppEvent::SettingsSnapshot(SettingsSnapshotView {
+            tabs: vec![
+                SettingsTabView {
+                    title: "General".into(),
+                    rows: vec![SettingsRowView { label: "mode".into(), value: "auto".into() }],
+                    jump: None,
+                },
+                SettingsTabView { title: "Permissions".into(), rows: vec![], jump: Some("permissions".into()) },
+            ],
+        }));
+        match &s.overlay {
+            Some(Overlay::Settings(v)) => {
+                assert_eq!(v.tab, 0, "starts on the first tab");
+                assert_eq!(v.snapshot.tabs.len(), 2);
+            }
+            _ => panic!("expected the settings overlay"),
+        }
+        // The General tab has no editor, so Enter would just close (no jump).
+        assert!(s.settings_jump().is_none());
+        // Switch to Permissions → Enter routes through /permissions.
+        s.settings_tab_move(1);
+        match s.settings_jump() {
+            Some(Action::SlashCommand { name, .. }) => assert_eq!(name, "permissions"),
+            other => panic!("expected a /permissions jump, got {other:?}"),
+        }
     }
 
     #[test]

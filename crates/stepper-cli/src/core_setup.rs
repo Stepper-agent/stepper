@@ -128,7 +128,9 @@ pub async fn build_orchestrator_with_fallback(
     let limits = merge_limits(limits, config.settings.limits.as_ref());
     let default_model = model.unwrap_or(DEFAULT_MODEL).to_string();
     // Precedence: `--mode` flag > `setting.json` `mode` >
-    // `permissions.defaultMode` > AcceptEdits.
+    // `permissions.defaultMode` > Auto. Auto is the autonomous default: it runs
+    // read-only tools and in-project edits without prompting and only asks before
+    // out-of-project writes (see stepper-permission `mode_default_path`).
     let mode = cli_mode
         .or_else(|| config.settings.mode.as_deref().and_then(parse_mode))
         .or_else(|| {
@@ -139,7 +141,7 @@ pub async fn build_orchestrator_with_fallback(
                 .as_deref()
                 .and_then(parse_mode)
         })
-        .unwrap_or(PermissionMode::AcceptEdits);
+        .unwrap_or(PermissionMode::Auto);
 
     let steps = build_steps(&config, &default_model);
     for step in &steps {

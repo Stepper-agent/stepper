@@ -20,8 +20,10 @@ pub const PRESET_NAMES: &[&str] = &[
 ];
 
 /// Color-role table (opencode-style). Defined once and passed to widgets so a
-/// future `--theme` flag is trivial. Does NOT set a background — we respect the
-/// terminal's own bg (opencode `system`/`none` behavior) in an inline viewport.
+/// future `--theme` flag is trivial. The foreground roles live here; the inline
+/// viewport's surface background is provided separately by [`Theme::preset_bg`]
+/// (per preset) so the live app region paints as a coloured panel while committed
+/// scrollback keeps the terminal's own background.
 #[derive(Clone)]
 pub struct Theme {
     pub accent: Color,
@@ -372,6 +374,30 @@ impl Theme {
         self.layer_colors[index % self.layer_colors.len()]
     }
 
+    /// The inline viewport's surface background for a preset, used to paint the
+    /// live app region as a coloured panel (committed scrollback stays the
+    /// terminal's own background). `None` falls back to the terminal background.
+    /// Each value is the palette's canonical editor background.
+    pub fn preset_bg(name: &str) -> Option<Color> {
+        let rgb = Color::Rgb;
+        Some(match name {
+            "dark" => rgb(0x1e, 0x1e, 0x2e),
+            "light" => rgb(0xfa, 0xfa, 0xfa),
+            "nord" => rgb(0x2e, 0x34, 0x40),
+            "dracula" => rgb(0x28, 0x2a, 0x36),
+            "gruvbox" => rgb(0x28, 0x28, 0x28),
+            "solarized" => rgb(0x00, 0x2b, 0x36),
+            "tokyonight" => rgb(0x1a, 0x1b, 0x26),
+            "catppuccin" => rgb(0x1e, 0x1e, 0x2e),
+            "catppuccin-macchiato" => rgb(0x24, 0x27, 0x3a),
+            "onedark" => rgb(0x28, 0x2c, 0x34),
+            "everforest" => rgb(0x2d, 0x35, 0x3b),
+            "kanagawa" => rgb(0x1f, 0x1f, 0x28),
+            "ayu" => rgb(0x0b, 0x0e, 0x14),
+            _ => return None,
+        })
+    }
+
     /// Context gauge color: lots of room = green, getting low = yellow, near the
     /// 95% auto-compaction line = red. `pct_left` is percent of context still free.
     pub fn gauge_color(&self, pct_left: u8) -> Color {
@@ -421,6 +447,15 @@ mod tests {
         let s = Theme::color_to_string(c);
         assert_eq!(Theme::parse_color(&s), Some(c), "display → parse round-trips");
         assert!(Theme::parse_color("definitely-not-a-color").is_none());
+    }
+
+    #[test]
+    fn preset_bg_covers_every_preset_and_rejects_unknown() {
+        for name in PRESET_NAMES {
+            assert!(Theme::preset_bg(name).is_some(), "preset {name} has a surface bg");
+        }
+        assert!(Theme::preset_bg("bogus").is_none());
+        assert_eq!(Theme::preset_bg("dracula"), Some(Color::Rgb(0x28, 0x2a, 0x36)));
     }
 
     #[test]

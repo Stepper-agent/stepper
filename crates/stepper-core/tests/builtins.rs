@@ -183,6 +183,36 @@ async fn next_notice(rx: &mut EventRx) -> String {
     panic!("event stream ended before a Notice");
 }
 
+async fn next_settings(rx: &mut EventRx) -> stepper_protocol::SettingsSnapshotView {
+    while let Some(ev) = rx.recv().await {
+        if let AppEvent::SettingsSnapshot(v) = ev {
+            return v;
+        }
+    }
+    panic!("event stream ended before a SettingsSnapshot");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slash_settings_emits_tabbed_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator(dir.path().to_path_buf()),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+
+    action_tx.send(slash("settings", "")).await.unwrap();
+    let snap = next_settings(&mut events).await;
+    let titles: Vec<&str> = snap.tabs.iter().map(|t| t.title.as_str()).collect();
+    assert_eq!(titles, ["General", "Model", "Permissions", "Theme", "MCP", "Notifications"]);
+    // General lists the active mode; Permissions/Theme link to their editors.
+    assert!(snap.tabs[0].rows.iter().any(|r| r.label == "mode"), "general has a mode row: {:?}", snap.tabs[0].rows);
+    assert_eq!(snap.tabs[2].jump.as_deref(), Some("permissions"));
+    assert_eq!(snap.tabs[3].jump.as_deref(), Some("theme"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn builtins_emit_events_without_running_a_turn() {
     let dir = tempfile::tempdir().unwrap();

@@ -85,15 +85,42 @@ pub fn load_base_context(config: &Config) -> String {
     if let Some(claude) = home.as_ref().map(|h| h.join(".claude")) {
         candidates.push((claude.join("CLAUDE.md"), claude));
     }
+    let mut context = String::new();
     for (file, base) in candidates {
         if let Ok(text) = std::fs::read_to_string(&file) {
             // Resolve `@import` directives (Claude-Code-style) — relative to the
             // file's own dir, `~/` to $HOME — so a CLAUDE.md that pulls in shared
             // rule files keeps working.
-            return stepper_config::imports::resolve_imports(&text, &base, home.as_deref());
+            context = stepper_config::imports::resolve_imports(&text, &base, home.as_deref());
+            break;
         }
     }
-    String::new()
+    // Project memory (written by the agent via `memory_write`) is ADDITIVE: it is
+    // always appended to whichever pinned context won above, so a future session
+    // sees the learnings the agent recorded — the auto-memory loop.
+    if let Some(root) = config.project_root.as_ref()
+        && let Ok(raw) = std::fs::read_to_string(root.join(crate::MEMORY_REL_PATH))
+    {
+        // The memory file is append-only and grows across sessions; cap what loads
+        // into every prompt by keeping the most-recent tail (it can't bloat the
+        // context window or cost unbounded).
+        const MEMORY_MAX_BYTES: usize = 32 * 1024;
+        let capped = if raw.len() > MEMORY_MAX_BYTES {
+            let cut = raw.len() - MEMORY_MAX_BYTES;
+            let cut = (cut..raw.len()).find(|&i| raw.is_char_boundary(i)).unwrap_or(raw.len());
+            format!("(older memory truncated)\n{}", &raw[cut..])
+        } else {
+            raw
+        };
+        let text = capped.trim();
+        if !text.is_empty() {
+            if !context.is_empty() {
+                context.push_str("\n\n");
+            }
+            context.push_str(text);
+        }
+    }
+    context
 }
 
 /// Map a reasoning-effort level to the per-dialect controls: OpenAI-family
@@ -104,6 +131,11 @@ pub fn effort_controls(level: &str) -> (Option<String>, Option<u32>) {
         "low" => (Some("low".into()), Some(2_048)),
         "medium" | "med" => (Some("medium".into()), Some(8_192)),
         "high" => (Some("high".into()), Some(16_384)),
+        // `xhigh`/`max` are Anthropic effort levels (adaptive thinking). The
+        // string flows to `output_config.effort` on modern Claude and clamps to
+        // `high` for OpenAI; the budget is only a legacy-model fallback.
+        "xhigh" => (Some("xhigh".into()), Some(24_576)),
+        "max" => (Some("max".into()), Some(32_768)),
         // "off"/unknown → no reasoning override, no thinking budget.
         _ => (None, None),
     }
@@ -443,10 +475,66 @@ mod tests {
     }
 
     #[test]
+    fn base_context_appends_project_memory_additively() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let stepper_dir = root.join(".stepper");
+        std::fs::create_dir_all(stepper_dir.join("memory")).unwrap();
+        std::fs::write(stepper_dir.join("stepper.md"), "PINNED CONTEXT").unwrap();
+        std::fs::write(
+            stepper_dir.join("memory/MEMORY.md"),
+            "# Project memory\n\n- run cargo test\n",
+        )
+        .unwrap();
+
+        let mut cfg = Config::from_settings(Default::default());
+        cfg.project_dir = Some(stepper_dir);
+        cfg.project_root = Some(root);
+        let ctx = load_base_context(&cfg);
+        // The pinned context wins the first-found candidate, and the agent's memory
+        // is appended after it (the auto-memory reload).
+        assert!(ctx.contains("PINNED CONTEXT"), "keeps the pinned context: {ctx}");
+        assert!(ctx.contains("- run cargo test"), "appends project memory: {ctx}");
+    }
+
+    #[test]
+    fn base_context_caps_an_oversized_memory_file_to_the_recent_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let stepper_dir = root.join(".stepper");
+        let mem_dir = stepper_dir.join("memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        // A small pinned context wins first-found (so the test doesn't pick up the
+        // real ~/.claude/CLAUDE.md fallback), and the memory below is appended.
+        std::fs::write(stepper_dir.join("stepper.md"), "BASE").unwrap();
+        // ~200KB of bullets, far over the 32KB load cap; the newest must survive.
+        let mut body = String::from("# Project memory\n\n");
+        for i in 0..8_000 {
+            body.push_str(&format!("- old learning number {i}\n"));
+        }
+        body.push_str("- NEWEST learning sentinel\n");
+        std::fs::write(mem_dir.join("MEMORY.md"), &body).unwrap();
+
+        let mut cfg = Config::from_settings(Default::default());
+        cfg.project_dir = Some(stepper_dir);
+        cfg.project_root = Some(root);
+        let ctx = load_base_context(&cfg);
+        assert!(ctx.len() < 64 * 1024, "the loaded memory is bounded, not {}B", ctx.len());
+        assert!(ctx.starts_with("BASE"), "pinned context kept first");
+        assert!(ctx.contains("(older memory truncated)"), "marks the truncation: tail-only");
+        assert!(ctx.contains("NEWEST learning sentinel"), "keeps the most recent tail");
+        assert!(!ctx.contains("old learning number 0"), "drops the oldest entries");
+    }
+
+    #[test]
     fn effort_controls_maps_levels_to_reasoning_and_thinking() {
         assert_eq!(effort_controls("off"), (None, None));
         assert_eq!(effort_controls("low"), (Some("low".into()), Some(2_048)));
         assert_eq!(effort_controls("high"), (Some("high".into()), Some(16_384)));
+        // Anthropic effort levels flow through as the string; the budget is only a
+        // legacy-model fallback.
+        assert_eq!(effort_controls("xhigh"), (Some("xhigh".into()), Some(24_576)));
+        assert_eq!(effort_controls("max"), (Some("max".into()), Some(32_768)));
         assert_eq!(effort_controls("bogus"), (None, None), "unknown → off");
     }
 

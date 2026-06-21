@@ -567,25 +567,38 @@ async fn write_outside_project_asks_and_records_file_edit_approval() {
 }
 
 #[tokio::test]
-async fn read_outside_project_asks_and_records_outside_project_approval() {
+async fn read_outside_project_in_auto_allows_but_accept_edits_asks() {
     let dir = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let target = outside.path().join("data.txt");
     std::fs::write(&target, "payload").unwrap();
     let reg = ToolRegistry::builtins();
-    let approver = Recording::new(Decision::Allow);
-    let cx = cx_with(dir.path(), PermissionMode::Auto, approver.clone());
 
+    // Policy A: in Auto, an out-of-project READ is auto-approved — the approver is
+    // never consulted (a read can't damage the tree; secrets are screened here).
+    let auto_approver = Recording::new(Decision::Allow);
+    let auto_cx = cx_with(dir.path(), PermissionMode::Auto, auto_approver.clone());
     let read = reg
         .get("read_file")
         .unwrap()
-        .call(json!({"path": target.to_string_lossy()}), &cx)
+        .call(json!({"path": target.to_string_lossy()}), &auto_cx)
         .await
         .unwrap();
     assert_eq!(read.content_text(), "payload");
+    assert!(auto_approver.kinds().is_empty(), "Auto must not prompt for an out-of-project read");
 
-    assert_eq!(approver.kinds(), vec!["outside_project"]);
-    match approver.last() {
+    // AcceptEdits still gates out-of-project reads, recording an OutsideProject ask.
+    let ae_approver = Recording::new(Decision::Allow);
+    let ae_cx = cx_with(dir.path(), PermissionMode::AcceptEdits, ae_approver.clone());
+    let read = reg
+        .get("read_file")
+        .unwrap()
+        .call(json!({"path": target.to_string_lossy()}), &ae_cx)
+        .await
+        .unwrap();
+    assert_eq!(read.content_text(), "payload");
+    assert_eq!(ae_approver.kinds(), vec!["outside_project"]);
+    match ae_approver.last() {
         Approval::OutsideProject { path, action } => {
             assert_eq!(path, target);
             assert_eq!(action, "read");
@@ -1103,7 +1116,9 @@ async fn read_offset_and_limit_slice_lines() {
 #[tokio::test]
 async fn glob_and_list_dir_gate_outside_project_reads() {
     // The project is `proj`; an out-of-project sibling dir must require approval
-    // for both glob and list_dir (previously they walked it with no gate).
+    // for both glob and list_dir (previously they walked it with no gate). Tested
+    // in AcceptEdits, which gates out-of-project reads — Auto auto-approves reads
+    // under policy A, so it would not exercise the gate path here.
     let proj = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     std::fs::write(outside.path().join("secret-topology.txt"), "x").unwrap();
@@ -1111,7 +1126,7 @@ async fn glob_and_list_dir_gate_outside_project_reads() {
 
     // DenyAll: the outside-project Read escalates to Ask, the approver denies.
     let denied = Recording::new(Decision::Deny);
-    let cx = cx_with(proj.path(), PermissionMode::Auto, denied.clone());
+    let cx = cx_with(proj.path(), PermissionMode::AcceptEdits, denied.clone());
 
     let glob = reg
         .get("glob")
@@ -1560,4 +1575,36 @@ async fn apply_patch_writes_nothing_when_a_change_is_denied() {
         !dir.path().join("created.txt").exists(),
         "a denied patch writes nothing"
     );
+}
+
+#[tokio::test]
+async fn memory_write_appends_to_project_memory_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = ToolRegistry::builtins();
+    let cx = cx_with(dir.path(), PermissionMode::Auto, Arc::new(AllowAll));
+
+    let r = reg
+        .get("memory_write")
+        .unwrap()
+        .call(json!({"note": "build with cargo test"}), &cx)
+        .await
+        .unwrap();
+    assert_eq!(r.content_text(), "remembered");
+    let path = dir.path().join(".stepper/memory/MEMORY.md");
+    let mem = std::fs::read_to_string(&path).unwrap();
+    assert!(mem.contains("# Project memory"), "header written: {mem}");
+    assert!(mem.contains("- build with cargo test"), "note appended: {mem}");
+
+    // A second note appends without duplicating the header.
+    reg.get("memory_write")
+        .unwrap()
+        .call(json!({"note": "lint: clippy -D warnings"}), &cx)
+        .await
+        .unwrap();
+    let mem2 = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(mem2.matches("# Project memory").count(), 1, "header once: {mem2}");
+    assert!(mem2.contains("- lint: clippy -D warnings"));
+
+    // An empty note is rejected.
+    assert!(reg.get("memory_write").unwrap().call(json!({"note": "  "}), &cx).await.is_err());
 }

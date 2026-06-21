@@ -277,6 +277,19 @@ impl Orchestrator {
         let outcome = self
             .run_turn_inner(user_turn, images, event_tx, approver, cancel)
             .await;
+        // A failed turn needs the user's attention — fire Notification before the
+        // per-turn Stop (both with a fresh token, like Stop below).
+        if let Err(e) = &outcome {
+            let _ = self
+                .hooks
+                .run(
+                    "Notification",
+                    None,
+                    &serde_json::json!({ "kind": "error", "message": e.to_string() }),
+                    &CancellationToken::new(),
+                )
+                .await;
+        }
         // Mirror SessionStart on every exit. Use a FRESH token (the turn's may
         // already be cancelled, which would make the hook itself bail immediately)
         // so a cleanup Stop hook still runs after an interrupted turn — bounded by
@@ -306,6 +319,16 @@ impl Orchestrator {
         let mut turn_usage = stepper_provider::Usage::default();
         let mut turn_cost_usd = 0.0_f64;
 
+        // UserPromptSubmit fires first (the prompt just arrived), then SessionStart.
+        let _ = self
+            .hooks
+            .run(
+                "UserPromptSubmit",
+                None,
+                &serde_json::json!({ "prompt": user_turn }),
+                &cancel,
+            )
+            .await;
         let _ = self
             .hooks
             .run(
@@ -791,6 +814,18 @@ impl Orchestrator {
         let results = run_parallel(tasks, step.parallel_max.max(1), event_tx.clone()).await;
         let mut workers_usage = stepper_provider::Usage::default();
         for (label, outcome) in results {
+            // Each finished fan-out worker is a sub-agent stop. Use a FRESH token
+            // (like the per-turn Stop) so a cleanup hook still runs even when the
+            // turn was interrupted mid-fan-out (the turn's `cancel` is already set).
+            let _ = self
+                .hooks
+                .run(
+                    "SubagentStop",
+                    Some(&label),
+                    &serde_json::json!({ "worker": &label }),
+                    &CancellationToken::new(),
+                )
+                .await;
             match outcome {
                 Ok(o) => {
                     workers_usage.add(&o.usage);

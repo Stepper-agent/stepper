@@ -212,3 +212,31 @@ async fn default_mode_tool_call_asks_then_deny_fails_the_tool() {
     assert!(saw_approval, "a bash tool call in Default mode raises ApprovalRequested");
     assert!(tool_failed, "replying Deny makes the gate fail the tool (ok=false)");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn user_prompt_submit_hook_fires_on_a_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ups.flag");
+    let hooks = std::collections::BTreeMap::from([(
+        "UserPromptSubmit".to_string(),
+        vec![stepper_config::HookEntry {
+            matcher: None,
+            command: format!("touch {}", marker.display()),
+        }],
+    )]);
+    let resolver = Arc::new(StubResolver {
+        make: Box::new(|| Box::new(HelloProvider)),
+    });
+    let mut orch = make_orch(resolver, dir.path().to_path_buf(), PermissionMode::AcceptEdits);
+    orch.hooks = Arc::new(HookHost::new(hooks, dir.path().to_path_buf()));
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(orch, SessionRecord::fresh(), action_rx, CancellationToken::new());
+
+    action_tx.send(Action::SubmitInput("hi".into())).await.unwrap();
+    while let Some(ev) = events.recv().await {
+        if matches!(ev, AppEvent::TurnComplete { .. }) {
+            break;
+        }
+    }
+    assert!(marker.exists(), "the UserPromptSubmit hook ran before the turn");
+}

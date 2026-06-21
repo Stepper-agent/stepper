@@ -8,7 +8,8 @@ use cli::{AuthCmd, Cli, Command, GlobalArgs};
 use core_setup::{build_orchestrator_with_fallback, DEFAULT_MODEL};
 use std::io::Write;
 use stepper_core::{
-    spawn_core, ConfigProviderResolver, ModelRegistry, ProviderResolver, SessionLimits, SessionRecord, SessionStore,
+    spawn_core, ConfigProviderResolver, ModelRegistry, Orchestrator, ProviderResolver, SessionLimits, SessionRecord,
+    SessionStore,
 };
 use stepper_permission::{PermissionMode, RuleSet};
 use stepper_protocol::{
@@ -47,10 +48,124 @@ async fn main() -> anyhow::Result<()> {
 
 /// `stepper mcp auth|logout|status`: manage OAuth for remote (http) MCP servers.
 /// Tokens live in `~/.stepper/mcp-auth.json` (0600), never in `setting.json`.
+/// Build a `mcpServers` JSON entry for `stepper mcp add`: an http server when a
+/// `--url` is given, otherwise a stdio server from `--command` + `--arg`s.
+fn mcp_server_entry(command: Option<String>, args: Vec<String>, url: Option<String>) -> serde_json::Value {
+    match url {
+        Some(url) => serde_json::json!({ "type": "http", "url": url }),
+        None => serde_json::json!({ "command": command, "args": args }),
+    }
+}
+
+/// The `.stepper` directory to write MCP config into: the project's if a project
+/// config exists, else the user's `~/.stepper`, else `<cwd>/.stepper` (created on
+/// first write by `update_settings`).
+fn mcp_write_dir(cfg: &stepper_config::Config, cwd: &std::path::Path) -> std::path::PathBuf {
+    cfg.project_dir
+        .clone()
+        .or_else(|| cfg.user_dir.clone())
+        .unwrap_or_else(|| cwd.join(".stepper"))
+}
+
 async fn mcp_cmd(args: cli::McpArgs, global: GlobalArgs) -> anyhow::Result<()> {
     let cwd = global_cwd(&global)?;
     let cfg = stepper_config::Config::load(&cwd).map_err(|e| anyhow::anyhow!("load config: {e}"))?;
     match args.cmd {
+        cli::McpCmd::List => {
+            if cfg.settings.mcp_servers.is_empty() {
+                println!("No MCP servers configured.");
+                return Ok(());
+            }
+            for (name, s) in &cfg.settings.mcp_servers {
+                let transport = s.transport.as_deref().unwrap_or("stdio");
+                let endpoint = s.url.clone().or_else(|| s.command.clone()).unwrap_or_default();
+                let disabled = if s.enabled == Some(false) { "  (disabled)" } else { "" };
+                println!("{name}  [{transport}]  {endpoint}{disabled}");
+            }
+            Ok(())
+        }
+        cli::McpCmd::Get { name } => {
+            let server = cfg
+                .settings
+                .mcp_servers
+                .get(&name)
+                .ok_or_else(|| anyhow::anyhow!("no MCP server '{name}' in setting.json"))?
+                .clone();
+            println!("{name}  [{}]", server.transport.as_deref().unwrap_or("stdio"));
+            if let Some(cmd) = &server.command {
+                println!("  command: {cmd} {}", server.args.join(" "));
+            }
+            if let Some(url) = &server.url {
+                println!("  url: {url}");
+            }
+            // Connect just this server and list everything it advertises.
+            let base_dir = cfg.project_root.clone().unwrap_or_else(|| cwd.clone());
+            let one = std::collections::BTreeMap::from([(name.clone(), server)]);
+            let mgr = stepper_mcp::McpManager::connect(&one, &base_dir, cfg.settings.proxy.as_ref()).await;
+            let tools = mgr.tool_names();
+            println!("  tools ({}):", tools.len());
+            for t in &tools {
+                println!("    {t}");
+            }
+            let resources = mgr.list_all_resources().await;
+            println!("  resources ({}):", resources.len());
+            for r in &resources {
+                println!("    {r}");
+            }
+            let prompts = mgr.list_all_prompts().await;
+            println!("  prompts ({}):", prompts.len());
+            for p in &prompts {
+                println!("    {p}");
+            }
+            mgr.shutdown().await;
+            Ok(())
+        }
+        cli::McpCmd::Add { name, command, args: cmd_args, url } => {
+            if command.is_none() && url.is_none() {
+                anyhow::bail!("provide --command <cmd> (stdio) or --url <url> (http)");
+            }
+            let dir = mcp_write_dir(&cfg, &cwd);
+            let entry = mcp_server_entry(command, cmd_args, url);
+            stepper_config::scaffold::update_settings(&dir, |obj| {
+                let servers = obj
+                    .entry("mcpServers")
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(map) = servers.as_object_mut() {
+                    map.insert(name.clone(), entry);
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("write {}: {e}", dir.join("setting.json").display()))?;
+            println!("Added MCP server '{name}' to {}.", dir.join("setting.json").display());
+            Ok(())
+        }
+        cli::McpCmd::Remove { name } => {
+            // `list`/`get` read the merged (user+project) config, so `remove` must
+            // reach BOTH scopes — a server defined only in `~/.stepper` is otherwise
+            // unremovable from inside a project. Only existing setting.json files are
+            // touched (no empty file is created in a scope that lacks the server).
+            let dirs: Vec<std::path::PathBuf> =
+                [cfg.project_dir.clone(), cfg.user_dir.clone()].into_iter().flatten().collect();
+            let mut removed = false;
+            for dir in &dirs {
+                if !dir.join("setting.json").is_file() {
+                    continue;
+                }
+                stepper_config::scaffold::update_settings(dir, |obj| {
+                    if let Some(map) = obj.get_mut("mcpServers").and_then(|v| v.as_object_mut())
+                        && map.remove(&name).is_some()
+                    {
+                        removed = true;
+                    }
+                })
+                .map_err(|e| anyhow::anyhow!("write {}: {e}", dir.join("setting.json").display()))?;
+            }
+            if removed {
+                println!("Removed MCP server '{name}'.");
+            } else {
+                println!("No MCP server '{name}' in the project or user config.");
+            }
+            Ok(())
+        }
         cli::McpCmd::Auth { name } => {
             let server = cfg
                 .settings
@@ -445,7 +560,7 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
     let effective_model = global.model.clone().or(onboarding_model);
     let (provider, model) = split_model(effective_model.as_deref());
 
-    let (orchestrator, _mcp) = build_orchestrator_with_fallback(
+    let (mut orchestrator, _mcp) = build_orchestrator_with_fallback(
         effective_model.as_deref(),
         global.fallback_model.as_deref(),
         cli_mode,
@@ -454,6 +569,7 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         limits,
     )
     .await?;
+    apply_system_prompt_overrides(&mut orchestrator, &global)?;
     let session = resume_or_fresh(
         &orchestrator.project_root,
         global.resume.as_deref(),
@@ -554,7 +670,7 @@ async fn oneshot(
     prompt: String,
     limits: SessionLimits,
 ) -> anyhow::Result<()> {
-    let (orchestrator, _mcp) = build_orchestrator_with_fallback(
+    let (mut orchestrator, _mcp) = build_orchestrator_with_fallback(
         global.model.as_deref(),
         global.fallback_model.as_deref(),
         cli_mode,
@@ -563,6 +679,7 @@ async fn oneshot(
         limits,
     )
     .await?;
+    apply_system_prompt_overrides(&mut orchestrator, global)?;
     // --file: inline attachments as leading context, then --agent prefixes the
     // `#name` trigger (which must stay at the very start of the prompt).
     let prompt = attach_files(&global.file, &prompt, &orchestrator.project_root)?;
@@ -678,6 +795,50 @@ fn attach_files(files: &[std::path::PathBuf], prompt: &str, cwd: &std::path::Pat
     }
     out.push_str(prompt);
     Ok(out)
+}
+
+/// Resolve a `--system-prompt[-file]` / `--append-system-prompt[-file]` pair to
+/// the text to use: inline text wins, else the file is read (clap already rejects
+/// passing both). `None` when neither is set.
+fn read_prompt_arg(text: Option<&str>, file: Option<&std::path::Path>) -> anyhow::Result<Option<String>> {
+    if let Some(t) = text {
+        return Ok(Some(t.to_string()));
+    }
+    if let Some(p) = file {
+        let body = std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("--system-prompt-file {}: {e}", p.display()))?;
+        return Ok(Some(body));
+    }
+    Ok(None)
+}
+
+/// Append extra instructions after a layer's role prompt (blank role → just the
+/// extra). The append lands at the very end of the composed system message.
+fn appended_role(role: &str, extra: &str) -> String {
+    let role = role.trim_end();
+    if role.is_empty() {
+        extra.to_string()
+    } else {
+        format!("{role}\n\n{extra}")
+    }
+}
+
+/// Apply `--system-prompt` (replace the project base context) and
+/// `--append-system-prompt` (append to every layer's role) to an already-built
+/// orchestrator. The base-context replacement also reaches dispatched sub-agents
+/// (they clone `base_context`); the append affects the main layers' roles only.
+fn apply_system_prompt_overrides(orchestrator: &mut Orchestrator, global: &GlobalArgs) -> anyhow::Result<()> {
+    if let Some(base) = read_prompt_arg(global.system_prompt.as_deref(), global.system_prompt_file.as_deref())? {
+        orchestrator.base_context = base;
+    }
+    if let Some(extra) = read_prompt_arg(global.append_system_prompt.as_deref(), global.append_system_prompt_file.as_deref())? {
+        let extra = extra.trim();
+        if !extra.is_empty() {
+            for step in &mut orchestrator.steps {
+                step.system_prompt = appended_role(&step.system_prompt, extra);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build the prompt for a headless `--agent <name>` run: validate the name
@@ -983,6 +1144,70 @@ mod tests {
         assert_eq!(attach_files(&[], "just this", dir.path()).unwrap(), "just this");
         // A missing file errors.
         assert!(attach_files(&[std::path::PathBuf::from("nope.txt")], "x", dir.path()).is_err());
+    }
+
+    #[test]
+    fn read_prompt_arg_prefers_inline_text_else_file() {
+        // Inline text wins.
+        assert_eq!(read_prompt_arg(Some("inline"), None).unwrap().as_deref(), Some("inline"));
+        // File is read when no inline text.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("sys.txt");
+        std::fs::write(&p, "from file").unwrap();
+        assert_eq!(read_prompt_arg(None, Some(p.as_path())).unwrap().as_deref(), Some("from file"));
+        // Neither → None.
+        assert!(read_prompt_arg(None, None).unwrap().is_none());
+        // Missing file errors.
+        assert!(read_prompt_arg(None, Some(std::path::Path::new("/no/such/file"))).is_err());
+    }
+
+    #[test]
+    fn mcp_server_entry_builds_http_or_stdio() {
+        let http = mcp_server_entry(None, vec![], Some("https://x/mcp".into()));
+        assert_eq!(http["type"], "http");
+        assert_eq!(http["url"], "https://x/mcp");
+        assert!(http.get("command").is_none());
+
+        let stdio = mcp_server_entry(Some("uvx".into()), vec!["server".into(), "--flag".into()], None);
+        assert_eq!(stdio["command"], "uvx");
+        assert_eq!(stdio["args"], serde_json::json!(["server", "--flag"]));
+        assert!(stdio.get("type").is_none());
+    }
+
+    #[test]
+    fn mcp_add_then_remove_round_trips_setting_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path().join(".stepper");
+        // Add writes a mcpServers entry (creating the file/dir on first write).
+        stepper_config::scaffold::update_settings(&sd, |obj| {
+            let servers = obj.entry("mcpServers").or_insert_with(|| serde_json::json!({}));
+            servers
+                .as_object_mut()
+                .unwrap()
+                .insert("fs".into(), mcp_server_entry(Some("uvx".into()), vec!["mcp-fs".into()], None));
+        })
+        .unwrap();
+        let written = std::fs::read_to_string(sd.join("setting.json")).unwrap();
+        assert!(written.contains("\"fs\"") && written.contains("mcp-fs"), "added: {written}");
+        // Remove deletes it.
+        let mut removed = false;
+        stepper_config::scaffold::update_settings(&sd, |obj| {
+            if let Some(map) = obj.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
+                removed = map.remove("fs").is_some();
+            }
+        })
+        .unwrap();
+        assert!(removed);
+        assert!(!std::fs::read_to_string(sd.join("setting.json")).unwrap().contains("mcp-fs"));
+    }
+
+    #[test]
+    fn appended_role_places_extra_after_role() {
+        assert_eq!(appended_role("You are a reviewer.", "Be terse."), "You are a reviewer.\n\nBe terse.");
+        // Trailing whitespace on the role is trimmed before the join.
+        assert_eq!(appended_role("role\n\n", "extra"), "role\n\nextra");
+        // A blank role yields just the appended text (no leading blank lines).
+        assert_eq!(appended_role("   ", "extra"), "extra");
     }
 
     #[test]

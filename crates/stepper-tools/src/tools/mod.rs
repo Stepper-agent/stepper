@@ -4,6 +4,7 @@ pub mod apply_patch;
 pub mod bash;
 pub mod fetch;
 pub mod files;
+pub mod memory;
 pub mod search;
 pub mod todo;
 

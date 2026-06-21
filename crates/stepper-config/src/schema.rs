@@ -20,7 +20,17 @@ const MODE_NAMES: [&str; 9] = [
     "dont_ask",
 ];
 const MCP_TRANSPORTS: [&str; 3] = ["stdio", "http", "streamable-http"];
-const HOOK_EVENTS: [&str; 4] = ["SessionStart", "PreToolUse", "PostToolUse", "Stop"];
+const HOOK_EVENTS: [&str; 9] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PreCompact",
+    "SubagentStop",
+    "Notification",
+    "Stop",
+    "SessionEnd",
+];
 const FAILURE_POLICIES: [&str; 2] = ["stop", "skip"];
 
 /// The JSON Schema for `setting.json`, derived from `SettingsFile`.
@@ -308,6 +318,21 @@ mod tests {
         assert_eq!(problems.len(), 1);
         assert!(problems[0].contains("hooks.OnToolUse"), "got: {}", problems[0]);
         assert!(problems[0].contains("PreToolUse"), "lists known events: {}", problems[0]);
+    }
+
+    #[test]
+    fn values_accept_the_extended_lifecycle_hook_events() {
+        // The 5 events added for Claude-Code parity all validate as known events.
+        let settings = settings_from(serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [ { "command": "echo p" } ],
+                "PreCompact": [ { "command": "echo c" } ],
+                "SubagentStop": [ { "command": "echo s" } ],
+                "Notification": [ { "command": "echo n" } ],
+                "SessionEnd": [ { "command": "echo e" } ],
+            }
+        }));
+        assert!(validate_settings_values(&settings).is_empty(), "all five are known events");
     }
 
     #[test]

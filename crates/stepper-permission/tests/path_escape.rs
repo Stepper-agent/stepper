@@ -62,7 +62,7 @@ fn parent_dir_traversal_back_into_project_is_inside() {
 }
 
 #[test]
-fn auto_mode_treats_symlink_escape_as_outside_and_asks() {
+fn auto_mode_symlink_escape_allows_read_but_gates_write() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");
     let outside = dir.path().join("outside");
@@ -74,9 +74,29 @@ fn auto_mode_treats_symlink_escape_as_outside_and_asks() {
     symlink_dir(&outside, &link);
 
     let rules = RuleSet::default();
-    let request = PermissionRequest::Read(link.join("secret.txt"));
+    let target = link.join("secret.txt");
+    // Policy A: a read through the escaping symlink is auto-approved in Auto —
+    // read-only tools are ungated and secret paths are screened at the tool layer.
     assert_eq!(
-        stepper_permission::evaluate(&request, &rules, &project, None, PermissionMode::Auto),
+        stepper_permission::evaluate(
+            &PermissionRequest::Read(target.clone()),
+            &rules,
+            &project,
+            None,
+            PermissionMode::Auto,
+        ),
+        Decision::Allow
+    );
+    // … but a WRITE through the same escape is still gated: the symlink resolves
+    // outside the tree, so a mutating op must be confirmed (escape defense intact).
+    assert_eq!(
+        stepper_permission::evaluate(
+            &PermissionRequest::Write(target),
+            &rules,
+            &project,
+            None,
+            PermissionMode::Auto,
+        ),
         Decision::Ask
     );
 }
@@ -128,13 +148,16 @@ fn home_anchored_rule_does_not_match_path_outside_home_via_evaluate() {
 
     let rules = RuleSet::from_lists(&["Read(~/.config/**)".into()], &[], &[]);
 
+    // Use AcceptEdits, which gates out-of-project reads, so a non-matching rule is
+    // visible as Ask. (In Auto/Default a read falls through to a broad allow, which
+    // would mask whether the `~/.config/**` rule matched.)
     assert_eq!(
         stepper_permission::evaluate(
             &PermissionRequest::Read(outside),
             &rules,
             &project,
             Some(home.as_path()),
-            PermissionMode::Auto,
+            PermissionMode::AcceptEdits,
         ),
         Decision::Ask
     );
@@ -152,13 +175,15 @@ fn home_anchored_rule_without_home_does_not_match() {
 
     let rules = RuleSet::from_lists(&["Read(~/.config/**)".into()], &[], &[]);
 
+    // Home is unset, so the `~/`-anchored rule can't resolve and must not match;
+    // AcceptEdits then gates the (out-of-project) read to Ask, proving the miss.
     assert_eq!(
         stepper_permission::evaluate(
             &PermissionRequest::Read(target),
             &rules,
             &project,
             None,
-            PermissionMode::Auto,
+            PermissionMode::AcceptEdits,
         ),
         Decision::Ask
     );

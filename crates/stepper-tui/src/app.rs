@@ -465,6 +465,26 @@ fn handle_overlay_key(state: &mut AppState, action_tx: &ActionTx, ev: &Event) {
         }
         return;
     }
+    // The `/settings` tabbed overview: ←/→ (or Tab) switch tabs, Enter opens the
+    // focused tab's editor (jump) or closes if it has none, Esc/q closes.
+    if matches!(state.overlay, Some(Overlay::Settings(_))) {
+        if let Event::Key(k) = ev {
+            match k.code {
+                KeyCode::Left => state.settings_tab_move(-1),
+                KeyCode::Right | KeyCode::Tab => state.settings_tab_move(1),
+                KeyCode::Enter => match state.settings_jump() {
+                    Some(action) => {
+                        state.overlay_close();
+                        let _ = action_tx.try_send(action);
+                    }
+                    None => state.overlay_close(),
+                },
+                KeyCode::Esc | KeyCode::Char('q') => state.overlay_close(),
+                _ => {}
+            }
+        }
+        return;
+    }
     if let Event::Key(k) = ev
         && matches!(
             k.code,

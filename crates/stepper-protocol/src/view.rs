@@ -148,6 +148,30 @@ pub struct PermissionsSnapshotView {
     pub approvals: Vec<ApprovalRuleView>,
 }
 
+/// One labelled value row inside a `/settings` tab (read-only).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingsRowView {
+    pub label: String,
+    pub value: String,
+}
+
+/// One tab of the `/settings` overview. `jump` is the slash command opened when
+/// the user presses Enter on this tab (e.g. `permissions`, `theme`, `model`,
+/// `effort`); `None` makes the tab informational only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingsTabView {
+    pub title: String,
+    pub rows: Vec<SettingsRowView>,
+    pub jump: Option<String>,
+}
+
+/// `/settings` — a consolidated read-only view of the session's settings grouped
+/// into tabs, each linking to its dedicated editor where one exists.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SettingsSnapshotView {
+    pub tabs: Vec<SettingsTabView>,
+}
+
 /// One `/rewind` candidate: a `turn-N` working-tree checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointView {

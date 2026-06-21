@@ -30,12 +30,12 @@ const MODEL_MENU: &[(&str, &str)] = &[
 /// Selectable permission modes `(setting.json value, one-line description)`. The
 /// first entry is the default.
 const MODE_MENU: &[(&str, &str)] = &[
+    ("auto", "run tools without prompting (asks before out-of-project writes)"),
     (
         "accept-edits",
         "auto-apply edits, ask before risky commands",
     ),
     ("plan", "read-only planning first"),
-    ("auto", "run tools without prompting"),
     ("default", "ask before edits and commands"),
 ];
 

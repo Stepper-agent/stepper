@@ -9,7 +9,7 @@ use stepper_tools::{ToolRegistry, ToolSpec};
 fn every_builtin_input_schema_is_a_typed_object() {
     let reg = ToolRegistry::builtins();
     let specs = reg.specs();
-    assert_eq!(specs.len(), 10);
+    assert_eq!(specs.len(), 11);
 
     for spec in &specs {
         let schema = &spec.input_schema;

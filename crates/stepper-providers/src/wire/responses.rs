@@ -37,6 +37,8 @@ pub fn build_request_body(req: &ChatRequest, model: &str, stream: bool, store: b
         body.insert("stop".into(), json!(req.stop));
     }
     if let Some(effort) = &req.reasoning_effort {
+        // `xhigh`/`max` are Anthropic-only levels — clamp to `high` for OpenAI.
+        let effort = super::openai::clamp_openai_effort(effort);
         body.insert("reasoning".into(), json!({ "effort": effort }));
     }
     Value::Object(body)

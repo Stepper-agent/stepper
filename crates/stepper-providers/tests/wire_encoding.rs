@@ -415,3 +415,78 @@ fn image_attachments_encode_per_dialect() {
     );
     assert_eq!(plain["messages"][0]["content"], "hi");
 }
+
+#[test]
+fn anthropic_date_suffixed_legacy_ids_stay_on_the_legacy_surface() {
+    // `claude-opus-4-20250514` is the canonical id for Opus 4.0 (alias
+    // `claude-opus-4-0`) — the date must NOT be parsed as minor 20250514, which
+    // would mis-classify it as adaptive-capable and 400 (output_config.effort is
+    // unsupported there) while dropping temperature/top_p.
+    let mut req = ChatRequest::new("claude-opus-4-20250514");
+    req.reasoning_effort = Some("high".into());
+    req.thinking = Some(ThinkingConfig { budget_tokens: 8_192 });
+    req.temperature = Some(0.5);
+    let body = wire::anthropic::build_request_body(&req, "claude-opus-4-20250514", true);
+    assert_eq!(body["thinking"]["type"], "enabled", "Opus 4.0 keeps legacy extended thinking");
+    assert_eq!(body["thinking"]["budget_tokens"], json!(8_192));
+    assert!(body.get("output_config").is_none(), "no output_config.effort on a pre-4.6 model");
+    assert!(body.get("temperature").is_some(), "legacy keeps sampling params");
+
+    // A date-suffixed MODERN id still classifies by its real minor (4.6), adaptive.
+    let mut modern = ChatRequest::new("claude-opus-4-6-20251101");
+    modern.reasoning_effort = Some("high".into());
+    let body = wire::anthropic::build_request_body(&modern, "claude-opus-4-6-20251101", true);
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert_eq!(body["output_config"]["effort"], "high");
+}
+
+#[test]
+fn anthropic_modern_models_use_adaptive_thinking_and_output_config_effort() {
+    // Modern Claude (Opus >= 4.6 / Sonnet >= 4.6 / Fable·Mythos 5) drives reasoning
+    // with adaptive thinking + output_config.effort; budget_tokens and sampling
+    // params are removed (they 400 on Opus 4.7+).
+    let mut req = ChatRequest::new("claude-opus-4-8");
+    req.reasoning_effort = Some("max".into());
+    req.thinking = Some(ThinkingConfig { budget_tokens: 16_384 });
+    req.temperature = Some(0.7);
+    req.top_p = Some(0.9);
+    let body = wire::anthropic::build_request_body(&req, "claude-opus-4-8", true);
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert!(body["thinking"].get("budget_tokens").is_none(), "budget_tokens gone on modern Claude");
+    assert_eq!(body["output_config"]["effort"], "max");
+    assert!(body.get("temperature").is_none(), "temperature 400s on Opus 4.7+ — suppressed");
+    assert!(body.get("top_p").is_none(), "top_p 400s on Opus 4.7+ — suppressed");
+}
+
+#[test]
+fn anthropic_xhigh_clamps_to_high_where_unsupported() {
+    let mut req = ChatRequest::new("x");
+    req.reasoning_effort = Some("xhigh".into());
+    let opus = wire::anthropic::build_request_body(&req, "claude-opus-4-8", true);
+    assert_eq!(opus["output_config"]["effort"], "xhigh");
+    let sonnet = wire::anthropic::build_request_body(&req, "claude-sonnet-4-6", true);
+    assert_eq!(sonnet["output_config"]["effort"], "high", "xhigh clamps to high on Sonnet 4.6");
+}
+
+#[test]
+fn anthropic_legacy_models_keep_budget_tokens_thinking() {
+    let mut req = ChatRequest::new("claude-sonnet-4-5");
+    req.thinking = Some(ThinkingConfig { budget_tokens: 8_192 });
+    req.temperature = Some(0.3);
+    let body = wire::anthropic::build_request_body(&req, "claude-sonnet-4-5", true);
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["thinking"]["budget_tokens"], json!(8_192));
+    assert!(body.get("output_config").is_none());
+    assert!(body.get("temperature").is_some(), "legacy keeps sampling params");
+}
+
+#[test]
+fn openai_clamps_anthropic_only_effort_levels() {
+    let mut req = ChatRequest::new("gpt");
+    req.reasoning_effort = Some("xhigh".into());
+    let chat = wire::openai::build_request_body(&req, "gpt", true);
+    assert_eq!(chat["reasoning_effort"], "high", "xhigh clamps to high for OpenAI");
+    req.reasoning_effort = Some("max".into());
+    let resp = wire::responses::build_request_body(&req, "gpt", true, false);
+    assert_eq!(resp["reasoning"]["effort"], "high", "max clamps to high for Responses");
+}

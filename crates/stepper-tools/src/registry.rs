@@ -1,4 +1,4 @@
-use crate::tools::{apply_patch, bash, fetch, files, search, todo};
+use crate::tools::{apply_patch, bash, fetch, files, memory, search, todo};
 use crate::Tool;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,6 +34,7 @@ impl ToolRegistry {
         r.register(Arc::new(search::GlobTool::default()));
         r.register(Arc::new(search::ListDir::default()));
         r.register(Arc::new(todo::TodoWrite::default()));
+        r.register(Arc::new(memory::MemoryWrite::default()));
         r.register(Arc::new(fetch::WebFetch::with_proxy(proxy)));
         r
     }

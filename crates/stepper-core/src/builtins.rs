@@ -15,7 +15,8 @@ use std::path::Path;
 use stepper_permission::{PermissionMode, Rule};
 use stepper_protocol::{
     AppEvent, ApprovalRuleView, CheckpointView, ContextBreakdownView, EventTx, ModelView,
-    NoticeLevel, PermissionRuleView, PermissionsSnapshotView, SessionView,
+    NoticeLevel, PermissionRuleView, PermissionsSnapshotView, SessionView, SettingsRowView,
+    SettingsSnapshotView, SettingsTabView,
 };
 use stepper_provider::Usage;
 
@@ -39,8 +40,9 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("models", "", "pick from fetched models"),
     ("theme", "", "edit the TUI color theme"),
     ("editor", "[text]", "compose the prompt in $EDITOR"),
-    ("effort", "[off|low|medium|high]", "reasoning effort"),
+    ("effort", "[off|low|medium|high|xhigh|max]", "reasoning effort"),
     ("permissions", "", "rules & approvals"),
+    ("settings", "", "all settings (tabbed overview)"),
     ("allow", "<spec>", "add an allow rule (e.g. Bash(cargo *))"),
     ("ask", "<spec>", "add an ask rule"),
     ("deny", "<spec>", "add a deny rule"),
@@ -176,6 +178,10 @@ pub async fn handle(
         }
         "permissions" => {
             handle_permissions(orchestrator, tx).await;
+            true
+        }
+        "settings" => {
+            handle_settings(orchestrator, tx).await;
             true
         }
         verdict @ ("allow" | "ask" | "deny") => {
@@ -500,9 +506,10 @@ fn persist_default_model(orchestrator: &Orchestrator, model: &str) -> std::io::R
     Ok(true)
 }
 
-/// `/effort [off|low|medium|high]` — show or set the session reasoning effort. An
-/// explicit set applies to every step (overriding per-layer frontmatter for this
-/// session) and persists as the project default.
+/// `/effort [off|low|medium|high|xhigh|max]` — show or set the session reasoning
+/// effort. With no argument it opens the TUI picker (current level highlighted).
+/// An explicit set applies to every step (overriding per-layer frontmatter for
+/// this session) and persists as the project default.
 async fn handle_effort(arg: &str, orchestrator: &mut Orchestrator, tx: &EventTx) {
     if arg.is_empty() {
         let current = orchestrator
@@ -510,20 +517,15 @@ async fn handle_effort(arg: &str, orchestrator: &mut Orchestrator, tx: &EventTx)
             .first()
             .and_then(|s| s.reasoning_effort.clone())
             .unwrap_or_else(|| "off".into());
-        notice(
-            tx,
-            NoticeLevel::Info,
-            format!("reasoning effort: {current} — set with /effort <off|low|medium|high>"),
-        )
-        .await;
+        let _ = tx.send(AppEvent::OpenEffortPicker { current }).await;
         return;
     }
     let level = arg.to_ascii_lowercase();
-    if !matches!(level.as_str(), "off" | "low" | "medium" | "high") {
+    if !matches!(level.as_str(), "off" | "low" | "medium" | "high" | "xhigh" | "max") {
         notice(
             tx,
             NoticeLevel::Warn,
-            format!("unknown effort '{arg}' — use off | low | medium | high"),
+            format!("unknown effort '{arg}' — use off | low | medium | high | xhigh | max"),
         )
         .await;
         return;
@@ -908,6 +910,120 @@ async fn handle_permissions(orchestrator: &Orchestrator, tx: &EventTx) {
         approvals,
     };
     let _ = tx.send(AppEvent::PermissionsSnapshot(snapshot)).await;
+}
+
+fn row(label: &str, value: impl Into<String>) -> SettingsRowView {
+    SettingsRowView {
+        label: label.into(),
+        value: value.into(),
+    }
+}
+
+/// `/settings` — a consolidated, read-only overview of the session's settings,
+/// grouped into tabs. Live values (mode/effort/model) come from the orchestrator;
+/// persisted ones (theme/mcp/notifications) are read from `.stepper/setting.json`
+/// (project over user). Enter on a tab with a `jump` opens its dedicated editor.
+async fn handle_settings(orchestrator: &Orchestrator, tx: &EventTx) {
+    let user = orchestrator
+        .home
+        .as_ref()
+        .map(|h| h.join(".stepper"))
+        .and_then(|d| read_settings(&d));
+    let project = read_settings(&orchestrator.project_root.join(".stepper"));
+    let pick = |f: fn(&stepper_config::SettingsFile) -> Option<String>| {
+        project.as_ref().and_then(f).or_else(|| user.as_ref().and_then(f))
+    };
+
+    let effort = orchestrator
+        .steps
+        .first()
+        .and_then(|s| s.reasoning_effort.clone())
+        .unwrap_or_else(|| "off".into());
+
+    let general = SettingsTabView {
+        title: "General".into(),
+        rows: vec![
+            row("mode", mode_label(orchestrator.mode_snapshot())),
+            row("reasoning effort", effort),
+            row("cwd", orchestrator.cwd.display().to_string()),
+            row("project root", orchestrator.project_root.display().to_string()),
+        ],
+        jump: None,
+    };
+
+    let model = SettingsTabView {
+        title: "Model".into(),
+        rows: orchestrator
+            .steps
+            .iter()
+            .map(|s| {
+                let eff = s.reasoning_effort.as_deref().unwrap_or("off");
+                row(&s.name, format!("{}  ·  effort {eff}", s.model_ref))
+            })
+            .collect(),
+        jump: Some("model".into()),
+    };
+
+    let (allow, ask, deny) = {
+        let r = orchestrator.rules.read().unwrap();
+        (r.allow.len(), r.ask.len(), r.deny.len())
+    };
+    let permissions = SettingsTabView {
+        title: "Permissions".into(),
+        rows: vec![
+            row("mode", mode_label(orchestrator.mode_snapshot())),
+            row("allow rules", allow.to_string()),
+            row("ask rules", ask.to_string()),
+            row("deny rules", deny.to_string()),
+        ],
+        jump: Some("permissions".into()),
+    };
+
+    let theme = SettingsTabView {
+        title: "Theme".into(),
+        rows: vec![row(
+            "preset",
+            pick(|s| s.theme.as_ref().and_then(|t| t.preset.clone())).unwrap_or_else(|| "dark (default)".into()),
+        )],
+        jump: Some("theme".into()),
+    };
+
+    let mut mcp_servers: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for src in [user.as_ref(), project.as_ref()].into_iter().flatten() {
+        for (name, cfg) in &src.mcp_servers {
+            let transport = cfg.transport.clone().unwrap_or_else(|| "stdio".into());
+            mcp_servers.insert(name.clone(), transport);
+        }
+    }
+    let mcp = SettingsTabView {
+        title: "MCP".into(),
+        rows: if mcp_servers.is_empty() {
+            vec![row("servers", "none configured")]
+        } else {
+            mcp_servers.into_iter().map(|(name, transport)| row(&name, transport)).collect()
+        },
+        jump: None,
+    };
+
+    let notifications = SettingsTabView {
+        title: "Notifications".into(),
+        rows: vec![row(
+            "bell",
+            match project.as_ref().and_then(|s| s.notification.as_ref()).or_else(|| user.as_ref().and_then(|s| s.notification.as_ref())) {
+                Some(n) => {
+                    let (complete, approval, error) = n.resolve();
+                    format!("complete:{complete} approval:{approval} error:{error}")
+                }
+                None => "off (default)".into(),
+            },
+        )],
+        jump: None,
+    };
+
+    let snapshot = SettingsSnapshotView {
+        tabs: vec![general, model, permissions, theme, mcp, notifications],
+    };
+    let _ = tx.send(AppEvent::SettingsSnapshot(snapshot)).await;
 }
 
 fn read_settings(dir: &Path) -> Option<stepper_config::SettingsFile> {

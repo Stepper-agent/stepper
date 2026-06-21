@@ -127,8 +127,13 @@ impl AgentLoop<'_> {
             if let Some(cut) = compactor.plan(&messages, projected) {
                 // A worker still compacts its own context, but silently: the
                 // compaction notice is a shared global surface (N workers would
-                // clobber it), so only the main thread announces it.
+                // clobber it), so only the main thread announces it (and fires the
+                // PreCompact hook, so a config hook runs once per compaction).
                 if self.worker.is_none() {
+                    let _ = self
+                        .hooks
+                        .run("PreCompact", None, &serde_json::json!({ "cut": cut }), &self.cx.cancel)
+                        .await;
                     let _ = self.event_tx.send(AppEvent::CompactionStarted).await;
                 }
                 let dropped: Vec<Message> = messages.drain(0..cut).collect();

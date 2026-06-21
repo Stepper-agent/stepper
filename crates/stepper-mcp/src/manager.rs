@@ -107,6 +107,38 @@ impl McpManager {
         self.tools.is_empty()
     }
 
+    /// Resources advertised by every connected server, as `uri  name` lines.
+    /// Best-effort: a server that errors, paginates oddly, or advertises none
+    /// simply contributes nothing (the MCP resources capability is optional).
+    pub async fn list_all_resources(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for svc in &self.services {
+            if let Ok(resources) = svc.list_all_resources().await {
+                for r in resources {
+                    out.push(format!("{}  {}", r.uri, r.name));
+                }
+            }
+        }
+        out
+    }
+
+    /// Prompts advertised by every connected server, as `name — description`
+    /// lines (description omitted when absent). Best-effort, like resources.
+    pub async fn list_all_prompts(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for svc in &self.services {
+            if let Ok(prompts) = svc.list_all_prompts().await {
+                for p in prompts {
+                    match p.description {
+                        Some(d) if !d.is_empty() => out.push(format!("{} — {d}", p.name)),
+                        _ => out.push(p.name),
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub async fn shutdown(self) {
         for service in self.services {
             let _ = service.cancel().await;

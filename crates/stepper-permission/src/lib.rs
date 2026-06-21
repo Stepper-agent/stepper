@@ -331,8 +331,12 @@ fn mode_default_path(
             }
         }
         PermissionMode::Auto => {
-            // In-project read or write is auto-approved; anything outside asks.
-            if in_project {
+            // Read-only tools (read/grep/glob/list) are auto-approved anywhere,
+            // including outside the project — a read can't damage the working
+            // tree, and secret files are still refused at the tool layer. Only
+            // mutating tools (write/edit) are gated by project boundary: allowed
+            // in-project, asked outside.
+            if read_only || in_project {
                 Decision::Allow
             } else {
                 Decision::Ask
@@ -737,6 +741,30 @@ mod tests {
                 PermissionMode::AcceptEdits,
             ),
             Decision::Deny
+        );
+    }
+
+    #[test]
+    fn auto_mode_auto_allows_read_only_outside_project() {
+        let rules = RuleSet::default();
+        // Policy A: a read outside the project is auto-approved in Auto — a read
+        // can't damage the tree and secret paths are still screened at the tool
+        // layer. (Previously Auto gated reads by project, more restrictive than
+        // even Default mode, which already allows reads anywhere.)
+        assert_eq!(
+            evaluate(&PermissionRequest::Read("/elsewhere/notes.md".into()), &rules, &root(), None, PermissionMode::Auto),
+            Decision::Allow,
+        );
+        // … but a WRITE outside the project still asks (only read-only tools are
+        // ungated; mutating tools stay project-bounded).
+        assert_eq!(
+            evaluate(&PermissionRequest::Write("/elsewhere/notes.md".into()), &rules, &root(), None, PermissionMode::Auto),
+            Decision::Ask,
+        );
+        // … and an in-project write is still auto-allowed in Auto.
+        assert_eq!(
+            evaluate(&PermissionRequest::Write(root().join("a.txt")), &rules, &root(), None, PermissionMode::Auto),
+            Decision::Allow,
         );
     }
 }

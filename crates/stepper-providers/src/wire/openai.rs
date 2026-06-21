@@ -32,12 +32,25 @@ pub fn build_request_body(req: &ChatRequest, model: &str, stream: bool) -> Value
         body.insert("stop".into(), json!(req.stop));
     }
     if let Some(effort) = &req.reasoning_effort {
+        // OpenAI `reasoning_effort` tops out at `high`; `xhigh`/`max` are
+        // Anthropic-only levels, so clamp them down rather than 400.
+        let effort = clamp_openai_effort(effort);
         body.insert("reasoning_effort".into(), json!(effort));
     }
     if stream {
         body.insert("stream_options".into(), json!({ "include_usage": true }));
     }
     Value::Object(body)
+}
+
+/// Map a canonical effort level to an OpenAI `reasoning_effort` value. OpenAI
+/// supports `minimal|low|medium|high`; the Anthropic-only `xhigh`/`max` clamp to
+/// `high`, and any other value passes through unchanged.
+pub(crate) fn clamp_openai_effort(level: &str) -> &str {
+    match level {
+        "xhigh" | "max" => "high",
+        other => other,
+    }
 }
 
 fn map_messages(req: &ChatRequest) -> Vec<Value> {

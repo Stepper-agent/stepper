@@ -46,22 +46,94 @@ pub fn build_request_body(req: &ChatRequest, model: &str, stream: bool) -> Value
         body.insert("tools".into(), json!(map_tools(req)));
         body.insert("tool_choice".into(), map_tool_choice(&req.tool_choice));
     }
-    if let Some(t) = req.temperature {
-        body.insert("temperature".into(), json!(t));
-    }
-    if let Some(p) = req.top_p {
-        body.insert("top_p".into(), json!(p));
+    // Modern Claude (Opus ≥ 4.6, Sonnet ≥ 4.6, Fable/Mythos 5) drives reasoning
+    // with adaptive thinking + `output_config.effort` and REMOVES the legacy
+    // `thinking.budget_tokens` and sampling params (`temperature`/`top_p`), all of
+    // which return a 400 on Opus 4.7+. Older Claude and non-Claude anthropic-dialect
+    // proxies keep the legacy surface they already accepted.
+    let adaptive = adaptive_effort_capable(model);
+    if !adaptive {
+        if let Some(t) = req.temperature {
+            body.insert("temperature".into(), json!(t));
+        }
+        if let Some(p) = req.top_p {
+            body.insert("top_p".into(), json!(p));
+        }
     }
     if !req.stop.is_empty() {
         body.insert("stop_sequences".into(), json!(req.stop));
     }
-    if let Some(thinking) = &req.thinking {
+    if adaptive {
+        // An effort level (low|medium|high|xhigh|max) maps to adaptive thinking
+        // plus `output_config.effort`; absent effort leaves thinking off. An
+        // explicit `thinking-budget` (frontmatter) on a modern model can't send a
+        // budget, so honor the "think" intent with adaptive at default depth.
+        if let Some(eff) = req.reasoning_effort.as_deref().and_then(|l| anthropic_effort_value(model, l)) {
+            body.insert("thinking".into(), json!({ "type": "adaptive" }));
+            body.insert("output_config".into(), json!({ "effort": eff }));
+        } else if req.thinking.is_some() {
+            body.insert("thinking".into(), json!({ "type": "adaptive" }));
+        }
+    } else if let Some(thinking) = &req.thinking {
         body.insert(
             "thinking".into(),
             json!({ "type": "enabled", "budget_tokens": thinking.budget_tokens }),
         );
     }
     Value::Object(body)
+}
+
+/// Whether an Anthropic model takes adaptive thinking + `output_config.effort`
+/// (Claude Opus ≥ 4.6, Sonnet ≥ 4.6, Fable/Mythos 5). On these models the legacy
+/// `thinking.budget_tokens` and sampling params return a 400. Older Claude and
+/// non-Claude anthropic-dialect proxies keep the legacy surface, so an unrecognized
+/// model is treated as legacy (no behavior change from before this migration).
+fn adaptive_effort_capable(model: &str) -> bool {
+    let m = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+    if m.contains("fable") || m.contains("mythos") {
+        return true;
+    }
+    for family in ["opus", "sonnet"] {
+        if let Some(v) = family_version(&m, family) {
+            return v >= (4, 6);
+        }
+    }
+    false
+}
+
+/// Extract the `(major, minor)` after a `<family>-` token, e.g. `claude-opus-4-8`
+/// with family `opus` → `(4, 8)`. Only 1–2 digit groups are version components, so
+/// an 8-digit date suffix is NOT mistaken for the minor: `claude-opus-4-20250514`
+/// (the canonical id for Opus 4.0) → `(4, 0)`, classified legacy — not `(4, 20250514)`.
+/// A model with a major but no minor (`...-4-<date>`) reads as `.0`.
+fn family_version(model: &str, family: &str) -> Option<(u32, u32)> {
+    let rest = model.split(family).nth(1)?;
+    let mut nums = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty() && s.len() <= 2)
+        .filter_map(|s| s.parse::<u32>().ok());
+    let major = nums.next()?;
+    Some((major, nums.next().unwrap_or(0)))
+}
+
+/// `xhigh` exists only on Opus ≥ 4.7 and Fable/Mythos 5.
+fn supports_xhigh(model: &str) -> bool {
+    let m = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+    m.contains("fable") || m.contains("mythos") || family_version(&m, "opus").is_some_and(|v| v >= (4, 7))
+}
+
+/// Clamp an effort level to a wire `output_config.effort` value the model supports:
+/// `xhigh` falls back to `high` on models that lack it; `low|medium|high|max` pass
+/// through. An unknown level yields `None` (no effort sent).
+fn anthropic_effort_value(model: &str, level: &str) -> Option<&'static str> {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "low" => Some("low"),
+        "medium" | "med" => Some("medium"),
+        "high" => Some("high"),
+        "max" => Some("max"),
+        "xhigh" => Some(if supports_xhigh(model) { "xhigh" } else { "high" }),
+        _ => None,
+    }
 }
 
 fn map_messages(req: &ChatRequest) -> Vec<Value> {
