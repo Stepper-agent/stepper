@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -36,6 +36,8 @@ futures = "0.3"
 async-trait = "0.1"
 smallvec = "1"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 # TUI stack (versions confirmed resolvable on this toolchain)
 ratatui = { version = "0.30.1", features = ["scrolling-regions"] }
 crossterm = { version = "0.29", features = ["event-stream"] }

@@ -1,12 +1,15 @@
 mod cli;
 mod core_setup;
+mod logging;
 mod onboarding;
 
 use clap::Parser;
 use cli::{AuthCmd, Cli, Command, GlobalArgs};
 use core_setup::{build_orchestrator_with_fallback, DEFAULT_MODEL};
 use std::io::Write;
-use stepper_core::{spawn_core, SessionLimits, SessionRecord, SessionStore};
+use stepper_core::{
+    spawn_core, ConfigProviderResolver, ModelRegistry, ProviderResolver, SessionLimits, SessionRecord, SessionStore,
+};
 use stepper_permission::{PermissionMode, RuleSet};
 use stepper_protocol::{
     Action, AppEvent, ApprovalDecision, ApprovalKind, Mode, ModelView,
@@ -19,6 +22,9 @@ use tokio_util::sync::CancellationToken;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // Keep the appender guard alive for the whole process so logs flush on exit.
+    // `None` (no `--log-level`) installs nothing — the tracing macros stay no-ops.
+    let _log_guard = logging::init_logging(&cli.global);
     match cli.command {
         None | Some(Command::Run) => launch(cli.global).await,
         Some(Command::Auth(args)) => match args.cmd {
@@ -35,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Session(args)) => session_cmd(args, cli.global),
         Some(Command::Mcp(args)) => mcp_cmd(args, cli.global).await,
         Some(Command::Stats(args)) => stats_cmd(args, cli.global),
+        Some(Command::Models(args)) => models_cmd(args, cli.global).await,
     }
 }
 
@@ -874,6 +881,65 @@ fn stats_cmd(args: cli::StatsArgs, global: GlobalArgs) -> anyhow::Result<()> {
         print!("{}", stats.render_text(args.models, args.tools));
     }
     Ok(())
+}
+
+/// `stepper models [provider]`: list the models reachable across the configured
+/// providers (each provider's live list merged with the models.dev catalog),
+/// sorted by `provider/model-id`, one per line. `--verbose` appends context /
+/// output / pricing; `--json` emits the raw entries.
+async fn models_cmd(args: cli::ModelsArgs, global: GlobalArgs) -> anyhow::Result<()> {
+    let cwd = global_cwd(&global)?;
+    let config = stepper_config::Config::load(&cwd).map_err(|e| anyhow::anyhow!("load config: {e}"))?;
+    let factory = ProviderFactory::with_proxy(config.settings.proxy.as_ref())?;
+    let catalog = stepper_providers::models::fetch_catalog(&factory.http_client()).await.ok();
+    let resolver = ConfigProviderResolver::new(config, factory, ModelRegistry::builtin(), None, catalog);
+
+    let mut entries = resolver.list_model_entries().await;
+    if let Some(p) = args.provider.as_deref() {
+        entries.retain(|e| provider_of(&e.model_ref) == p);
+        if entries.is_empty() {
+            anyhow::bail!("no models for provider '{p}' — is it configured under `providers` in setting.json?");
+        }
+    }
+    entries.sort_by(|a, b| a.model_ref.cmp(&b.model_ref));
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+        return Ok(());
+    }
+    let mut out = String::new();
+    for e in &entries {
+        out.push_str(&e.model_ref);
+        if args.verbose {
+            let mut meta = Vec::new();
+            if let Some(c) = e.context_window {
+                meta.push(format!("ctx {}", fmt_tokens(c)));
+            }
+            if let Some(o) = e.max_output_tokens {
+                meta.push(format!("out {}", fmt_tokens(o)));
+            }
+            if let (Some(i), Some(o)) = (e.input_per_mtok, e.output_per_mtok) {
+                meta.push(format!("${i:.2}/${o:.2}"));
+            }
+            if !meta.is_empty() {
+                out.push_str(&format!("  ({})", meta.join(" · ")));
+            }
+        }
+        out.push('\n');
+    }
+    print!("{out}");
+    Ok(())
+}
+
+/// `1234567 → "1M"`, `200000 → "200k"`, small values unchanged.
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
 }
 
 /// The provider segment of a `provider/model-id` ref (or the whole string).

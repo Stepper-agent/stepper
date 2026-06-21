@@ -84,6 +84,42 @@ pub struct GlobalArgs {
     /// would reject any value other than "true"/"false" and abort every command).
     #[arg(long, global = true)]
     pub no_init: bool,
+    /// Write logs to `~/.stepper/logs/stepper.log` at this level (off | error |
+    /// warn | info | debug | trace). Off by default — nothing is written unless
+    /// this is set. The interactive TUI always logs to the file only (never the
+    /// screen); see `--print-logs` for headless runs.
+    #[arg(long, value_enum, global = true)]
+    pub log_level: Option<LogLevelArg>,
+    /// (headless `-p`) Also stream logs to stderr, in addition to the log file.
+    /// Ignored in the interactive TUI, where stderr would corrupt the viewport.
+    #[arg(long, global = true)]
+    pub print_logs: bool,
+}
+
+/// Log verbosity for `--log-level`. `Off` installs no subscriber (the default),
+/// so the `tracing` macros throughout the crates stay no-ops with zero overhead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LogLevelArg {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevelArg {
+    /// The `EnvFilter` directive (also a valid `tracing` level name).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogLevelArg::Off => "off",
+            LogLevelArg::Error => "error",
+            LogLevelArg::Warn => "warn",
+            LogLevelArg::Info => "info",
+            LogLevelArg::Debug => "debug",
+            LogLevelArg::Trace => "trace",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -119,6 +155,24 @@ pub enum Command {
     Mcp(McpArgs),
     /// Cross-session token & cost statistics: `stepper stats`.
     Stats(StatsArgs),
+    /// List models across configured providers: `stepper models [provider]`.
+    Models(ModelsArgs),
+}
+
+#[derive(Args)]
+pub struct ModelsArgs {
+    /// Only list models from this provider id (the `provider/` prefix).
+    pub provider: Option<String>,
+    /// Emit the model entries as JSON instead of the plain `provider/model` list.
+    #[arg(long)]
+    pub json: bool,
+    /// Append each model's context window, max output, and per-Mtok pricing.
+    #[arg(long)]
+    pub verbose: bool,
+    /// Accepted for `opencode models` parity. stepper keeps no on-disk catalog
+    /// cache, so models are always fetched fresh — this flag is a no-op.
+    #[arg(long)]
+    pub refresh: bool,
 }
 
 #[derive(Args)]
@@ -344,6 +398,46 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Stats(a)) if a.tools == Some(3)));
         let cli = Cli::try_parse_from(["stepper", "stats", "--export", "/tmp/s.csv"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Stats(a)) if a.export.as_deref() == Some(std::path::Path::new("/tmp/s.csv"))));
+    }
+
+    #[test]
+    fn models_args_parse() {
+        // Bare `models` → no provider filter, plain output.
+        let cli = Cli::try_parse_from(["stepper", "models"]).unwrap();
+        match cli.command {
+            Some(Command::Models(a)) => {
+                assert_eq!(a.provider, None);
+                assert!(!a.json && !a.verbose && !a.refresh);
+            }
+            _ => panic!("expected models"),
+        }
+        // Positional provider filter + flags.
+        let cli = Cli::try_parse_from(["stepper", "models", "anthropic", "--json", "--verbose"]).unwrap();
+        match cli.command {
+            Some(Command::Models(a)) => {
+                assert_eq!(a.provider.as_deref(), Some("anthropic"));
+                assert!(a.json && a.verbose);
+            }
+            _ => panic!("expected models"),
+        }
+        // `--refresh` is accepted (no-op for parity).
+        let cli = Cli::try_parse_from(["stepper", "models", "--refresh"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Models(a)) if a.refresh && a.provider.is_none()));
+    }
+
+    #[test]
+    fn log_flags_parse_and_default_off() {
+        // Default: no logging.
+        let cli = Cli::try_parse_from(["stepper"]).unwrap();
+        assert_eq!(cli.global.log_level, None);
+        assert!(!cli.global.print_logs);
+        // `--log-level` + `--print-logs` (global, so they attach to any subcommand).
+        let cli = Cli::try_parse_from(["stepper", "--log-level", "debug", "--print-logs", "-p", "hi"]).unwrap();
+        assert_eq!(cli.global.log_level, Some(LogLevelArg::Debug));
+        assert!(cli.global.print_logs);
+        // Level → EnvFilter directive string.
+        assert_eq!(LogLevelArg::Off.as_str(), "off");
+        assert_eq!(LogLevelArg::Trace.as_str(), "trace");
     }
 
     #[test]

@@ -2,6 +2,7 @@ use crate::error::CoreError;
 use crate::model::ModelInfo;
 use stepper_protocol::{ModelChoiceView, ProviderChoiceView};
 use stepper_provider::LlmProvider;
+use stepper_providers::models::ModelEntry;
 
 /// What `connect_provider` derived for a freshly added provider, so the caller
 /// can persist it to `setting.json` (the resolver already injected it live, into
@@ -23,6 +24,12 @@ pub trait ProviderResolver: Send + Sync {
     /// live list endpoint merged with the models.dev catalog. Defaults to none so
     /// convention/test resolvers need not implement discovery.
     async fn list_models(&self) -> Vec<ModelChoiceView> {
+        Vec::new()
+    }
+    /// The same configured-provider models as [`Self::list_models`], but as raw
+    /// catalog entries (context window / pricing intact) for the `stepper models`
+    /// CLI. Defaults to none so convention/test resolvers need not implement it.
+    async fn list_model_entries(&self) -> Vec<ModelEntry> {
         Vec::new()
     }
     /// The `/connect` provider seed: every provider in the models.dev catalog.

@@ -31,7 +31,8 @@ fn fetch_timeout() -> Duration {
 
 /// One selectable model, merged from a provider's live list and (when present)
 /// the models.dev catalog.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelEntry {
     /// `provider/model-id` — exactly what `--model` / `/model` accepts.
     pub model_ref: String,

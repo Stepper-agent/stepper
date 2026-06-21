@@ -135,6 +135,14 @@ impl ProviderResolver for ConfigProviderResolver {
     /// Best-effort — an unreachable endpoint falls back to the catalog list, and
     /// a failed catalog still returns whatever the live endpoints reported.
     async fn list_models(&self) -> Vec<ModelChoiceView> {
+        self.list_model_entries()
+            .await
+            .iter()
+            .map(|e| ModelChoiceView { label: model_label(e), model_ref: e.model_ref.clone() })
+            .collect()
+    }
+
+    async fn list_model_entries(&self) -> Vec<ModelEntry> {
         // The redirect-following client — the auth client's `redirect: none`
         // would turn a CDN/host 3xx into a failed catalog fetch.
         let client = self.factory.http_client();
@@ -188,10 +196,7 @@ impl ProviderResolver for ConfigProviderResolver {
                 catalog,
             )
             .await;
-            out.extend(entries.iter().map(|e| ModelChoiceView {
-                label: model_label(e),
-                model_ref: e.model_ref.clone(),
-            }));
+            out.extend(entries);
         }
         out
     }
