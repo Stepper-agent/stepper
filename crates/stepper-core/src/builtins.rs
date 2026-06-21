@@ -38,6 +38,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("model", "[provider/model]", "show or switch"),
     ("models", "", "pick from fetched models"),
     ("theme", "", "edit the TUI color theme"),
+    ("editor", "[text]", "compose the prompt in $EDITOR"),
     ("effort", "[off|low|medium|high]", "reasoning effort"),
     ("permissions", "", "rules & approvals"),
     ("allow", "<spec>", "add an allow rule (e.g. Bash(cargo *))"),
@@ -160,6 +161,13 @@ pub async fn handle(
             // Colors live TUI-side, so just ask the TUI to open its editor; the
             // chosen theme comes back as `Action::SetTheme` for persistence.
             let _ = tx.send(AppEvent::OpenThemeEditor).await;
+            true
+        }
+        "editor" => {
+            // The editor spawn (terminal handoff) is TUI-only; pass the slash
+            // argument through as the seed (`/editor foo` starts the buffer at
+            // "foo"). The edited result replaces the TUI input box.
+            let _ = tx.send(AppEvent::OpenEditor { seed: args.trim().to_string() }).await;
             true
         }
         "effort" => {

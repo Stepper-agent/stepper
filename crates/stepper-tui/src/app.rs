@@ -35,27 +35,9 @@ pub async fn run(
     // The live theme lives in AppState (the `/theme` editor mutates it).
     let mut state = AppState::new(init);
 
-    let running = Arc::new(AtomicBool::new(true));
+    let mut running = Arc::new(AtomicBool::new(true));
     let (input_tx, mut input_rx) = mpsc::channel::<Event>(256);
-    let reader = {
-        let running = running.clone();
-        std::thread::spawn(move || {
-            while running.load(Ordering::Relaxed) {
-                match event::poll(Duration::from_millis(50)) {
-                    Ok(true) => match event::read() {
-                        Ok(ev) => {
-                            if input_tx.blocking_send(ev).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    },
-                    Ok(false) => {}
-                    Err(_) => break,
-                }
-            }
-        })
-    };
+    let mut reader = spawn_reader(running.clone(), input_tx);
 
     let mut tick = tokio::time::interval(Duration::from_millis(33));
     let mut dirty = true;
@@ -117,12 +99,101 @@ pub async fn run(
             }
             _ = cancel.cancelled() => break,
         }
+
+        // `/editor` or Ctrl+E: hand the terminal to $EDITOR. The reader thread must
+        // stop first (the child inherits stdin, and a live reader would race it for
+        // keystrokes); restart it on a fresh channel afterwards.
+        if let Some(seed) = state.take_editor_request() {
+            running.store(false, Ordering::Relaxed);
+            let _ = reader.join();
+            open_external_editor(&mut guard, &mut state, &seed);
+            running = Arc::new(AtomicBool::new(true));
+            let (tx, rx) = mpsc::channel::<Event>(256);
+            input_rx = rx;
+            reader = spawn_reader(running.clone(), tx);
+            force_clear = true;
+            dirty = true;
+        }
     }
 
     running.store(false, Ordering::Relaxed);
     drop(input_rx);
     let _ = reader.join();
     Ok(())
+}
+
+/// The dedicated blocking input reader: forward terminal events to the loop until
+/// `running` clears or the channel closes. Split out so the event loop can stop it
+/// (to hand stdin to an external editor) and restart it on a fresh channel.
+fn spawn_reader(running: Arc<AtomicBool>, tx: mpsc::Sender<Event>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while running.load(Ordering::Relaxed) {
+            match event::poll(Duration::from_millis(50)) {
+                Ok(true) => match event::read() {
+                    Ok(ev) => {
+                        if tx.blocking_send(ev).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                Ok(false) => {}
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+/// Hand the terminal to `$VISUAL`/`$EDITOR` to compose the prompt. `seed` starts
+/// the temp file; on a clean exit the saved buffer replaces the input box. The
+/// caller must stop the input reader first (the child inherits stdin).
+fn open_external_editor(guard: &mut TerminalGuard, state: &mut AppState, seed: &str) {
+    let Some(editor) = std::env::var_os("VISUAL").or_else(|| std::env::var_os("EDITOR")) else {
+        state.set_notice("set $EDITOR or $VISUAL to compose in an external editor");
+        return;
+    };
+    let editor = editor.to_string_lossy().into_owned();
+    let mut parts = editor.split_whitespace();
+    let Some(prog) = parts.next() else {
+        state.set_notice("$EDITOR is empty");
+        return;
+    };
+    let args: Vec<&str> = parts.collect();
+
+    // O_EXCL + random name (not a predictable /tmp/stepper-prompt-<pid>.md): on a
+    // shared host a fixed path is a symlink-follow / TOCTOU hazard — an attacker
+    // could pre-plant a symlink so the seed write clobbers a victim file, or swap
+    // the file mid-edit to inject text into the prompt. The handle auto-removes the
+    // file on drop.
+    let tmp = match tempfile::Builder::new().prefix("stepper-prompt-").suffix(".md").tempfile() {
+        Ok(t) => t,
+        Err(e) => {
+            state.set_notice(format!("editor: could not create temp file: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(tmp.path(), seed) {
+        state.set_notice(format!("editor: could not write temp file: {e}"));
+        return;
+    }
+
+    guard.suspend();
+    let status = std::process::Command::new(prog)
+        .args(&args)
+        .arg(tmp.path())
+        .current_dir(&state.cwd)
+        .status();
+    guard.resume();
+
+    match status {
+        // Drop a single trailing newline (editors append one) but keep blank lines.
+        Ok(s) if s.success() => match std::fs::read_to_string(tmp.path()) {
+            Ok(content) => state.set_input(content.strip_suffix('\n').unwrap_or(&content)),
+            Err(e) => state.set_notice(format!("editor: could not read result: {e}")),
+        },
+        Ok(_) => state.set_notice("editor exited without saving — input unchanged"),
+        Err(e) => state.set_notice(format!("could not launch editor '{prog}': {e}")),
+    }
 }
 
 /// Handle one terminal event. Returns `Ok(true)` if anything was committed to

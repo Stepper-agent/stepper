@@ -73,6 +73,8 @@ pub fn lower_event(event: &Event, state: &AppState) -> Lowered {
         // are universal fallbacks for terminals that can't (e.g. Apple Terminal).
         KeyCode::Enter if shift || alt => Lowered::Action(Action::InsertNewline),
         KeyCode::Char('j') if ctrl => Lowered::Action(Action::InsertNewline),
+        // Ctrl+E hands the current buffer to $EDITOR (Claude-Code / opencode key).
+        KeyCode::Char('e') if ctrl => Lowered::Action(Action::OpenEditor),
         KeyCode::Enter => submit_action(&state.input_text()),
         // Scroll the live region's in-app scrollback (mouse wheel does the same).
         KeyCode::PageUp => Lowered::Action(Action::ScrollUp(SCROLL_PAGE)),

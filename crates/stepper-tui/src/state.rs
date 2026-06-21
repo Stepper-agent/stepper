@@ -531,6 +531,11 @@ pub struct AppState {
     /// a failed turn would otherwise double-beep). Error and complete bells are
     /// mutually exclusive per turn; the error wins.
     errored_this_turn: bool,
+    /// Pending request to open the external editor (`/editor` or Ctrl+E), with the
+    /// seed text for the temp file. The event loop drains it via
+    /// [`AppState::take_editor_request`] because spawning the editor needs the
+    /// terminal/reader handles it owns. `None` when no request is pending.
+    editor_request: Option<String>,
 }
 
 /// A blank input textarea configured the way every fresh prompt needs it:
@@ -578,6 +583,7 @@ impl AppState {
             notify_on_approval: init.notify_on_approval,
             notify_on_error: init.notify_on_error,
             errored_this_turn: false,
+            editor_request: None,
             commands: init.commands,
             palette_selected: 0,
             esc_armed: false,
@@ -651,6 +657,26 @@ impl AppState {
 
     pub fn input_text(&self) -> String {
         self.textarea.lines().join("\n")
+    }
+
+    /// Take the pending `/editor`/Ctrl+E request (the seed text), if any. The
+    /// event loop calls this each iteration and, when it returns `Some`, hands the
+    /// terminal to `$EDITOR`.
+    pub fn take_editor_request(&mut self) -> Option<String> {
+        self.editor_request.take()
+    }
+
+    /// Replace the input box with `text` (the external editor's saved buffer).
+    pub fn set_input(&mut self, text: &str) {
+        self.textarea = fresh_textarea();
+        if !text.is_empty() {
+            self.textarea.insert_str(text);
+        }
+    }
+
+    /// Show a one-line info notice in the status area (e.g. editor diagnostics).
+    pub fn set_notice(&mut self, text: impl Into<String>) {
+        self.notice = Some(info_notice(text));
     }
 
     // ── `/` slash-command palette (pure; the command list is supplied at init) ──
@@ -1174,6 +1200,9 @@ impl AppState {
                 self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Connect, items)));
             }
             AppEvent::OpenThemeEditor => self.open_theme_editor(),
+            // `/editor [text]` — the event loop opens $EDITOR (it owns the
+            // terminal); the slash argument is the seed.
+            AppEvent::OpenEditor { seed } => self.editor_request = Some(seed),
             AppEvent::EffortChanged(level) => self.effort = level,
             AppEvent::ApiKeyPrompt { provider } => {
                 // Never clobber a live overlay (esp. an approval's oneshot) and
@@ -1326,6 +1355,9 @@ impl AppState {
             // height is known (saturating_sub keeps the raw value recoverable).
             Action::ScrollUp(n) => self.scroll_offset = self.scroll_offset.saturating_add(n),
             Action::ScrollDown(n) => self.scroll_offset = self.scroll_offset.saturating_sub(n),
+            // Ctrl+E: seed the editor with the current buffer; the event loop opens
+            // it (it owns the terminal). TUI-local, never forwarded to core.
+            Action::OpenEditor => self.editor_request = Some(self.input_text()),
             Action::Redraw => {}
         }
         effects
@@ -1450,6 +1482,37 @@ mod tests {
             AgentInfo { name: "refactorer".into(), description: "refactor".into() },
         ];
         s
+    }
+
+    #[test]
+    fn ctrl_e_requests_editor_seeded_with_the_current_buffer() {
+        let mut s = test_state();
+        s.textarea.insert_str("draft prompt");
+        // Ctrl+E lowers to Action::OpenEditor (TUI-local: no Effect::Send).
+        let effects = s.apply_action(Action::OpenEditor);
+        assert!(effects.is_empty(), "OpenEditor is TUI-local, nothing forwarded to core");
+        assert_eq!(s.take_editor_request().as_deref(), Some("draft prompt"));
+        // Drained — a second take yields nothing.
+        assert!(s.take_editor_request().is_none());
+    }
+
+    #[test]
+    fn slash_editor_requests_editor_seeded_with_its_argument() {
+        let mut s = test_state();
+        // `/editor foo bar` arrives from core as OpenEditor { seed: "foo bar" }.
+        s.apply_event(AppEvent::OpenEditor { seed: "foo bar".into() });
+        assert_eq!(s.take_editor_request().as_deref(), Some("foo bar"));
+    }
+
+    #[test]
+    fn set_input_replaces_the_buffer_with_the_editor_result() {
+        let mut s = test_state();
+        s.textarea.insert_str("old");
+        s.set_input("edited\nmulti-line");
+        assert_eq!(s.input_text(), "edited\nmulti-line");
+        // An empty result clears the box.
+        s.set_input("");
+        assert_eq!(s.input_text(), "");
     }
 
     #[test]

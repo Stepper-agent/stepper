@@ -97,6 +97,13 @@ pub enum AppEvent {
     /// TUI fills the editor from its own current theme (colors live TUI-side); a
     /// save comes back as `Action::SetTheme`.
     OpenThemeEditor,
+    /// `/editor [text]` — ask the TUI to compose the next prompt in `$VISUAL`/
+    /// `$EDITOR`. `seed` is the text after `/editor` (empty for a bare `/editor`),
+    /// written to the temp file as the starting buffer. The edited result replaces
+    /// the TUI input box. Spawning the editor (terminal handoff) is TUI-only.
+    OpenEditor {
+        seed: String,
+    },
     /// The session reasoning-effort level changed (`/effort`); `None` = off. The
     /// TUI shows it in the status footer.
     EffortChanged(Option<String>),

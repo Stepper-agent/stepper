@@ -58,6 +58,11 @@ pub enum Action {
         media_type: String,
         data: String,
     },
+    /// Ctrl+E — open the external editor (`$VISUAL`/`$EDITOR`) seeded with the
+    /// current input box. TUI-local: handled entirely in the event loop (terminal
+    /// handoff), never forwarded to core. The `/editor` slash takes the core path
+    /// (`AppEvent::OpenEditor`) so its argument survives as the seed.
+    OpenEditor,
     Quit,
     Redraw,
 }
