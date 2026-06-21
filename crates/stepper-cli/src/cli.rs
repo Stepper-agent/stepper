@@ -16,10 +16,12 @@ pub struct GlobalArgs {
     /// Override the active model, as `provider/model-id`.
     #[arg(long, global = true)]
     pub model: Option<String>,
-    /// Fallback model (`provider/model-id`) tried once when a step's primary
-    /// model fails non-retryably or exhausts its retries.
-    #[arg(long, global = true)]
-    pub fallback_model: Option<String>,
+    /// Fallback model chain (`provider/model-id`), tried in order when a step's
+    /// primary model fails non-retryably or exhausts its retries. Comma-separated
+    /// or repeated (`--fallback-model a,b` or `--fallback-model a --fallback-model
+    /// b`); overrides `setting.json` `fallbackModel`. Capped at 3 links.
+    #[arg(long, global = true, value_delimiter = ',')]
+    pub fallback_model: Vec<String>,
     /// Start in this mode (auto | plan | accept-edits | default | dont-ask).
     #[arg(long, value_enum, global = true)]
     pub mode: Option<ModeArg>,
@@ -146,6 +148,9 @@ pub enum Command {
     Auth(AuthArgs),
     /// Inspect or validate `.stepper/setting.json`.
     Config(ConfigArgs),
+    /// Run a full health check: config, provider keys, MCP servers, the models
+    /// catalog, and the latest release (`stepper doctor`).
+    Doctor,
     /// Scan the repo and generate `.stepper/stepper.md`.
     Init,
     /// Scaffold a new layer: `stepper layer <name>`.
@@ -554,6 +559,24 @@ mod tests {
         let cli = Cli::try_parse_from(["stepper", "-p", "x", "--format", "json"]).unwrap();
         assert_eq!(cli.global.format, Some(OutputFormat::Json));
         assert!(Cli::try_parse_from(["stepper"]).unwrap().global.format.is_none());
+    }
+
+    #[test]
+    fn doctor_command_parses() {
+        let cli = Cli::try_parse_from(["stepper", "doctor"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Doctor)));
+    }
+
+    #[test]
+    fn fallback_model_parses_comma_and_repeat_into_a_chain() {
+        // Comma-separated → ordered chain.
+        let cli = Cli::try_parse_from(["stepper", "--fallback-model", "p/a,p/b"]).unwrap();
+        assert_eq!(cli.global.fallback_model, vec!["p/a", "p/b"]);
+        // Repeated flag accumulates too.
+        let cli = Cli::try_parse_from(["stepper", "--fallback-model", "p/a", "--fallback-model", "p/b"]).unwrap();
+        assert_eq!(cli.global.fallback_model, vec!["p/a", "p/b"]);
+        // Absent → empty.
+        assert!(Cli::try_parse_from(["stepper"]).unwrap().global.fallback_model.is_empty());
     }
 
     #[test]

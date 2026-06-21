@@ -45,6 +45,9 @@ pub struct TuiInit {
     pub notify_on_approval: bool,
     /// Ring the terminal bell when a turn errors.
     pub notify_on_error: bool,
+    /// Where to persist the prompt history (`~/.stepper/history/<project>.json`).
+    /// `None` keeps history in memory only (no `$HOME`). Loaded by the event loop.
+    pub history_path: Option<PathBuf>,
 }
 
 /// A slash command shown in the `/` palette: its name, a one-line description,

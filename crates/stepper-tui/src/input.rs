@@ -164,6 +164,7 @@ mod tests {
             notify_on_complete: false,
             notify_on_approval: false,
             notify_on_error: false,
+            history_path: None,
         })
     }
 

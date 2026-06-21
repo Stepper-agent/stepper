@@ -10,8 +10,8 @@ use stepper_protocol::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::state::{
-    AgentPicker, ApiKeyOverlay, AppState, FilePicker, ListPicker, Overlay, ProcStatus, SettingsView,
-    ShellView, ThemeState,
+    AgentPicker, ApiKeyOverlay, AppState, FilePicker, HistorySearch, ListPicker, Overlay,
+    ProcStatus, SettingsView, ShellView, ThemeState,
 };
 use crate::theme::Theme;
 
@@ -76,6 +76,7 @@ fn ui(frame: &mut Frame, state: &AppState, theme: &Theme) {
             Overlay::Shell(s) => render_shell(frame, rows[0], state, s, theme),
             Overlay::Theme(ts) => render_theme(frame, rows[0], ts, theme),
             Overlay::Settings(v) => render_settings(frame, rows[0], v, theme),
+            Overlay::HistorySearch(s) => render_history_search(frame, rows[0], state, s, theme),
         }
     } else if state.palette_active() {
         render_palette(frame, rows[0], state, theme);
@@ -405,6 +406,51 @@ fn render_list_picker(frame: &mut Frame, area: Rect, picker: &ListPicker, theme:
         };
         lines.push(Line::from(Span::styled(
             format!("  {}", truncate(&picker.items[idx].label, inner.width.saturating_sub(2) as usize)),
+            style,
+        )));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// Ctrl+R reverse search: a filter line over the prompt history, the matched
+/// entries below (most-recent first), with the selection highlighted.
+fn render_history_search(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    search: &HistorySearch,
+    theme: &Theme,
+) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .title(" history ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let hint = format!(
+        "   search: {}▏  ↑↓/^R select · Enter use · Esc cancel",
+        search.query
+    );
+    let mut lines = vec![Line::from(Span::styled(hint, Style::default().fg(theme.muted)))];
+    let entries = state.history_search_rows();
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled("  (no matches)", Style::default().fg(theme.muted))));
+    }
+    // Find the selected row so the visible window scrolls with it.
+    let selected = entries.iter().position(|(_, sel)| *sel).unwrap_or(0);
+    let rows = (inner.height as usize).saturating_sub(1);
+    let offset = scroll_offset(selected, entries.len(), rows);
+    for (entry, is_selected) in entries.iter().skip(offset).take(rows) {
+        let style = if *is_selected {
+            Style::default().fg(theme.accent).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        // History entries can be multi-line; show only the first line, flattened.
+        let first = entry.lines().next().unwrap_or("");
+        lines.push(Line::from(Span::styled(
+            format!("  {}", truncate(first, inner.width.saturating_sub(2) as usize)),
             style,
         )));
     }
@@ -1160,6 +1206,7 @@ mod tests {
             notify_on_complete: false,
             notify_on_approval: false,
             notify_on_error: false,
+            history_path: None,
         })
     }
 

@@ -21,7 +21,8 @@ pub use auth::{
 pub use codex::{CodexTokenStore, CODEX_BASE_URL};
 pub use factory::{ProviderFactory, ProviderKind, ProviderSpec};
 pub use models::{
-    fetch_catalog, list_models, onboarding_models, Catalog, CatalogMeta, ModelEntry, ProviderMeta,
+    fetch_catalog, fetch_latest_release_tag, list_models, onboarding_models, Catalog, CatalogMeta,
+    ModelEntry, ProviderMeta,
 };
 pub use openai_compat::OpenAiCompatAdapter;
 pub use responses::OpenAiResponsesAdapter;

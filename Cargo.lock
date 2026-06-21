@@ -3536,6 +3536,7 @@ dependencies = [
  "image",
  "ratatui",
  "ratatui-textarea",
+ "serde_json",
  "similar",
  "smallvec",
  "stepper-protocol",

@@ -25,6 +25,9 @@ pub enum Effect {
     /// Ring the terminal bell (`\x07`) — a turn finished, an approval is awaited,
     /// or a turn errored, and the matching `notification` trigger is enabled.
     Bell,
+    /// Persist the prompt history to `path` (the event loop does the IO so
+    /// `state.rs` stays pure). Carries the full capped list, written as a JSON array.
+    PersistHistory { path: PathBuf, lines: Vec<String> },
 }
 
 pub type Effects = SmallVec<[Effect; 2]>;
@@ -98,6 +101,29 @@ pub enum Overlay {
     /// `/settings` — the tabbed read-only settings overview. ←/→ switch tabs,
     /// Enter opens the focused tab's editor (jump), Esc closes.
     Settings(SettingsView),
+    /// Ctrl+R — reverse search over the prompt history. Typing filters; ↑/↓ or a
+    /// repeated Ctrl+R move the selection; Enter loads the entry into the input,
+    /// Esc cancels. Holds query + selection; the matched entries live in
+    /// `AppState.history` (indexed by `matches`).
+    HistorySearch(HistorySearch),
+}
+
+/// Reverse-search overlay state (Ctrl+R). `matches` are indices into
+/// `AppState.history`, most-recent first, narrowed by `query`.
+pub struct HistorySearch {
+    pub query: String,
+    pub matches: Vec<usize>,
+    pub selected: usize,
+}
+
+impl HistorySearch {
+    fn move_sel(&mut self, delta: i32) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let n = self.matches.len() as i32;
+        self.selected = (((self.selected as i32 + delta) % n + n) % n) as usize;
+    }
 }
 
 /// `/settings` overlay state: the snapshot plus the focused tab index.
@@ -573,7 +599,23 @@ pub struct AppState {
     /// [`AppState::take_editor_request`] because spawning the editor needs the
     /// terminal/reader handles it owns. `None` when no request is pending.
     editor_request: Option<String>,
+    /// Submitted prompts (oldest → newest), recalled with ↑/↓ and Ctrl+R. Loaded
+    /// from `history_path` at startup and appended on each submit.
+    pub history: Vec<String>,
+    /// Where the history persists (`~/.stepper/history/<project>.json`). `None`
+    /// keeps history in-memory only (no `$HOME`); the event loop does the IO.
+    history_path: Option<PathBuf>,
+    /// Current position while browsing history with ↑/↓ (index into `history`);
+    /// `None` when editing fresh input rather than recalling.
+    history_nav: Option<usize>,
+    /// The in-progress input stashed when ↑ first enters history browsing, so ↓
+    /// past the newest entry restores what the user was typing.
+    history_draft: Option<String>,
 }
+
+/// Cap on persisted prompt history (newest kept). Bounds the on-disk file and
+/// the in-memory list.
+const HISTORY_MAX: usize = 500;
 
 /// A blank input textarea configured the way every fresh prompt needs it:
 /// no emulated cursor (the event loop draws the real one for correct CJK / wide
@@ -623,6 +665,10 @@ impl AppState {
             notify_on_error: init.notify_on_error,
             errored_this_turn: false,
             editor_request: None,
+            history: Vec::new(),
+            history_path: init.history_path,
+            history_nav: None,
+            history_draft: None,
             commands: init.commands,
             palette_selected: 0,
             esc_armed: false,
@@ -716,6 +762,156 @@ impl AppState {
     /// Show a one-line info notice in the status area (e.g. editor diagnostics).
     pub fn set_notice(&mut self, text: impl Into<String>) {
         self.notice = Some(info_notice(text));
+    }
+
+    // ── prompt history (↑/↓ recall + Ctrl+R reverse search) ──
+
+    /// Seed the in-memory history from disk (called once at startup, after the
+    /// event loop has read the file). Already-capped on save, but re-cap defensively.
+    pub fn set_history(&mut self, mut history: Vec<String>) {
+        if history.len() > HISTORY_MAX {
+            let overflow = history.len() - HISTORY_MAX;
+            history.drain(0..overflow);
+        }
+        self.history = history;
+    }
+
+    /// Record a submitted prompt: reset the browse cursor, drop consecutive
+    /// duplicates, cap, and return the persistence effect (when a path is set).
+    fn record_history(&mut self, entry: String) -> Option<Effect> {
+        self.history_nav = None;
+        self.history_draft = None;
+        if entry.trim().is_empty() || self.history.last() == Some(&entry) {
+            return None;
+        }
+        self.history.push(entry);
+        if self.history.len() > HISTORY_MAX {
+            let overflow = self.history.len() - HISTORY_MAX;
+            self.history.drain(0..overflow);
+        }
+        self.history_path
+            .clone()
+            .map(|path| Effect::PersistHistory { path, lines: self.history.clone() })
+    }
+
+    /// Recall the previous (older) history entry into the input. Returns whether
+    /// the key was consumed (`false` → the caller forwards ↑ to the textarea so it
+    /// still moves the cursor when there's no history).
+    pub fn history_prev(&mut self) -> bool {
+        if self.history.is_empty() {
+            return false;
+        }
+        let idx = match self.history_nav {
+            // Entering browse mode: stash the in-progress draft first.
+            None => {
+                self.history_draft = Some(self.input_text());
+                self.history.len() - 1
+            }
+            // Already at the oldest entry — stay put (don't fall off the end).
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.history_nav = Some(idx);
+        self.set_input(&self.history[idx].clone());
+        // Park the cursor on the first row so a subsequent ↑ (gated on row 0) keeps
+        // walking older even through a multi-line recalled entry, instead of the
+        // caret getting stuck mid-entry (`set_input` leaves it at the end).
+        self.textarea.move_cursor(ratatui_textarea::CursorMove::Top);
+        true
+    }
+
+    /// Recall the next (newer) history entry; past the newest, restore the stashed
+    /// draft and leave browse mode. Returns whether the key was consumed.
+    pub fn history_next(&mut self) -> bool {
+        let Some(i) = self.history_nav else {
+            return false;
+        };
+        if i + 1 < self.history.len() {
+            self.history_nav = Some(i + 1);
+            self.set_input(&self.history[i + 1].clone());
+        } else {
+            self.history_nav = None;
+            let draft = self.history_draft.take().unwrap_or_default();
+            self.set_input(&draft);
+        }
+        true
+    }
+
+    /// Open the Ctrl+R reverse-search overlay (a no-op notice when history is empty).
+    pub fn open_history_search(&mut self) {
+        if self.history.is_empty() {
+            self.set_notice("no prompt history yet");
+            return;
+        }
+        let mut search = HistorySearch { query: String::new(), matches: Vec::new(), selected: 0 };
+        self.refilter_history_search(&mut search);
+        self.open_overlay(Overlay::HistorySearch(search));
+    }
+
+    /// Recompute a search's matches (most-recent first, case-insensitive substring).
+    fn refilter_history_search(&self, search: &mut HistorySearch) {
+        let needle = search.query.to_lowercase();
+        search.matches = self
+            .history
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, e)| needle.is_empty() || e.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect();
+        if search.selected >= search.matches.len() {
+            search.selected = 0;
+        }
+    }
+
+    /// Type a char into the reverse-search query and re-filter.
+    pub fn history_search_push(&mut self, c: char) {
+        if let Some(Overlay::HistorySearch(mut search)) = self.overlay.take() {
+            search.query.push(c);
+            self.refilter_history_search(&mut search);
+            self.overlay = Some(Overlay::HistorySearch(search));
+        }
+    }
+
+    /// Backspace the reverse-search query and re-filter.
+    pub fn history_search_backspace(&mut self) {
+        if let Some(Overlay::HistorySearch(mut search)) = self.overlay.take() {
+            search.query.pop();
+            self.refilter_history_search(&mut search);
+            self.overlay = Some(Overlay::HistorySearch(search));
+        }
+    }
+
+    /// Move the reverse-search selection (Ctrl+R / ↑ / ↓).
+    pub fn history_search_move(&mut self, delta: i32) {
+        if let Some(Overlay::HistorySearch(search)) = &mut self.overlay {
+            search.move_sel(delta);
+        }
+    }
+
+    /// Accept the highlighted entry: load it into the input and close the overlay.
+    pub fn history_search_accept(&mut self) {
+        let pick = match &self.overlay {
+            Some(Overlay::HistorySearch(s)) => s.matches.get(s.selected).map(|&i| self.history[i].clone()),
+            _ => None,
+        };
+        if let Some(text) = pick {
+            self.set_input(&text);
+        }
+        self.overlay_close();
+    }
+
+    /// The (entry, is_selected) rows for the reverse-search overlay renderer.
+    pub fn history_search_rows(&self) -> Vec<(&str, bool)> {
+        match &self.overlay {
+            Some(Overlay::HistorySearch(s)) => s
+                .matches
+                .iter()
+                .enumerate()
+                .filter_map(|(row, &i)| self.history.get(i).map(|e| (e.as_str(), row == s.selected)))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     // ── `/` slash-command palette (pure; the command list is supplied at init) ──
@@ -938,6 +1134,7 @@ impl AppState {
                     | Overlay::Shell(_)
                     | Overlay::Theme(_)
                     | Overlay::Settings(_)
+                    | Overlay::HistorySearch(_)
             )
         )
     }
@@ -1463,6 +1660,15 @@ impl AppState {
         if text_empty {
             return;
         }
+        // Record the prompt as the user typed it (a shell line keeps its `!`), so
+        // ↑/Ctrl+R recall reproduces the original input.
+        let entry = match &item {
+            Queued::Chat(t) => t.clone(),
+            Queued::Shell(c) => format!("!{c}"),
+        };
+        if let Some(eff) = self.record_history(entry) {
+            effects.push(eff);
+        }
         self.textarea = fresh_textarea();
         // Pasted images were forwarded to core as they were pasted; the next turn
         // consumes them, so clear the staged indicator now.
@@ -1563,6 +1769,7 @@ mod tests {
             notify_on_complete: false,
             notify_on_approval: false,
             notify_on_error: false,
+            history_path: None,
         })
     }
 
@@ -1605,6 +1812,93 @@ mod tests {
         // An empty result clears the box.
         s.set_input("");
         assert_eq!(s.input_text(), "");
+    }
+
+    #[test]
+    fn history_records_submitted_prompts_dedups_and_keeps_shell_prefix() {
+        let mut s = test_state();
+        s.apply_action(Action::SubmitInput("first".into()));
+        // A consecutive duplicate is not stored twice.
+        s.apply_action(Action::SubmitInput("first".into()));
+        s.apply_action(Action::SubmitInput("second".into()));
+        // A shell line is recorded with its `!` so recall reproduces the input.
+        s.apply_action(Action::RunShell("ls -la".into()));
+        assert_eq!(s.history, vec!["first", "second", "!ls -la"]);
+        // Blank input records nothing.
+        s.apply_action(Action::SubmitInput("   ".into()));
+        assert_eq!(s.history.len(), 3);
+    }
+
+    #[test]
+    fn history_up_down_recalls_entries_and_restores_the_draft() {
+        let mut s = test_state();
+        s.set_history(vec!["one".into(), "two".into()]);
+        s.textarea.insert_str("draft");
+        // ↑ walks older; stays at the oldest.
+        assert!(s.history_prev());
+        assert_eq!(s.input_text(), "two");
+        s.history_prev();
+        assert_eq!(s.input_text(), "one");
+        s.history_prev();
+        assert_eq!(s.input_text(), "one", "stays at the oldest entry");
+        // ↓ walks newer; past the newest restores the stashed draft.
+        s.history_next();
+        assert_eq!(s.input_text(), "two");
+        s.history_next();
+        assert_eq!(s.input_text(), "draft", "the in-progress draft is restored");
+        // ↓ with nothing being browsed is a no-op (not consumed).
+        assert!(!s.history_next());
+    }
+
+    #[test]
+    fn history_prev_on_empty_history_is_not_consumed() {
+        let mut s = test_state();
+        assert!(!s.history_prev(), "no history → ↑ falls through to the textarea");
+    }
+
+    #[test]
+    fn history_prev_parks_cursor_on_first_row_so_multiline_entries_can_be_walked() {
+        let mut s = test_state();
+        s.set_history(vec!["older".into(), "a\nb\nc".into()]);
+        // Recall the newest (multi-line) entry; the caret must land on row 0 so the
+        // next ↑ (gated on row 0 in app.rs) keeps walking older.
+        s.history_prev();
+        assert_eq!(s.input_text(), "a\nb\nc");
+        assert_eq!(s.textarea.cursor().0, 0, "caret parked on the first row after recall");
+        // A second ↑ walks to the older entry rather than getting stuck mid-entry.
+        s.history_prev();
+        assert_eq!(s.input_text(), "older");
+    }
+
+    #[test]
+    fn ctrl_r_search_filters_and_accepts_into_the_input() {
+        let mut s = test_state();
+        s.set_history(vec!["build".into(), "test all".into(), "deploy".into()]);
+        s.open_history_search();
+        assert!(matches!(s.overlay, Some(Overlay::HistorySearch(_))));
+        for c in "all".chars() {
+            s.history_search_push(c);
+        }
+        let rows = s.history_search_rows();
+        assert_eq!(rows.len(), 1, "only 'test all' contains 'all'");
+        assert_eq!(rows[0].0, "test all");
+        s.history_search_accept();
+        assert_eq!(s.input_text(), "test all");
+        assert!(s.overlay.is_none(), "accepting closes the overlay");
+    }
+
+    #[test]
+    fn submit_emits_a_persist_effect_carrying_the_path_and_lines() {
+        let mut s = test_state();
+        s.history_path = Some(PathBuf::from("/tmp/hist.json"));
+        let effects = s.apply_action(Action::SubmitInput("remember me".into()));
+        let persisted = effects.iter().find_map(|e| match e {
+            Effect::PersistHistory { path, lines } => Some((path.clone(), lines.clone())),
+            _ => None,
+        });
+        let (path, lines) = persisted.expect("a PersistHistory effect when a path is set");
+        assert_eq!(path, PathBuf::from("/tmp/hist.json"));
+        assert_eq!(lines, vec!["remember me"]);
     }
 
     #[test]

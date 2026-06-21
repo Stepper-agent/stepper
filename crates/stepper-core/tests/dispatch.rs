@@ -483,7 +483,7 @@ async fn dispatched_subagents_cannot_use_a_tool_the_calling_layer_denied() {
         dispatch_enabled: true,
         dispatch_concurrency: 8,
         dispatch_step_cap: None,        limits: stepper_core::SessionLimits::default(),
-        fallback_model: None,
+        fallback_models: Vec::new(),
         resume_seed: Vec::new(),
         sandbox_writable_roots: None,
     };
@@ -549,7 +549,7 @@ async fn enabling_dispatch_lets_the_model_fan_out_subagents() {
         dispatch_enabled: true,
         dispatch_concurrency: 8,
         dispatch_step_cap: None,        limits: stepper_core::SessionLimits::default(),
-        fallback_model: None,
+        fallback_models: Vec::new(),
         resume_seed: Vec::new(),
         sandbox_writable_roots: None,
     };

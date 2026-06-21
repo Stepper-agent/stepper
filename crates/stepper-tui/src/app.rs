@@ -32,8 +32,12 @@ pub async fn run(
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut guard = TerminalGuard::new(init.inline_height);
+    // Load the persisted prompt history (IO here keeps `state.rs` pure) before the
+    // state takes ownership of `init`.
+    let history = load_history_file(init.history_path.as_deref());
     // The live theme lives in AppState (the `/theme` editor mutates it).
     let mut state = AppState::new(init);
+    state.set_history(history);
 
     let mut running = Arc::new(AtomicBool::new(true));
     let (input_tx, mut input_rx) = mpsc::channel::<Event>(256);
@@ -120,6 +124,14 @@ pub async fn run(
     drop(input_rx);
     let _ = reader.join();
     Ok(())
+}
+
+/// Load the persisted prompt history (a JSON array of strings). A missing or
+/// unreadable/corrupt file yields an empty history rather than failing the launch.
+fn load_history_file(path: Option<&std::path::Path>) -> Vec<String> {
+    path.and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|body| serde_json::from_str::<Vec<String>>(&body).ok())
+        .unwrap_or_default()
 }
 
 /// The dedicated blocking input reader: forward terminal events to the loop until
@@ -335,6 +347,34 @@ fn handle_terminal_event(
         return Ok(false);
     }
 
+    // Ctrl+R opens reverse search over the prompt history (shell convention).
+    if let Event::Key(k) = &ev
+        && k.code == KeyCode::Char('r')
+        && k.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        state.open_history_search();
+        return Ok(false);
+    }
+
+    // ↑/↓ recall the prompt history when the cursor is on the boundary row (↑ on
+    // the first line, ↓ on the last) — otherwise they move within a multi-line
+    // draft. `history_*` return false (e.g. empty history / not browsing) so the
+    // key falls through to the textarea as a plain cursor move. Gated on no overlay
+    // so it never overwrites a draft hidden behind an active Approval (whose keys
+    // are NOT captured by `overlay_captures_keys`, so they reach here).
+    if let Event::Key(k) = &ev
+        && state.overlay.is_none()
+    {
+        let row = state.textarea.cursor().0;
+        let last_row = state.textarea.lines().len().saturating_sub(1);
+        if k.code == KeyCode::Up && row == 0 && state.history_prev() {
+            return Ok(false);
+        }
+        if k.code == KeyCode::Down && row == last_row && state.history_next() {
+            return Ok(false);
+        }
+    }
+
     match lower_event(&ev, state) {
         // An action's effects can include a scrollback commit (the prompt echo),
         // so run them through `run_effects` rather than only forwarding sends.
@@ -480,6 +520,27 @@ fn handle_overlay_key(state: &mut AppState, action_tx: &ActionTx, ev: &Event) {
                     None => state.overlay_close(),
                 },
                 KeyCode::Esc | KeyCode::Char('q') => state.overlay_close(),
+                _ => {}
+            }
+        }
+        return;
+    }
+    // Ctrl+R reverse search: type to filter, ↑/↓ (or another Ctrl+R) move the
+    // selection, Enter loads the entry into the input, Esc/Ctrl+C cancel.
+    if matches!(state.overlay, Some(Overlay::HistorySearch(_))) {
+        if let Event::Key(k) = ev {
+            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+            match k.code {
+                KeyCode::Up => state.history_search_move(-1),
+                KeyCode::Down => state.history_search_move(1),
+                // A repeated Ctrl+R steps to the next (older) match, shell-style.
+                KeyCode::Char('r') if ctrl => state.history_search_move(1),
+                KeyCode::Backspace => state.history_search_backspace(),
+                KeyCode::Enter => state.history_search_accept(),
+                KeyCode::Esc => state.overlay_close(),
+                KeyCode::Char(c) if !ctrl && !k.modifiers.contains(KeyModifiers::ALT) => {
+                    state.history_search_push(c)
+                }
                 _ => {}
             }
         }
@@ -683,6 +744,15 @@ fn run_effects(
                 let _ = out.write_all(b"\x07");
                 let _ = out.flush();
             }
+            Effect::PersistHistory { path, lines } => {
+                // Best-effort: a failed write must never disrupt the session.
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Ok(body) = serde_json::to_string(&lines) {
+                    let _ = std::fs::write(&path, body);
+                }
+            }
         }
     }
     Ok(committed)
@@ -718,6 +788,7 @@ mod tests {
             notify_on_complete: false,
             notify_on_approval: false,
             notify_on_error: false,
+            history_path: None,
         });
         s.overlay = Some(Overlay::ApiKey(ApiKeyOverlay {
             provider: "anthropic".into(),

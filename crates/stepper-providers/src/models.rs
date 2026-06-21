@@ -138,6 +138,40 @@ pub async fn fetch_catalog(client: &reqwest::Client) -> Result<Catalog, Provider
     Ok(parse_catalog(&root))
 }
 
+/// Fetch the latest published release tag for a GitHub `owner/repo` (the
+/// `tag_name` of `/releases/latest`), for `stepper doctor`'s update check. The
+/// client's User-Agent (set by `ProviderFactory`) satisfies GitHub's UA
+/// requirement. A failure is returned so the caller can degrade gracefully.
+pub async fn fetch_latest_release_tag(
+    client: &reqwest::Client,
+    repo: &str,
+) -> Result<String, ProviderError> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .timeout(fetch_timeout())
+        .send()
+        .await
+        .map_err(error::transport)?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(error::transport)?;
+    if !status.is_success() {
+        return Err(error::api_error_from_body(status.as_u16(), &body));
+    }
+    parse_release_tag(&body).ok_or_else(|| error::decode("no tag_name in release"))
+}
+
+/// Pull `tag_name` out of a GitHub `/releases/latest` JSON body. `None` when the
+/// body isn't JSON or has no string `tag_name`.
+pub fn parse_release_tag(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("tag_name")?
+        .as_str()
+        .map(String::from)
+}
+
 /// Parse the models.dev document shape:
 /// `{ "<provider>": { "models": { "<id>": { name, limit:{context,output}, cost:{input,output} } } } }`.
 pub fn parse_catalog(root: &serde_json::Value) -> Catalog {
@@ -326,6 +360,15 @@ mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn parse_release_tag_reads_tag_name_or_none() {
+        assert_eq!(parse_release_tag(r#"{"tag_name":"v0.13.0","name":"x"}"#).as_deref(), Some("v0.13.0"));
+        // No tag_name, wrong type, or non-JSON → None (the update check degrades).
+        assert!(parse_release_tag(r#"{"name":"x"}"#).is_none());
+        assert!(parse_release_tag(r#"{"tag_name":123}"#).is_none());
+        assert!(parse_release_tag("not json").is_none());
+    }
 
     #[test]
     fn onboarding_models_filters_to_tool_call_newest_first() {

@@ -26,6 +26,12 @@ pub struct SettingsFile {
     pub mode: Option<String>,
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Fallback model chain (`provider/model-id`), tried in order when a step's
+    /// primary model fails non-retryably or exhausts its retries. A bare string
+    /// is a single fallback; an array is the ordered chain. `--fallback-model`
+    /// (comma-separated) overrides this for a run. See `fallback_models()`.
+    #[serde(default)]
+    pub fallback_model: Option<FallbackModels>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -93,6 +99,31 @@ pub struct SettingsFile {
     /// the environment; `disabled: true` forces a direct connection.
     #[serde(default)]
     pub proxy: Option<ProxyConfig>,
+}
+
+/// `setting.json` `fallbackModel`: a single `provider/model-id` string or an
+/// ordered array of them. Normalize with [`FallbackModels::into_vec`].
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum FallbackModels {
+    /// `fallbackModel: "provider/model-id"`.
+    One(String),
+    /// `fallbackModel: ["provider/a", "provider/b"]` (tried in order).
+    Many(Vec<String>),
+}
+
+impl FallbackModels {
+    /// Flatten to the ordered chain, trimming each entry and dropping empties.
+    pub fn into_vec(self) -> Vec<String> {
+        let trim_keep = |m: String| {
+            let t = m.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        };
+        match self {
+            FallbackModels::One(m) => trim_keep(m).into_iter().collect(),
+            FallbackModels::Many(v) => v.into_iter().filter_map(trim_keep).collect(),
+        }
+    }
 }
 
 /// `setting.json` `lsp`: a master on/off switch or a map of per-server overrides
@@ -604,5 +635,27 @@ mod tests {
         assert!(s.sandbox.as_ref().unwrap().enabled);
         let back = serde_json::to_value(&s).unwrap();
         assert_eq!(back["sandbox"]["enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn fallback_model_accepts_a_string_or_an_array() {
+        // Absent by default.
+        assert!(serde_json::from_str::<SettingsFile>("{}").unwrap().fallback_model.is_none());
+        // Bare string → one-element chain.
+        let one: SettingsFile = serde_json::from_str(r#"{"fallbackModel":"anthropic/claude-opus-4-8"}"#).unwrap();
+        assert_eq!(one.fallback_model.unwrap().into_vec(), vec!["anthropic/claude-opus-4-8"]);
+        // Array → ordered chain.
+        let many: SettingsFile =
+            serde_json::from_str(r#"{"fallbackModel":["openai/gpt-5","anthropic/claude-sonnet-4-6"]}"#).unwrap();
+        assert_eq!(
+            many.fallback_model.unwrap().into_vec(),
+            vec!["openai/gpt-5", "anthropic/claude-sonnet-4-6"]
+        );
+        // Empty/blank entries are dropped, and surrounding whitespace is trimmed
+        // (so a `"a, b"`-style value doesn't keep a leading space on `b`).
+        assert!(FallbackModels::One("  ".into()).into_vec().is_empty());
+        assert_eq!(FallbackModels::Many(vec!["a".into(), "".into()]).into_vec(), vec!["a"]);
+        assert_eq!(FallbackModels::One("  p/m  ".into()).into_vec(), vec!["p/m"]);
+        assert_eq!(FallbackModels::Many(vec!["p/a".into(), " p/b ".into()]).into_vec(), vec!["p/a", "p/b"]);
     }
 }

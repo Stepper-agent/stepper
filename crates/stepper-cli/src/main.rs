@@ -34,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
             AuthCmd::DeleteKey { provider } => delete_key(&provider),
         },
         Some(Command::Config(args)) => config_cmd(args, cli.global),
+        Some(Command::Doctor) => doctor_cmd(cli.global).await,
         Some(Command::Init) => init_cmd(cli.global),
         Some(Command::Layer { name }) => scaffold_layer_cmd(&name, cli.global),
         Some(Command::Cmd { name }) => scaffold_command_cmd(&name, cli.global),
@@ -398,6 +399,168 @@ fn config_cmd(args: cli::ConfigArgs, global: GlobalArgs) -> anyhow::Result<()> {
     }
 }
 
+/// `stepper doctor`: a full health check. Validates the config, checks each
+/// provider's API key, resolves the default model + fallback chain, attempts to
+/// connect every MCP server, fetches the models.dev catalog, and compares the
+/// running version to the latest published release. Prints a per-check report and
+/// exits non-zero only on a hard problem (invalid config, an unresolvable default
+/// model) — missing keys / unreachable servers are warnings, not failures.
+async fn doctor_cmd(global: GlobalArgs) -> anyhow::Result<()> {
+    let cwd = global_cwd(&global)?;
+    println!("stepper {} — doctor", env!("CARGO_PKG_VERSION"));
+    println!("  cwd: {}", cwd.display());
+    let mut errors = 0usize;
+
+    // 1. Config: structural + value validation, plus the permission ruleset.
+    let mut config = match stepper_config::Config::load(&cwd) {
+        Ok(cfg) => {
+            let mut problems = cfg.validate_values();
+            let perms = &cfg.settings.permissions;
+            match RuleSet::from_lists_checked(&perms.allow, &perms.ask, &perms.deny) {
+                Ok((_, dropped)) => problems.extend(
+                    dropped.iter().map(|s| format!("malformed allow/ask rule (ignored): {s}")),
+                ),
+                Err(e) => problems.push(format!("permissions: {e}")),
+            }
+            if problems.is_empty() {
+                println!(
+                    "✓ config: valid ({} step(s), {} provider(s))",
+                    cfg.settings.step.len(),
+                    cfg.settings.providers.len()
+                );
+            } else {
+                errors += 1;
+                println!("✗ config: {} problem(s)", problems.len());
+                for p in &problems {
+                    println!("    - {p}");
+                }
+            }
+            cfg
+        }
+        // Without a loadable config there's nothing further to check.
+        Err(e) => anyhow::bail!("✗ config: failed to load: {e}"),
+    };
+
+    // 2. Provider API keys (env / keyring / explicit cfg). A missing key is only a
+    // warning — localhost and OAuth providers don't need one. The check mirrors the
+    // factory exactly: `resolve_provider` first expands the config key (`{env:VAR}`
+    // / `{file:}` / the `null` sentinel → None), then `resolve_key` layers env +
+    // keyring on top — so an unset `{env:VAR}` is NOT falsely reported as resolved.
+    if config.settings.providers.is_empty() {
+        println!("· providers: none configured (convention defaults + env keys apply)");
+    } else {
+        let names: Vec<String> = config.settings.providers.keys().cloned().collect();
+        for name in &names {
+            let explicit = config.resolve_provider(&format!("{name}/_")).ok().and_then(|p| p.api_key);
+            if stepper_providers::resolve_key(name, explicit.as_deref()).is_some() {
+                println!("✓ provider {name}: key resolved");
+            } else {
+                println!("· provider {name}: no key (env/keyring/config) — ok for local/oauth");
+            }
+        }
+    }
+
+    // Read everything config-derived BEFORE the resolver consumes the config.
+    let proxy = config.settings.proxy.clone();
+    let mcp_servers = config.settings.mcp_servers.clone();
+    let base_dir = config.project_root.clone().unwrap_or_else(|| cwd.clone());
+    let default_model = config
+        .settings
+        .default_model
+        .clone()
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let fallback_models = core_setup::resolve_fallback_models(&global.fallback_model, &config);
+    // Mirror `launch`: synthesize the convention provider for the default model +
+    // each fallback so doctor checks what an actual run would resolve (without
+    // this, the convention default like `ollama-cloud/...` reports a false error).
+    core_setup::ensure_provider(&mut config, &default_model);
+    for fb in &fallback_models {
+        core_setup::ensure_provider(&mut config, fb);
+    }
+
+    let factory = ProviderFactory::with_proxy(proxy.as_ref())?;
+    // `http_client()` is a cheap clone, so the catalog + release fetches keep a
+    // client of their own while `factory` moves into the resolver below.
+    let client = factory.http_client();
+
+    // 6. models.dev catalog (network) — reused by the resolver for overlays.
+    let catalog = match stepper_providers::models::fetch_catalog(&client).await {
+        Ok(c) => {
+            println!("✓ models.dev catalog: {} provider(s)", c.provider_seeds().len());
+            Some(c)
+        }
+        Err(e) => {
+            println!("! models.dev catalog: fetch failed ({e})");
+            None
+        }
+    };
+    let resolver =
+        ConfigProviderResolver::new(config, factory, ModelRegistry::builtin(), None, catalog);
+
+    // 3. Default model + fallback chain resolve cleanly (key + provider kind). A
+    // missing key is a warning (consistent with step 2 and the fresh-checkout
+    // convention default that exists precisely for a keyless start); only a
+    // genuinely unresolvable default (unknown provider kind, malformed ref) fails.
+    match resolver.resolve(&default_model) {
+        Ok(_) => println!("✓ default model {default_model}: resolves"),
+        Err(stepper_core::CoreError::Provider(stepper_providers::ProviderError::Auth(_))) => {
+            println!("! default model {default_model}: no API key reachable (set a key to use it)");
+        }
+        Err(e) => {
+            errors += 1;
+            println!("✗ default model {default_model}: {e}");
+        }
+    }
+    for fb in &fallback_models {
+        match resolver.resolve(fb) {
+            Ok(_) => println!("✓ fallback model {fb}: resolves"),
+            Err(e) => println!("! fallback model {fb}: {e}"),
+        }
+    }
+
+    // 4. MCP servers — a real connection attempt per server (network/process).
+    if mcp_servers.is_empty() {
+        println!("· mcp: no servers configured");
+    } else {
+        for (name, server) in &mcp_servers {
+            if server.enabled == Some(false) {
+                println!("· mcp {name}: disabled");
+                continue;
+            }
+            let one = std::collections::BTreeMap::from([(name.clone(), server.clone())]);
+            let mgr = stepper_mcp::McpManager::connect(&one, &base_dir, proxy.as_ref()).await;
+            let count = mgr.tool_names().len();
+            if count == 0 {
+                println!("! mcp {name}: connected with no tools, or failed to connect");
+            } else {
+                println!("✓ mcp {name}: {count} tool(s)");
+            }
+            mgr.shutdown().await;
+        }
+    }
+
+    // 7. Latest release (network) — informational only.
+    match stepper_providers::fetch_latest_release_tag(&client, "Stepper-agent/stepper").await {
+        Ok(tag) => {
+            let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+            if tag == current {
+                println!("✓ version: {current} (latest)");
+            } else {
+                println!("! version: running {current}, latest is {tag}");
+            }
+        }
+        Err(e) => println!("· version: update check skipped ({e})"),
+    }
+
+    println!();
+    if errors == 0 {
+        println!("doctor: no problems found");
+        Ok(())
+    } else {
+        anyhow::bail!("doctor: {errors} problem(s) found");
+    }
+}
+
 fn init_cmd(global: GlobalArgs) -> anyhow::Result<()> {
     let cwd = global
         .cwd
@@ -562,7 +725,7 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
 
     let (mut orchestrator, _mcp) = build_orchestrator_with_fallback(
         effective_model.as_deref(),
-        global.fallback_model.as_deref(),
+        &global.fallback_model,
         cli_mode,
         global.effort.clone(),
         cwd.clone(),
@@ -594,6 +757,8 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         .iter()
         .map(|a| AgentInfo { name: a.name.clone(), description: a.description.clone() })
         .collect();
+    // Per-project prompt-history file, resolved before the orchestrator moves.
+    let history_path = history_file_path(&orchestrator.project_root);
     let event_rx = spawn_core(orchestrator, session, action_rx, cancel.clone());
     if let Some(provider) = key_prompt {
         let _ = action_tx
@@ -654,8 +819,34 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         notify_on_complete: notify.0,
         notify_on_approval: notify.1,
         notify_on_error: notify.2,
+        history_path,
     };
     run_tui(event_rx, action_tx, init, cancel).await
+}
+
+/// The per-project prompt-history file: `~/.stepper/history/<slug>-<hash>.json`.
+/// The slug (project dir name) keeps it human-recognizable; the stable hash of
+/// the full path disambiguates same-named projects. `None` without `$HOME` (then
+/// history stays in memory only).
+fn history_file_path(project_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let home = std::env::var_os("HOME")?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    project_root.hash(&mut hasher);
+    let hash = hasher.finish();
+    let slug: String = project_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    Some(
+        std::path::PathBuf::from(home)
+            .join(".stepper")
+            .join("history")
+            .join(format!("{slug}-{hash:016x}.json")),
+    )
 }
 
 /// Headless one-shot: drive the real agent and stream assistant text to stdout.
@@ -672,7 +863,7 @@ async fn oneshot(
 ) -> anyhow::Result<()> {
     let (mut orchestrator, _mcp) = build_orchestrator_with_fallback(
         global.model.as_deref(),
-        global.fallback_model.as_deref(),
+        &global.fallback_model,
         cli_mode,
         global.effort.clone(),
         cwd,

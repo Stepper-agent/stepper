@@ -227,7 +227,7 @@ fn pipeline(resolver: Arc<dyn ProviderResolver>, root: std::path::PathBuf) -> Or
         dispatch_enabled: false,
         dispatch_concurrency: 8,
         dispatch_step_cap: None,        limits: stepper_core::SessionLimits::default(),
-        fallback_model: None,
+        fallback_models: Vec::new(),
         resume_seed: Vec::new(),
         sandbox_writable_roots: None,
     }

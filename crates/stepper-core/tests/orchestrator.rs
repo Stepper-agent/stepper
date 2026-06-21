@@ -158,7 +158,7 @@ fn orchestrator(resolver: Arc<dyn ProviderResolver>, root: std::path::PathBuf) -
         dispatch_enabled: false,
         dispatch_concurrency: 8,
         dispatch_step_cap: None,        limits: stepper_core::SessionLimits::default(),
-        fallback_model: None,
+        fallback_models: Vec::new(),
         resume_seed: Vec::new(),
         sandbox_writable_roots: None,
     }
@@ -431,7 +431,7 @@ async fn fallback_model_engages_after_a_non_retryable_failure_and_notices() {
     let mut orch = orchestrator(resolver, dir.path().to_path_buf());
     orch.steps = vec![step("solo", "primary/m", 5)];
     orch.steps[0].retries = 2;
-    orch.fallback_model = Some("backup/m".into());
+    orch.fallback_models = vec!["backup/m".into()];
 
     let (tx, mut rx) = mpsc::channel(256);
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -465,6 +465,51 @@ async fn fallback_model_engages_after_a_non_retryable_failure_and_notices() {
     assert!(
         events.contains("fallback model 'backup/m'"),
         "the switch must surface as a Notice: {events}"
+    );
+}
+
+#[tokio::test]
+async fn fallback_chain_walks_past_an_unresolvable_link_to_the_next_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    let backup_seen = Arc::new(Mutex::new(None));
+    let resolver = Arc::new(FallbackResolver {
+        primary_calls: primary_calls.clone(),
+        backup_seen: backup_seen.clone(),
+    });
+    let mut orch = orchestrator(resolver, dir.path().to_path_buf());
+    orch.steps = vec![step("solo", "primary/m", 5)];
+    // First link `down/m` is unresolvable (the resolver's `other` arm); the chain
+    // must skip it and reach the working `backup/m`.
+    orch.fallback_models = vec!["down/m".into(), "backup/m".into()];
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen2 = seen.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            seen2.lock().unwrap().push(format!("{ev:?}"));
+        }
+    });
+
+    let summaries = orch
+        .run_turn("go".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .await
+        .expect("the second fallback link rescues the layer")
+        .summaries;
+
+    assert_eq!(summaries[0].1, "rescued by fallback");
+    assert!(backup_seen.lock().unwrap().is_some(), "the working link must be driven");
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let events = seen.lock().unwrap().join("\n");
+    assert!(
+        events.contains("cannot resolve fallback model 'down/m'"),
+        "the dead link must surface a notice: {events}"
+    );
+    assert!(
+        events.contains("fallback model 'backup/m'"),
+        "the working link must surface its switch notice: {events}"
     );
 }
 

@@ -215,9 +215,11 @@ pub struct Orchestrator {
     /// Safety caps (`--max-turns` / `--max-budget-usd`); `SessionLimits::default()`
     /// disables both.
     pub limits: SessionLimits,
-    /// `--fallback-model`: when a step's primary model fails non-retryably or
-    /// exhausts its retries, the layer is re-run once on this model.
-    pub fallback_model: Option<String>,
+    /// `--fallback-model` / `fallbackModel`: the ordered fallback chain. When a
+    /// step's primary model fails non-retryably or exhausts its retries, the layer
+    /// is re-run on each of these in turn until one succeeds (links equal to the
+    /// primary are skipped). Empty = no fallback.
+    pub fallback_models: Vec<String>,
     /// Real prior messages from a resumed session, prepended to every
     /// sequential layer's opening messages (the message-level analogue of the
     /// old resume digest in `base_context`). Empty for a fresh session.
@@ -588,83 +590,89 @@ impl Orchestrator {
             }
 
             // The primary model failed non-retryably or exhausted its retries:
-            // re-resolve once with `--fallback-model` and notice the switch.
-            if succeeded.is_none()
-                && let Some(fallback_ref) = self
-                    .fallback_model
-                    .as_ref()
+            // walk the fallback chain in order, re-resolving each link fresh and
+            // re-running the layer on it, until one succeeds. A link equal to the
+            // primary is skipped (already tried); a resolve/run failure moves on
+            // to the next link.
+            if succeeded.is_none() {
+                for fallback_ref in self
+                    .fallback_models
+                    .iter()
                     .filter(|f| f.as_str() != step.model_ref)
-            {
-                match self.resolver.resolve(fallback_ref) {
-                    Ok(provider) => {
-                        let reason = last_err
-                            .as_ref()
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "unknown error".into());
-                        let _ = event_tx
-                            .send(AppEvent::Notice {
-                                level: stepper_protocol::NoticeLevel::Warn,
-                                text: format!(
-                                    "layer '{}' failed ({reason}); switching to fallback model '{fallback_ref}'",
-                                    step.name
-                                ),
-                            })
-                            .await;
-                        let fallback_info = self.resolver.model_info(fallback_ref);
-                        let provider = budget_wrap(provider, &budget, fallback_info);
-                        let agent = AgentLoop {
-                            layer_name: step.name.clone(),
-                            provider: provider.as_ref(),
-                            tools: &tools,
-                            cx: ToolCx {
-                                cwd: self.cwd.clone(),
-                                project_root: self.project_root.clone(),
-                                home: self.home.clone(),
-                                mode: self.mode_snapshot(),
-                                live_mode: Some(self.mode.clone()),
-                                rules: layer_rules.clone(),
-                                approver: approver.clone(),
-                                cancel: cancel.clone(),
-                                sandbox_writable_roots: self.sandbox_writable_roots.clone(),
-                            },
-                            event_tx: event_tx.clone(),
-                            model_info: fallback_info,
-                            step_cap: step.step_cap,
-                            hooks: self.hooks.clone(),
-                            compaction_provider: compaction_provider.clone(),
-                            temperature: step.temperature,
-                            top_p: step.top_p,
-                            reasoning_effort: step.reasoning_effort.clone(),
-                            thinking_budget: step.thinking_budget,
-                            worker: None,
-                            formatters: self.formatters.clone(),
-                            lsp: self.lsp.clone(),
-                        };
-                        match agent.drive(system.clone(), initial.clone()).await {
-                            Ok(outcome) => {
-                                active_info = fallback_info;
-                                succeeded = Some(outcome);
-                            }
-                            Err(CoreError::Cancelled) => {
-                                if let Some(budget) = &budget
-                                    && let Some(e) = budget.cap_error()
-                                {
-                                    return Err(e);
+                {
+                    match self.resolver.resolve(fallback_ref) {
+                        Ok(provider) => {
+                            let reason = last_err
+                                .as_ref()
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "unknown error".into());
+                            let _ = event_tx
+                                .send(AppEvent::Notice {
+                                    level: stepper_protocol::NoticeLevel::Warn,
+                                    text: format!(
+                                        "layer '{}' failed ({reason}); switching to fallback model '{fallback_ref}'",
+                                        step.name
+                                    ),
+                                })
+                                .await;
+                            let fallback_info = self.resolver.model_info(fallback_ref);
+                            let provider = budget_wrap(provider, &budget, fallback_info);
+                            let agent = AgentLoop {
+                                layer_name: step.name.clone(),
+                                provider: provider.as_ref(),
+                                tools: &tools,
+                                cx: ToolCx {
+                                    cwd: self.cwd.clone(),
+                                    project_root: self.project_root.clone(),
+                                    home: self.home.clone(),
+                                    mode: self.mode_snapshot(),
+                                    live_mode: Some(self.mode.clone()),
+                                    rules: layer_rules.clone(),
+                                    approver: approver.clone(),
+                                    cancel: cancel.clone(),
+                                    sandbox_writable_roots: self.sandbox_writable_roots.clone(),
+                                },
+                                event_tx: event_tx.clone(),
+                                model_info: fallback_info,
+                                step_cap: step.step_cap,
+                                hooks: self.hooks.clone(),
+                                compaction_provider: compaction_provider.clone(),
+                                temperature: step.temperature,
+                                top_p: step.top_p,
+                                reasoning_effort: step.reasoning_effort.clone(),
+                                thinking_budget: step.thinking_budget,
+                                worker: None,
+                                formatters: self.formatters.clone(),
+                                lsp: self.lsp.clone(),
+                            };
+                            match agent.drive(system.clone(), initial.clone()).await {
+                                Ok(outcome) => {
+                                    active_info = fallback_info;
+                                    succeeded = Some(outcome);
+                                    break;
                                 }
-                                return Err(CoreError::Cancelled);
+                                Err(CoreError::Cancelled) => {
+                                    if let Some(budget) = &budget
+                                        && let Some(e) = budget.cap_error()
+                                    {
+                                        return Err(e);
+                                    }
+                                    return Err(CoreError::Cancelled);
+                                }
+                                // This link failed; fall through to the next one.
+                                Err(e) => last_err = Some(e),
                             }
-                            Err(e) => last_err = Some(e),
                         }
-                    }
-                    Err(e) => {
-                        let _ = event_tx
-                            .send(AppEvent::Notice {
-                                level: stepper_protocol::NoticeLevel::Warn,
-                                text: format!(
-                                    "cannot resolve fallback model '{fallback_ref}': {e}"
-                                ),
-                            })
-                            .await;
+                        Err(e) => {
+                            let _ = event_tx
+                                .send(AppEvent::Notice {
+                                    level: stepper_protocol::NoticeLevel::Warn,
+                                    text: format!(
+                                        "cannot resolve fallback model '{fallback_ref}': {e}"
+                                    ),
+                                })
+                                .await;
+                        }
                     }
                 }
             }

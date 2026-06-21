@@ -106,13 +106,38 @@ fn merge_limits(cli: SessionLimits, config: Option<&LimitsConfig>) -> SessionLim
     )
 }
 
+/// Max fallback links honored (mirrors Claude Code's chain cap).
+const MAX_FALLBACK_MODELS: usize = 3;
+
+/// The effective fallback chain: the CLI `--fallback-model` list wins when given,
+/// else `setting.json` `fallbackModel`. Deduplicated (first occurrence kept) and
+/// capped at [`MAX_FALLBACK_MODELS`]. Each link is re-resolved at run time.
+pub(crate) fn resolve_fallback_models(cli_fallbacks: &[String], config: &Config) -> Vec<String> {
+    let raw: Vec<String> = if cli_fallbacks.is_empty() {
+        config.settings.fallback_model.clone().map(|f| f.into_vec()).unwrap_or_default()
+    } else {
+        cli_fallbacks.to_vec()
+    };
+    let mut seen = std::collections::HashSet::new();
+    // Trim before filtering/dedup: a comma list with spaces (`a, b`) and an
+    // already-listed entry with stray whitespace must collapse, not slip through
+    // as `" b"` which would later fail to resolve to a provider.
+    raw.into_iter()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .filter(|m| seen.insert(m.clone()))
+        .take(MAX_FALLBACK_MODELS)
+        .collect()
+}
+
 /// Build the orchestrator and connect MCP servers. The returned `McpManager`
 /// must be kept alive for the session (it owns the live connections).
-/// `fallback_model` (`--fallback-model`) is re-resolved once when a step's
-/// primary model fails non-retryably or exhausts its retries.
+/// `cli_fallbacks` (`--fallback-model`) overrides `setting.json` `fallbackModel`;
+/// the resulting chain is re-resolved in order when a step's primary model fails
+/// non-retryably or exhausts its retries.
 pub async fn build_orchestrator_with_fallback(
     model: Option<&str>,
-    fallback_model: Option<&str>,
+    cli_fallbacks: &[String],
     cli_mode: Option<PermissionMode>,
     cli_effort: Option<String>,
     cwd: PathBuf,
@@ -143,11 +168,12 @@ pub async fn build_orchestrator_with_fallback(
         })
         .unwrap_or(PermissionMode::Auto);
 
+    let fallback_models = resolve_fallback_models(cli_fallbacks, &config);
     let steps = build_steps(&config, &default_model);
     for step in &steps {
         ensure_provider(&mut config, &step.model_ref);
     }
-    if let Some(fallback) = fallback_model {
+    for fallback in &fallback_models {
         ensure_provider(&mut config, fallback);
     }
 
@@ -294,7 +320,7 @@ pub async fn build_orchestrator_with_fallback(
         dispatch_concurrency,
         dispatch_step_cap,
         limits,
-        fallback_model: fallback_model.map(str::to_string),
+        fallback_models,
         resume_seed: Vec::new(),
         sandbox_writable_roots,
         formatters,
@@ -355,7 +381,7 @@ pub fn parse_mode(s: &str) -> Option<PermissionMode> {
 
 /// If a model names a provider not in config, synthesize one from the CLI's
 /// known-provider convention (key still comes from `STEPPER_<P>_API_KEY`).
-fn ensure_provider(config: &mut Config, model_ref: &str) {
+pub(crate) fn ensure_provider(config: &mut Config, model_ref: &str) {
     let Some((name, _)) = model_ref.split_once('/') else {
         return;
     };
@@ -446,6 +472,43 @@ mod tests {
             .expect("override present");
         assert_eq!(ra.command, vec!["/custom/ra"]);
         assert!(ra.extensions.iter().any(|e| e == ".rs"));
+    }
+
+    fn config_with_fallback(fallback: Option<stepper_config::FallbackModels>) -> Config {
+        Config {
+            settings: stepper_config::SettingsFile {
+                fallback_model: fallback,
+                ..Default::default()
+            },
+            project_dir: None,
+            project_root: None,
+            user_dir: None,
+        }
+    }
+
+    #[test]
+    fn resolve_fallback_models_prefers_cli_then_config_dedupes_and_caps() {
+        use stepper_config::FallbackModels;
+        // CLI list wins over the config chain entirely.
+        let cfg = config_with_fallback(Some(FallbackModels::One("cfg/only".into())));
+        assert_eq!(
+            resolve_fallback_models(&["cli/a".to_string(), "cli/b".to_string()], &cfg),
+            vec!["cli/a", "cli/b"]
+        );
+        // No CLI list → fall back to the config chain.
+        assert_eq!(resolve_fallback_models(&[], &cfg), vec!["cfg/only"]);
+        // Duplicates collapse (first kept) and the chain is capped at 3.
+        let cli = ["p/a", "p/a", "p/b", "p/c", "p/d"].map(String::from);
+        assert_eq!(
+            resolve_fallback_models(&cli, &config_with_fallback(None)),
+            vec!["p/a", "p/b", "p/c"]
+        );
+        // Nothing configured → empty.
+        assert!(resolve_fallback_models(&[], &config_with_fallback(None)).is_empty());
+        // Whitespace (a `--fallback-model "a, b"` split) is trimmed, and trimming
+        // collapses a spaced duplicate with its bare form.
+        let spaced = ["p/a".to_string(), " p/b".to_string(), " p/a ".to_string()];
+        assert_eq!(resolve_fallback_models(&spaced, &config_with_fallback(None)), vec!["p/a", "p/b"]);
     }
 
     #[test]

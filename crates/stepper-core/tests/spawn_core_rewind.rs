@@ -188,7 +188,7 @@ fn solo_orch(root: std::path::PathBuf) -> Orchestrator {
         dispatch_concurrency: 8,
         dispatch_step_cap: None,
         limits: stepper_core::SessionLimits::default(),
-        fallback_model: None,
+        fallback_models: Vec::new(),
         resume_seed: Vec::new(),
         sandbox_writable_roots: None,
     }
@@ -349,7 +349,7 @@ async fn rewind_prunes_later_files_and_truncates_session() {
         dispatch_enabled: false,
         dispatch_concurrency: 8,
         dispatch_step_cap: None,        limits: stepper_core::SessionLimits::default(),
-        fallback_model: None,
+        fallback_models: Vec::new(),
         resume_seed: Vec::new(),
         sandbox_writable_roots: None,
     };
@@ -438,7 +438,7 @@ async fn rewind_uses_the_recorded_turn_count_when_the_turn_id_has_drifted() {
         dispatch_concurrency: 8,
         dispatch_step_cap: None,
         limits: stepper_core::SessionLimits::default(),
-        fallback_model: None,
+        fallback_models: Vec::new(),
         resume_seed: Vec::new(),
         sandbox_writable_roots: None,
     };
