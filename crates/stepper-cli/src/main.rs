@@ -482,6 +482,11 @@ async fn doctor_cmd(global: GlobalArgs) -> anyhow::Result<()> {
     // `http_client()` is a cheap clone, so the catalog + release fetches keep a
     // client of their own while `factory` moves into the resolver below.
     let client = factory.http_client();
+    // Mirror `build_orchestrator`: load the Codex OAuth token store so a codex /
+    // codex-oauth default model resolves exactly as a real run would. Without it
+    // the resolver sees `None` and reports a logged-in user's codex default model
+    // as a hard-fail "not logged in".
+    let codex_store = CodexTokenStore::load(CodexTokenStore::default_path(), factory.client()).ok();
 
     // 6. models.dev catalog (network) — reused by the resolver for overlays.
     let catalog = match stepper_providers::models::fetch_catalog(&client).await {
@@ -495,7 +500,7 @@ async fn doctor_cmd(global: GlobalArgs) -> anyhow::Result<()> {
         }
     };
     let resolver =
-        ConfigProviderResolver::new(config, factory, ModelRegistry::builtin(), None, catalog);
+        ConfigProviderResolver::new(config, factory, ModelRegistry::builtin(), codex_store, catalog);
 
     // 3. Default model + fallback chain resolve cleanly (key + provider kind). A
     // missing key is a warning (consistent with step 2 and the fresh-checkout
@@ -841,10 +846,27 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
 fn load_keybindings(project_root: &std::path::Path) -> Vec<(String, String)> {
     let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     let mut load = |path: std::path::PathBuf| {
-        if let Ok(body) = std::fs::read_to_string(&path)
-            && let Ok(obj) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&body)
-        {
-            map.extend(obj);
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        // Per-item resilience: take each string binding individually so one bad
+        // entry (wrong type) doesn't silently drop the whole file's bindings.
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(serde_json::Value::Object(obj)) => {
+                for (action, chord) in obj {
+                    match chord {
+                        serde_json::Value::String(c) => {
+                            map.insert(action, c);
+                        }
+                        other => eprintln!(
+                            "warning: ignoring keybinding '{action}' in {}: expected a chord string, got {other}",
+                            path.display()
+                        ),
+                    }
+                }
+            }
+            Ok(_) => eprintln!("warning: {} is not a JSON object of bindings", path.display()),
+            Err(e) => eprintln!("warning: could not parse {}: {e}", path.display()),
         }
     };
     if let Some(home) = std::env::var_os("HOME") {
@@ -1101,12 +1123,27 @@ fn validate_output(
     reply: &str,
 ) -> Result<serde_json::Value, String> {
     let trimmed = strip_code_fence(reply.trim());
-    let value: serde_json::Value =
-        serde_json::from_str(trimmed).map_err(|e| format!("reply is not valid JSON ({e})"))?;
+    let value = parse_lenient_json(trimmed)?;
     match validator.validate(&value) {
         Ok(()) => Ok(value),
         Err(error) => Err(error.to_string()),
     }
+}
+
+/// Parse JSON from a model reply, tolerating a non-trailing-newline language tag
+/// the fence-stripper can't drop (single-line `` ```json {…} `` ``) or stray prose:
+/// try the text as-is first, then fall back to the outermost `{…}`/`[…]` span.
+fn parse_lenient_json(s: &str) -> Result<serde_json::Value, String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(s) {
+        return Ok(value);
+    }
+    if let (Some(start), Some(end)) = (s.find(['{', '[']), s.rfind(['}', ']']))
+        && end > start
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&s[start..=end])
+    {
+        return Ok(value);
+    }
+    serde_json::from_str::<serde_json::Value>(s).map_err(|e| format!("reply is not valid JSON ({e})"))
 }
 
 /// Strip a single Markdown code fence (```` ``` ```` or ```` ```json ````) around
@@ -1702,6 +1739,18 @@ mod tests {
         assert_eq!(validate_output(&v, "{\"name\":\"ok\"}").unwrap()["name"], "ok");
         let fenced = validate_output(&v, "```json\n{\"name\":\"ok\"}\n```").unwrap();
         assert_eq!(serde_json::to_string(&fenced).unwrap(), "{\"name\":\"ok\"}", "fence stripped, re-serialized");
+        // A single-line fence (language tag, no newline) still validates via the
+        // lenient `{…}` anchor — not a spurious re-prompt.
+        assert_eq!(
+            validate_output(&v, "```json {\"name\":\"ok\"}```").unwrap()["name"],
+            "ok",
+            "newline-less language tag tolerated"
+        );
+        // So does a bare-prose lead-in around the object.
+        assert_eq!(
+            validate_output(&v, "Here you go: {\"name\":\"ok\"}").unwrap()["name"],
+            "ok"
+        );
         // Missing required key, wrong type, and non-JSON all fail.
         assert!(validate_output(&v, "{\"other\":1}").is_err());
         assert!(validate_output(&v, "{\"name\":5}").is_err());

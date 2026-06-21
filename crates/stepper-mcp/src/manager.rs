@@ -2,7 +2,7 @@ use crate::bridge::claim_namespaced_name;
 use crate::error::McpError;
 use crate::tool::McpTool;
 use reqwest::header::{HeaderName, HeaderValue};
-use rmcp::service::{RoleClient, RunningService};
+use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use rmcp::ServiceExt;
 use std::collections::{BTreeMap, HashMap};
@@ -66,22 +66,56 @@ impl McpManager {
     ) -> Self {
         let mut manager = McpManager::empty();
         let mut taken = HashMap::new();
+
+        // Phase 1: connect + list tools for every enabled server CONCURRENTLY, so a
+        // slow/hung server no longer serializes the others' startup (each stays
+        // bounded by its own per-server timeout).
+        type ConnectResult =
+            Result<(RunningService<RoleClient, ()>, Peer<RoleClient>, Vec<rmcp::model::Tool>), McpError>;
+        let mut set: tokio::task::JoinSet<(String, ConnectResult)> = tokio::task::JoinSet::new();
         for (name, cfg) in servers {
             // A server disabled in config stays defined but isn't connected.
             if cfg.enabled == Some(false) {
                 continue;
             }
-            match connect_one(name, cfg, base_dir, &mut taken, proxy).await {
-                Ok((service, tools)) => {
+            let (name, cfg) = (name.clone(), cfg.clone());
+            let base_dir = base_dir.to_path_buf();
+            let proxy = proxy.cloned();
+            set.spawn(async move {
+                let r = connect_and_list(&name, &cfg, &base_dir, proxy.as_ref()).await;
+                (name, r)
+            });
+        }
+        let mut results: HashMap<String, ConnectResult> = HashMap::new();
+        while let Some(joined) = set.join_next().await {
+            if let Ok((name, r)) = joined {
+                results.insert(name, r);
+            }
+        }
+
+        // Phase 2: namespace + register in deterministic (BTreeMap) order, so the
+        // tool-name collision resolution (`taken`) is identical regardless of which
+        // server happened to connect first.
+        for name in servers.keys() {
+            match results.remove(name) {
+                Some(Ok((service, peer, mcp_tools))) => {
+                    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+                    for t in mcp_tools {
+                        let Some(unique) = claim_namespaced_name(&mut taken, name, &t.name) else {
+                            continue;
+                        };
+                        tools.push(
+                            Arc::new(McpTool::with_name(name, t, peer.clone(), unique)) as Arc<dyn Tool>,
+                        );
+                    }
                     for tool in &tools {
-                        manager
-                            .origins
-                            .push((tool.name().to_string(), name.clone()));
+                        manager.origins.push((tool.name().to_string(), name.clone()));
                     }
                     manager.services.push(service);
                     manager.tools.extend(tools);
                 }
-                Err(e) => eprintln!("mcp: server '{name}' unavailable: {e}"),
+                Some(Err(e)) => eprintln!("mcp: server '{name}' unavailable: {e}"),
+                None => {} // disabled (never spawned) or the task was dropped
             }
         }
         manager
@@ -113,7 +147,11 @@ impl McpManager {
     pub async fn list_all_resources(&self) -> Vec<String> {
         let mut out = Vec::new();
         for svc in &self.services {
-            if let Ok(resources) = svc.list_all_resources().await {
+            // Bound each call: a server that connected but won't answer this
+            // (optional) request must not hang `stepper mcp get` indefinitely.
+            if let Ok(Ok(resources)) =
+                tokio::time::timeout(connect_timeout(), svc.list_all_resources()).await
+            {
                 for r in resources {
                     out.push(format!("{}  {}", r.uri, r.name));
                 }
@@ -127,7 +165,11 @@ impl McpManager {
     pub async fn list_all_prompts(&self) -> Vec<String> {
         let mut out = Vec::new();
         for svc in &self.services {
-            if let Ok(prompts) = svc.list_all_prompts().await {
+            // Bound each call (see `list_all_resources`): a connected-but-silent
+            // server must not freeze `stepper mcp get`.
+            if let Ok(Ok(prompts)) =
+                tokio::time::timeout(connect_timeout(), svc.list_all_prompts()).await
+            {
                 for p in prompts {
                     match p.description {
                         Some(d) if !d.is_empty() => out.push(format!("{} — {d}", p.name)),
@@ -146,13 +188,15 @@ impl McpManager {
     }
 }
 
-async fn connect_one(
+/// Connect one server and list its raw tools — WITHOUT namespacing (which needs
+/// the shared `taken` map and so must stay sequential in `connect`'s phase 2).
+/// Split out so the slow, independent connect+list work runs concurrently.
+async fn connect_and_list(
     name: &str,
     cfg: &McpServerConfig,
     base_dir: &Path,
-    taken: &mut HashMap<String, (String, String)>,
     proxy: Option<&ProxyConfig>,
-) -> Result<(RunningService<RoleClient, ()>, Vec<Arc<dyn Tool>>), McpError> {
+) -> Result<(RunningService<RoleClient, ()>, Peer<RoleClient>, Vec<rmcp::model::Tool>), McpError> {
     let timeout = server_timeout(cfg);
     let service = match cfg.transport.as_deref() {
         Some("http") | Some("streamable-http") => connect_http(name, cfg, timeout, proxy).await?,
@@ -164,14 +208,7 @@ async fn connect_one(
         .map_err(|_| McpError::Connect("list_tools timed out".into()))?
         .map_err(|e| McpError::Connect(format!("list_tools: {e}")))?;
     let peer = service.peer().clone();
-    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-    for t in mcp_tools {
-        let Some(unique) = claim_namespaced_name(taken, name, &t.name) else {
-            continue;
-        };
-        tools.push(Arc::new(McpTool::with_name(name, t, peer.clone(), unique)) as Arc<dyn Tool>);
-    }
-    Ok((service, tools))
+    Ok((service, peer, mcp_tools))
 }
 
 /// A bounded tail of a child's piped stderr, drained by a background task so a

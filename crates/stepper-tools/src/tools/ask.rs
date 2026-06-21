@@ -68,7 +68,21 @@ impl Tool for AskUserQuestion {
                 "ask_user_question needs at least 2 non-empty options".into(),
             ));
         }
-        match cx.approver.ask(&a.question, &options).await {
+        // Like `gate`, a parked question must be interruptible: Esc / the per-turn
+        // timeout fire `cancel`, and selecting on it drops the `ask` future
+        // (unwinding its `rx.await`) so the turn can finish instead of hanging
+        // until the user also answers the overlay.
+        let answer = tokio::select! {
+            biased;
+            _ = cx.cancel.cancelled() => {
+                return Ok(ToolResult::text(
+                    "The user did not answer (the turn was interrupted). \
+                     Proceed with your best judgment.",
+                ));
+            }
+            a = cx.approver.ask(&a.question, &options) => a,
+        };
+        match answer {
             Some(i) if i < options.len() => {
                 Ok(ToolResult::text(format!("The user selected: {}", options[i])))
             }

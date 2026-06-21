@@ -114,6 +114,10 @@ pub struct AgentLoop<'a> {
     /// successful file-editing tool wrote are synced to the matching language
     /// server and its errors are appended to the tool result. `None` = disabled.
     pub lsp: Option<Arc<dyn LspDiagnostics>>,
+    /// The turn's shared step/budget gate (`--max-turns`/`--max-budget-usd`), or
+    /// `None` when uncapped. Charged once per ReAct step at the top of `drive` so
+    /// a step's transient retries don't each consume the budget.
+    pub budget: Option<Arc<crate::orchestrator::TurnBudget>>,
 }
 
 /// Post-edit LSP diagnostics for a file (errors-only report; empty when clean).
@@ -172,6 +176,16 @@ impl AgentLoop<'_> {
             if self.cx.cancel.is_cancelled() {
                 return Err(CoreError::Cancelled);
             }
+            // Charge this step against the turn caps before doing any work. A
+            // tripped cap surfaces as `Cancelled` (never retried); `run_turn`/the
+            // fan-out then report which cap via `TurnBudget::cap_error`. Charged
+            // here — once per step — not in `BudgetedProvider`, so a step's
+            // transient request retries don't each consume the step budget.
+            if let Some(budget) = &self.budget
+                && !budget.admit_step()
+            {
+                return Err(CoreError::Cancelled);
+            }
 
             let projected = last_context
                 + crate::compaction::estimate_tokens(&messages[accounted.min(messages.len())..]);
@@ -201,9 +215,16 @@ impl AgentLoop<'_> {
                 let dropped: Vec<Message> = messages.drain(0..cut).collect();
                 let freed_tokens = crate::compaction::estimate_tokens(&dropped);
                 let summary = match &self.compaction_provider {
-                    Some(p) => crate::compaction::summarize_with_model(p.as_ref(), &dropped, None)
-                        .await
-                        .unwrap_or_else(|| crate::compaction::heuristic_summary(&dropped)),
+                    // Race the model summary against the turn's cancel: an Esc mid-
+                    // summary drops to the cheap heuristic immediately rather than
+                    // waiting for the summarizer call to finish.
+                    Some(p) => tokio::select! {
+                        biased;
+                        _ = self.cx.cancel.cancelled() => crate::compaction::heuristic_summary(&dropped),
+                        s = crate::compaction::summarize_with_model(p.as_ref(), &dropped, None, &self.cx.cancel) => {
+                            s.unwrap_or_else(|| crate::compaction::heuristic_summary(&dropped))
+                        }
+                    },
                     None => crate::compaction::heuristic_summary(&dropped),
                 };
                 messages.insert(0, crate::compaction::marker(&summary));

@@ -116,7 +116,9 @@ pub async fn run(
                 }
             }
             Some(line) = status_rx.recv() => {
-                state.status_line = Some(line);
+                // Empty → the command failed or produced nothing: fall back to the
+                // built-in footer instead of holding a stale custom line.
+                state.status_line = if line.is_empty() { None } else { Some(line) };
                 dirty = true;
             }
             _ = cancel.cancelled() => break,
@@ -148,8 +150,17 @@ pub async fn run(
 /// stdin, capture the first line of stdout, and send it back. Bounded at 5s and
 /// killed on drop, so a slow or hung script can never wedge the UI or leak.
 async fn run_status_line(cmd: Vec<String>, ctx: serde_json::Value, tx: mpsc::Sender<String>) {
+    // Always send the result — an empty string (spawn/timeout/io failure or no
+    // output) clears a now-stale footer back to the built-in one, so a command
+    // that stops producing output doesn't leave the last good line on screen.
+    let _ = tx.send(status_line_output(cmd, ctx).await).await;
+}
+
+/// Run the status-line command and return its first output line (trimmed), or an
+/// empty string on any failure (missing program, spawn/io error, 5s timeout).
+async fn status_line_output(cmd: Vec<String>, ctx: serde_json::Value) -> String {
     let Some((prog, args)) = cmd.split_first() else {
-        return;
+        return String::new();
     };
     let child = tokio::process::Command::new(prog)
         .args(args)
@@ -160,7 +171,7 @@ async fn run_status_line(cmd: Vec<String>, ctx: serde_json::Value, tx: mpsc::Sen
         .spawn();
     let mut child = match child {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => return String::new(),
     };
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
@@ -169,17 +180,14 @@ async fn run_status_line(cmd: Vec<String>, ctx: serde_json::Value, tx: mpsc::Sen
     }
     let output = match tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await {
         Ok(Ok(o)) => o,
-        _ => return, // timeout (child killed on drop) or spawn/io error
+        _ => return String::new(), // timeout (child killed on drop) or spawn/io error
     };
-    let line = String::from_utf8_lossy(&output.stdout)
+    String::from_utf8_lossy(&output.stdout)
         .lines()
         .next()
         .unwrap_or("")
         .trim()
-        .to_string();
-    if !line.is_empty() {
-        let _ = tx.send(line).await;
-    }
+        .to_string()
 }
 
 /// Load the persisted prompt history (a JSON array of strings). A missing or
@@ -878,6 +886,18 @@ mod tests {
             input: String::new(),
         }));
         s
+    }
+
+    #[tokio::test]
+    async fn status_line_output_is_empty_on_failure_so_a_stale_line_clears() {
+        let ctx = serde_json::json!({});
+        // A working command's first line is returned...
+        let ok = status_line_output(vec!["sh".into(), "-c".into(), "echo custom-status".into()], ctx.clone()).await;
+        assert_eq!(ok, "custom-status");
+        // ...but a missing program, an empty output, and a failing command all
+        // return "" so the event loop falls back to the built-in footer.
+        assert_eq!(status_line_output(vec!["stepper-no-such-program-xyz".into()], ctx.clone()).await, "");
+        assert_eq!(status_line_output(vec!["sh".into(), "-c".into(), "true".into()], ctx).await, "");
     }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> Event {

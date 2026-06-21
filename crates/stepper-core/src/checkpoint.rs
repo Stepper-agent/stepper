@@ -1,7 +1,7 @@
 use crate::error::CoreError;
 use ignore::WalkBuilder;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// How many `turn-<N>` snapshots to keep. Every turn full-copies the working
 /// tree, so without a cap the store grows unbounded for the life of the project.
@@ -124,6 +124,36 @@ impl Snapshotter {
         Ok(())
     }
 
+    /// After a `/rewind` that keeps `keep` turns, drop every `turn-<N>` checkpoint
+    /// taken when MORE than `keep` turns were complete — the abandoned "future"
+    /// trees. Without this they linger in the rewind picker as stale entries that,
+    /// if re-selected, restore a future tree while the conversation has fewer turns
+    /// (a files↔conversation desync). Mirrors [`clear_redo_snapshots`]' rule that a
+    /// forward tree is unreachable once you go back. A missing store is a no-op.
+    pub fn prune_forward(&self, keep: usize) {
+        let Ok(entries) = std::fs::read_dir(&self.store) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(id) = path.file_name().and_then(|s| s.to_str()).map(str::to_owned) else {
+                continue;
+            };
+            let Some(n) = id.strip_prefix("turn-").and_then(|s| s.parse::<u64>().ok()) else {
+                continue;
+            };
+            // Turns-completed for this checkpoint: the recorded count, else N-1.
+            let completed = self.checkpoint_turns(&id).unwrap_or(n.saturating_sub(1) as usize);
+            if completed > keep {
+                let _ = std::fs::remove_dir_all(&path);
+                let _ = std::fs::remove_file(self.meta_path(&id));
+            }
+        }
+    }
+
     /// Record how many session turns were complete when `id` was taken, so a
     /// later rewind truncates the session exactly — the turn-id counter can drift
     /// past the real turn count (failed turns, `/compact`), so the count is stored
@@ -184,17 +214,16 @@ impl Snapshotter {
         // `hidden(false)` so dotfiles (`.github`, `.gitignore`, …) are captured;
         // `require_git(false)` so `.gitignore` is honored even in a non-git
         // project (otherwise `target/`, `node_modules/` get full-copied every
-        // turn). `.git` and our own runtime state are pruned at traversal so the
-        // large dirs are never walked.
+        // turn). `.git` and our own runtime state (the whole `.stepper/`:
+        // checkpoints, sessions, setting.json, commands, exports, memory, …) are
+        // pruned at traversal so they are never walked and never restored/pruned
+        // by a `/rewind` or `/undo` of the user's working tree. `starts_with`
+        // matches whole path components, so `.github` is unaffected.
         for entry in WalkBuilder::new(&self.project_root)
             .hidden(false)
             .require_git(false)
             .filter_entry(move |e| match e.path().strip_prefix(&root) {
-                Ok(rel) => {
-                    !(rel.starts_with(".git")
-                        || rel.starts_with(Path::new(".stepper/checkpoints"))
-                        || rel.starts_with(Path::new(".stepper/sessions")))
-                }
+                Ok(rel) => !(rel.starts_with(".git") || rel.starts_with(".stepper")),
                 Err(_) => true,
             })
             .build()
@@ -248,6 +277,46 @@ mod tests {
     }
 
     #[test]
+    fn stepper_runtime_state_is_excluded_from_checkpoints() {
+        // The whole `.stepper/` dir (setting.json, commands, exports, memory, …)
+        // is stepper's own runtime state, not the user's working tree: a `/rewind`
+        // or `/undo` must never revert/prune it. Regression: only `.stepper/
+        // checkpoints` and `.stepper/sessions` used to be excluded, so editing
+        // settings / adding a command / exporting mid-session, then rewinding,
+        // reverted or deleted those files.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("code.rs"), "fn main() {}").unwrap();
+        std::fs::create_dir_all(root.join(".stepper/commands")).unwrap();
+        std::fs::write(root.join(".stepper/setting.json"), "{\"mode\":\"auto\"}").unwrap();
+
+        let snap = Snapshotter::new(root.clone());
+        snap.snapshot("turn-1").unwrap();
+
+        // After the snapshot: the user edits code (to be reverted) AND stepper
+        // writes its own runtime files (must survive the rewind untouched).
+        std::fs::write(root.join("code.rs"), "fn main() { broken }").unwrap();
+        std::fs::write(root.join(".stepper/setting.json"), "{\"mode\":\"plan\"}").unwrap();
+        std::fs::write(root.join(".stepper/commands/greet.md"), "hi").unwrap();
+        std::fs::create_dir_all(root.join(".stepper/exports")).unwrap();
+        std::fs::write(root.join(".stepper/exports/t.md"), "transcript").unwrap();
+
+        snap.restore("turn-1").unwrap();
+
+        // The user's code is reverted...
+        assert_eq!(std::fs::read_to_string(root.join("code.rs")).unwrap(), "fn main() {}");
+        // ...but every `.stepper/` file written after the snapshot is preserved
+        // (neither reverted to its pre-turn state nor pruned as "post-snapshot").
+        assert_eq!(
+            std::fs::read_to_string(root.join(".stepper/setting.json")).unwrap(),
+            "{\"mode\":\"plan\"}",
+            ".stepper/setting.json is not reverted"
+        );
+        assert!(root.join(".stepper/commands/greet.md").exists(), "a command added mid-session survives");
+        assert!(root.join(".stepper/exports/t.md").exists(), "an export written mid-session survives");
+    }
+
+    #[test]
     fn snapshot_of_an_empty_tree_is_restorable() {
         // A fresh project's first turn checkpoints an empty working tree. The
         // snapshot must still exist so `/rewind` to that pre-turn point works and
@@ -298,6 +367,36 @@ mod tests {
         std::fs::write(root.join("a.txt"), "changed").unwrap();
         snap.restore("turn-25").unwrap();
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "x");
+    }
+
+    #[test]
+    fn prune_forward_drops_abandoned_future_checkpoints() {
+        // After a rewind that keeps `keep` turns, checkpoints taken when more than
+        // `keep` turns were complete are abandoned futures and must be removed, so
+        // they can't be re-selected later and restore a tree newer than the (now
+        // shorter) conversation.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        let snap = Snapshotter::new(root.clone());
+        for n in 1..=5 {
+            snap.snapshot(&format!("turn-{n}")).unwrap();
+            snap.record_turns(&format!("turn-{n}"), n - 1); // turn-N taken after N-1 turns
+        }
+        let store = root.join(".stepper/checkpoints");
+
+        // Rewind kept 2 turns: turn-1 (0 done) and turn-2 (1 done) and turn-3 (2
+        // done) stay; turn-4 (3 done) and turn-5 (4 done) are the abandoned future.
+        snap.prune_forward(2);
+
+        for n in 1..=3 {
+            assert!(store.join(format!("turn-{n}")).exists(), "turn-{n} kept (<= keep)");
+            assert!(store.join(format!("turn-{n}.meta")).exists(), "turn-{n}.meta kept");
+        }
+        for n in 4..=5 {
+            assert!(!store.join(format!("turn-{n}")).exists(), "turn-{n} pruned (future)");
+            assert!(!store.join(format!("turn-{n}.meta")).exists(), "turn-{n}.meta pruned");
+        }
     }
 
     #[test]

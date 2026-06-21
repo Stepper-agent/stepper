@@ -1,10 +1,13 @@
 //! User-customizable key bindings (`~/.stepper/keybindings.json`).
 //!
 //! Design: **additive**. Each entry binds an extra key to an editor action; the
-//! built-in defaults (Enter=submit, Ctrl+C=quit, Esc=interrupt, Shift+Enter=
-//! newline, Ctrl+E=editor, …) always keep working. So a binding can only *add* a
-//! key, never break a load-bearing one — zero regression risk for the delicate
-//! input layer. `lower_event` consults these overrides first.
+//! built-in defaults (Enter=submit, Ctrl+C=quit, Esc=interrupt, Shift+Enter/
+//! Ctrl+J=newline, Ctrl+E=editor, arrows=cursor, …) always keep working. So a
+//! binding can only *add* a key, never break a built-in — zero regression risk
+//! for the delicate input layer. `lower_event` consults these overrides first,
+//! and [`Chord::is_bindable`] enforces the invariant by refusing any chord that
+//! would shadow a built-in (bare characters, Enter/Esc/Backspace, plain arrows,
+//! Ctrl+J, Ctrl+E).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -76,9 +79,18 @@ impl Chord {
     /// (Enter, Esc, Backspace) are never rebindable. Other named keys are fine.
     fn is_bindable(&self) -> bool {
         match self.code {
+            // Ctrl+J (universal newline fallback) and Ctrl+E (external editor) are
+            // built-in chords consulted AFTER an override would fire, so binding
+            // them to another action would shadow the default. Keep them hardwired
+            // so the additive invariant ("never break a built-in") actually holds.
+            KeyCode::Char('j' | 'e') if self.ctrl => false,
             KeyCode::Char(_) => self.ctrl || self.alt,
             // Enter=submit, Esc=interrupt, Backspace=edit must always work.
             KeyCode::Enter | KeyCode::Esc | KeyCode::Backspace => false,
+            // Unmodified arrows move the cursor (including between lines of a
+            // multi-line draft); binding them plain would swallow that. A
+            // modified arrow (Ctrl/Alt) is fair game.
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => self.ctrl || self.alt,
             _ => true,
         }
     }
@@ -188,5 +200,53 @@ mod tests {
         // Load-bearing keys (Enter/Esc/Backspace) are never rebindable.
         let kb = KeyBindings::from_overrides(&[("scroll-up".into(), "enter".into())]);
         assert_eq!(kb.action_for(&key(KeyCode::Enter, KeyModifiers::NONE)), None, "Enter stays submit");
+    }
+
+    #[test]
+    fn plain_arrow_bindings_are_rejected_so_cursor_movement_still_works() {
+        // Unmodified arrows move the textarea cursor (between lines of a
+        // multi-line draft); a plain binding would swallow that — dropped.
+        for token in ["up", "down", "left", "right"] {
+            let kb = KeyBindings::from_overrides(&[("scroll-up".into(), token.into())]);
+            let code = Chord::parse(token).unwrap().code;
+            assert_eq!(
+                kb.action_for(&key(code, KeyModifiers::NONE)),
+                None,
+                "plain {token} must stay cursor movement"
+            );
+        }
+        // A modified arrow (Ctrl/Alt) is fair game.
+        let kb = KeyBindings::from_overrides(&[("scroll-up".into(), "ctrl+up".into())]);
+        assert_eq!(
+            kb.action_for(&key(KeyCode::Up, KeyModifiers::CONTROL)),
+            Some(BindableAction::ScrollUp),
+            "ctrl+up is bindable"
+        );
+    }
+
+    #[test]
+    fn ctrl_j_and_ctrl_e_builtins_cannot_be_shadowed() {
+        // Ctrl+J (newline fallback) and Ctrl+E (editor) are built-in chords that
+        // `lower_event` consults after the override would fire, so they must not be
+        // bindable — otherwise a binding shadows the default (additive invariant).
+        let kb = KeyBindings::from_overrides(&[("scroll-up".into(), "ctrl+j".into())]);
+        assert_eq!(
+            kb.action_for(&key(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            None,
+            "Ctrl+J stays newline"
+        );
+        let kb = KeyBindings::from_overrides(&[("scroll-down".into(), "ctrl+e".into())]);
+        assert_eq!(
+            kb.action_for(&key(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            None,
+            "Ctrl+E stays editor"
+        );
+        // Other Ctrl chords remain bindable.
+        let kb = KeyBindings::from_overrides(&[("scroll-up".into(), "ctrl+k".into())]);
+        assert_eq!(
+            kb.action_for(&key(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+            Some(BindableAction::ScrollUp),
+            "ctrl+k is bindable"
+        );
     }
 }

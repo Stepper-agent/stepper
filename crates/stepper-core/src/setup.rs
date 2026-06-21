@@ -82,9 +82,13 @@ fn subdir_chain(root: &std::path::Path, cwd: &std::path::Path) -> Vec<std::path:
 
 /// Whether a path-scoped rule with these `paths` globs applies at `rel_cwd` (the
 /// working dir relative to the project root, `/`-normalized, `""` at the root).
-/// No globs → always. A glob is a directory scope: a trailing `/**` or `/*` (or a
-/// bare directory) matches that directory and everything beneath it; `*`/`**`
-/// match everywhere.
+///
+/// `paths` is a DIRECTORY scope, not a general file glob: a bare directory, a
+/// trailing `dir/`, `dir/*`, or `dir/**` matches that directory and everything
+/// beneath it; a bare `*`/`**` matches everywhere; no globs → always. A pattern
+/// with a wildcard anywhere but a trailing position (`**/widgets`, `src/*.md`,
+/// `*.rs`) is NOT a supported directory scope — it is reported and skipped rather
+/// than silently never matching.
 fn rule_applies(paths: &[String], rel_cwd: &str) -> bool {
     if paths.is_empty() {
         return true;
@@ -97,7 +101,16 @@ fn rule_applies(paths: &[String], rel_cwd: &str) -> bool {
         // Reduce a `dir/**`, `dir/*`, or bare `dir` glob to its directory prefix,
         // then match the cwd as that directory or any descendant of it.
         let base = p.trim_end_matches("**").trim_end_matches('*').trim_end_matches('/');
-        !base.is_empty() && (rel_cwd == base || rel_cwd.starts_with(&format!("{base}/")))
+        if base.is_empty() || base.contains('*') {
+            // A non-trailing wildcard can't be reduced to a directory prefix, so it
+            // would never match any real cwd. Surface it instead of dropping silently.
+            eprintln!(
+                "warning: rule `paths` glob '{p}' is not a supported directory scope \
+                 (use a directory like `src` or `src/**`); it will never match"
+            );
+            return false;
+        }
+        rel_cwd == base || rel_cwd.starts_with(&format!("{base}/"))
     })
 }
 
@@ -172,10 +185,19 @@ pub fn load_base_context(config: &Config, cwd: &std::path::Path) -> String {
             .collect();
         files.sort();
         for file in files {
-            if let Ok(text) = std::fs::read_to_string(&file)
-                && let Ok(rule) = stepper_config::parse_rule(&text)
-                && rule_applies(&rule.paths, &rel_cwd)
-            {
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            // A malformed rule file (broken frontmatter) is surfaced, not silently
+            // dropped — otherwise a rule the user wrote vanishes without a trace.
+            let rule = match stepper_config::parse_rule(&text) {
+                Ok(rule) => rule,
+                Err(e) => {
+                    eprintln!("warning: skipping malformed rule {}: {e}", file.display());
+                    continue;
+                }
+            };
+            if rule_applies(&rule.paths, &rel_cwd) {
                 let resolved =
                     stepper_config::imports::resolve_imports(&rule.body, &rules_dir, home.as_deref());
                 if !resolved.trim().is_empty() {
@@ -682,6 +704,12 @@ mod tests {
         assert!(!rule_applies(&["src".into()], "tests"));
         assert!(!rule_applies(&["src".into()], "srcfoo"), "prefix must be a path boundary");
         assert!(rule_applies(&["a".into(), "b".into()], "b/x"), "any glob matches");
+        assert!(rule_applies(&["src/*".into()], "src/a"), "trailing /* is a directory scope");
+        // A non-trailing wildcard isn't a supported directory scope: it never
+        // matches (and is warned about), rather than matching by accident.
+        assert!(!rule_applies(&["*.rs".into()], "src"));
+        assert!(!rule_applies(&["**/widgets".into()], "app/widgets"));
+        assert!(!rule_applies(&["src/*.md".into()], "src"));
     }
 
     #[test]

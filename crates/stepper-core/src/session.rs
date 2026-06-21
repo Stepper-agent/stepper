@@ -185,6 +185,12 @@ impl SessionStore {
             else {
                 continue;
             };
+            // A cleared/fresh session with no turns has nothing to continue or
+            // resume — skip it so `--continue` resumes the last REAL work instead
+            // of the empty session `/clear` persists for its clean-break id.
+            if record.turns.is_empty() {
+                continue;
+            }
             sessions.push((record, modified));
         }
         sessions.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
@@ -339,16 +345,9 @@ mod tests {
         let store = SessionStore::new(dir.path());
         assert!(store.latest().is_none(), "no sessions yet");
 
-        let older = SessionRecord {
-            id: "older".into(),
-            name: None,
-            turns: vec![],
-        };
-        let newer = SessionRecord {
-            id: "newer".into(),
-            name: None,
-            turns: vec![],
-        };
+        let turn = || vec![TurnRecord { user: "hi".into(), ..Default::default() }];
+        let older = SessionRecord { id: "older".into(), name: None, turns: turn() };
+        let newer = SessionRecord { id: "newer".into(), name: None, turns: turn() };
         store.save(&older).unwrap();
         store.save(&newer).unwrap();
 
@@ -362,6 +361,31 @@ mod tests {
         // Flip the mtimes: "older" becomes the most recent.
         set_mtime(&sessions.join("older.json"), now + std::time::Duration::from_secs(60));
         assert_eq!(store.latest().unwrap().id, "older");
+    }
+
+    #[test]
+    fn list_recent_skips_empty_sessions_so_continue_resumes_real_work() {
+        // `/clear` persists an empty session for a clean-break id; it must not be
+        // the `--continue`/resume target over the last session that did real work.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let real = SessionRecord {
+            id: "real".into(),
+            name: None,
+            turns: vec![TurnRecord { user: "did work".into(), ..Default::default() }],
+        };
+        let cleared = SessionRecord { id: "cleared".into(), name: None, turns: vec![] };
+        store.save(&real).unwrap();
+        store.save(&cleared).unwrap();
+
+        // Make the empty cleared session the NEWEST by mtime.
+        let sessions = dir.path().join(".stepper").join("sessions");
+        let now = std::time::SystemTime::now();
+        set_mtime(&sessions.join("real.json"), now - std::time::Duration::from_secs(60));
+        set_mtime(&sessions.join("cleared.json"), now);
+
+        assert_eq!(store.latest().unwrap().id, "real", "the empty newest session is skipped");
+        assert_eq!(store.list_recent(10).len(), 1, "only the non-empty session is listed");
     }
 
     #[test]

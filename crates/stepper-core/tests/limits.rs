@@ -198,6 +198,90 @@ async fn max_turns_cap_aborts_a_runaway_turn() {
     );
 }
 
+/// Fails the first `fail_times` requests with a retryable, zero-delay error, then
+/// finishes — to prove a step's transient retries don't each consume the step cap.
+struct FlakyProvider {
+    calls: Arc<AtomicUsize>,
+    fail_times: usize,
+}
+
+#[async_trait]
+impl LlmProvider for FlakyProvider {
+    fn provider(&self) -> &str {
+        "fake"
+    }
+    fn model(&self) -> &str {
+        "fake-m"
+    }
+    async fn chat_stream(
+        &self,
+        _request: ChatRequest,
+        _cancel: CancellationToken,
+    ) -> Result<ChatStream, ProviderError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n < self.fail_times {
+            // 503 is retryable; `retry_after: 0` keeps the test instant.
+            return Err(ProviderError::Api {
+                status: 503,
+                code: None,
+                message: "transient".into(),
+                retry_after: Some(std::time::Duration::ZERO),
+            });
+        }
+        let script = vec![ChatEvent::TextDelta("done".into()), ChatEvent::Done(StopReason::EndTurn)];
+        Ok(Box::pin(futures::stream::iter(script.into_iter().map(Ok))))
+    }
+}
+
+struct FlakyResolver {
+    calls: Arc<AtomicUsize>,
+    fail_times: usize,
+}
+
+impl ProviderResolver for FlakyResolver {
+    fn resolve(&self, _model_ref: &str) -> Result<Box<dyn LlmProvider>, CoreError> {
+        Ok(Box::new(FlakyProvider {
+            calls: self.calls.clone(),
+            fail_times: self.fail_times,
+        }))
+    }
+    fn model_info(&self, _model_ref: &str) -> ModelInfo {
+        ModelInfo {
+            context_window: 200_000,
+            max_output_tokens: 0,
+            input_per_mtok: 0.0,
+            output_per_mtok: 0.0,
+            cache_read_per_mtok: 0.0,
+            cache_write_per_mtok: 0.0,
+            estimated: false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn transient_retries_do_not_each_consume_the_step_budget() {
+    // One ReAct step that needs two transient retries to succeed must charge the
+    // step cap ONCE, not once per request. With `--max-turns 2` and two retries,
+    // the old per-`chat_stream` admission tripped MaxTurnsExceeded before the
+    // request ever succeeded; admitting once per step lets the turn finish.
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver = Arc::new(FlakyResolver { calls: calls.clone(), fail_times: 2 });
+    let orch = orchestrator(
+        resolver,
+        dir.path().to_path_buf(),
+        SessionLimits::new(Some(2), None, None),
+    );
+    let (tx, _drain) = drain_events();
+
+    let outcome = orch
+        .run_turn("go".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .await;
+
+    assert!(outcome.is_ok(), "the turn finishes instead of tripping MaxTurnsExceeded: {outcome:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 3, "2 transient failures + 1 success, all in one step");
+}
+
 #[tokio::test]
 async fn budget_cap_aborts_once_session_cost_reaches_it() {
     let dir = tempfile::tempdir().unwrap();

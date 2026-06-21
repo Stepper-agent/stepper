@@ -95,6 +95,7 @@ async fn finishes_turn_when_model_emits_no_tool_call() {
     let agent = AgentLoop {
         formatters: Default::default(),
         lsp: Default::default(),
+        budget: None,
         layer_name: "test".into(),
         provider: &provider,
         tools: &registry,
@@ -141,6 +142,7 @@ async fn terminates_at_step_cap_when_model_never_stops() {
     let agent = AgentLoop {
         formatters: Default::default(),
         lsp: Default::default(),
+        budget: None,
         layer_name: "looping".into(),
         provider: &provider,
         tools: &registry,
@@ -219,6 +221,7 @@ async fn blocking_pretooluse_hook_denies_the_tool() {
     let agent = AgentLoop {
         formatters: Default::default(),
         lsp: Default::default(),
+        budget: None,
         layer_name: "guarded".into(),
         provider: &provider,
         tools: &registry,
@@ -291,6 +294,7 @@ async fn posttooluse_hook_runs_after_the_tool_without_blocking_the_loop() {
     let agent = AgentLoop {
         formatters: Default::default(),
         lsp: Default::default(),
+        budget: None,
         layer_name: "post".into(),
         provider: &provider,
         tools: &registry,
@@ -352,6 +356,7 @@ async fn already_cancelled_token_returns_cancelled_before_any_step() {
     let agent = AgentLoop {
         formatters: Default::default(),
         lsp: Default::default(),
+        budget: None,
         layer_name: "cancelled".into(),
         provider: &provider,
         tools: &registry,
@@ -422,6 +427,7 @@ async fn pretooluse_matcher_is_exact_and_does_not_substring_match() {
     let agent = AgentLoop {
         formatters: Default::default(),
         lsp: Default::default(),
+        budget: None,
         layer_name: "guarded".into(),
         provider: &provider,
         tools: &registry,
@@ -503,6 +509,7 @@ fn agent<'a>(
     AgentLoop {
         formatters: Default::default(),
         lsp: Default::default(),
+        budget: None,
         layer_name: "retry".into(),
         provider,
         tools: registry,
@@ -659,6 +666,7 @@ async fn sampling_overrides_are_forwarded_to_the_provider_request() {
     let agent = AgentLoop {
         formatters: Default::default(),
         lsp: Default::default(),
+        budget: None,
         layer_name: "sampled".into(),
         provider: &provider,
         tools: &registry,
@@ -720,6 +728,7 @@ async fn max_tokens_comes_from_the_model_info_output_cap() {
     let mut agent = AgentLoop {
         formatters: Default::default(),
         lsp: Default::default(),
+        budget: None,
         layer_name: "capped".into(),
         provider: &provider,
         tools: &registry,
@@ -794,6 +803,7 @@ async fn formats_a_file_after_a_write_tool_succeeds() {
     let agent = AgentLoop {
         formatters,
         lsp: None,
+        budget: None,
         layer_name: "fmt".into(),
         provider: &provider,
         tools: &registry,
@@ -895,6 +905,7 @@ async fn lsp_diagnostics_are_appended_to_an_edit_tool_result() {
     let agent = AgentLoop {
         formatters: Default::default(),
         lsp: Some(Arc::new(FakeLsp)),
+        budget: None,
         layer_name: "diag".into(),
         provider: &provider,
         tools: &registry,

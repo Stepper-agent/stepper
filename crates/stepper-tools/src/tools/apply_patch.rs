@@ -246,6 +246,16 @@ async fn compute_change(cx: &ToolCx, hunk: &Hunk) -> Result<Change, ToolError> {
         Hunk::Add { path, contents } => {
             let path = cx.resolve(path);
             secret_check(&path, "create")?;
+            // `Add File` creates a *new* file. Refuse to clobber an existing one
+            // (which would silently destroy its contents — the approval diff shows
+            // `old: ""`, hiding the loss, and auto-approve modes never even prompt).
+            // The model should use `Update File` to change an existing file.
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                return Err(ToolError::InvalidArgs(format!(
+                    "apply_patch: {} already exists — use `Update File` to change it, not `Add File`",
+                    path.display()
+                )));
+            }
             Ok(Change {
                 path,
                 move_to: None,

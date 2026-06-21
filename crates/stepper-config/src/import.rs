@@ -1009,12 +1009,14 @@ fn read_text(path: &Path) -> io::Result<Option<String>> {
     }
 }
 
-/// Strict JSON read for the *destination*: `None` if absent, but a present file
-/// that does not parse is an `InvalidData` error (never silently dropped — that
-/// would let the import clobber a file it could not read).
+/// JSONC read for the *destination*: `None` if absent, but a present file that
+/// does not parse is an `InvalidData` error (never silently dropped — that would
+/// let the import clobber a file it could not read). Uses the same JSONC parser
+/// as `Config::load` so an annotated (commented) `setting.json` is accepted, not
+/// rejected as the import's "unreadable destination" safety net.
 fn read_json(path: &Path) -> io::Result<Option<Value>> {
     match read_text(path)? {
-        Some(raw) => serde_json::from_str(&raw).map(Some).map_err(|e| {
+        Some(raw) => crate::parse_setting_jsonc(&raw).map(Some).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{} is not valid JSON: {e}", path.display()),
@@ -1417,10 +1419,12 @@ mod tests {
     fn malformed_destination_setting_aborts_instead_of_clobbering() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        // A precious destination with a trailing comma (invalid JSON) + real data.
+        // A precious destination that is genuinely unparseable even as JSONC
+        // (unterminated — a trailing comma alone would now parse, since the import
+        // accepts the same JSONC as `Config::load`) + real data.
         write(
             &home.join(".stepper/setting.json"),
-            "{ \"step\": [\"plan\"], \"mcpServers\": { \"mine\": { \"command\": \"keepme\" } }, }",
+            "{ \"step\": [\"plan\", \"mcpServers\": { \"mine\": { \"command\": \"keepme\" } }",
         );
         write(&home.join(".claude/settings.json"), r#"{"permissions":{"allow":["mcp__pencil"]}}"#);
 
@@ -1438,6 +1442,22 @@ mod tests {
         write(&home.join(".stepper/setting.json"), "[1, 2, 3]");
         write(&home.join(".claude/settings.json"), r#"{"permissions":{"allow":["mcp__pencil"]}}"#);
         assert!(build_plan(home, ImportFrom::All).is_err());
+    }
+
+    #[test]
+    fn jsonc_annotated_destination_is_accepted_by_import() {
+        // A destination `setting.json` with comments / a trailing comma is valid
+        // JSONC (and loads via `Config::load`), so the import must accept it, not
+        // abort it as an "unreadable destination".
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        write(
+            &home.join(".stepper/setting.json"),
+            "{\n  // mine\n  \"mcpServers\": { \"mine\": { \"command\": \"keepme\" } },\n}",
+        );
+        write(&home.join(".claude/settings.json"), r#"{"permissions":{"allow":["mcp__pencil"]}}"#);
+        let plan = build_plan(home, ImportFrom::All).unwrap();
+        assert!(plan.permission_adds.contains(&("allow".into(), "Mcp(pencil)".into())));
     }
 
     #[test]

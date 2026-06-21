@@ -123,7 +123,7 @@ pub fn scaffold_default_pipeline(project_root: &Path) -> io::Result<Vec<PathBuf>
 pub fn set_pipeline_steps_if_empty(project_root: &Path, steps: &[String]) -> io::Result<bool> {
     let path = project_root.join(".stepper").join("setting.json");
     let mut value: serde_json::Value = if path.exists() {
-        serde_json::from_str(&fs::read_to_string(&path)?)
+        crate::parse_setting_jsonc(&fs::read_to_string(&path)?)
             .unwrap_or_else(|_| serde_json::json!({ "$schema": "stepper://setting.schema.json" }))
     } else {
         serde_json::json!({ "$schema": "stepper://setting.schema.json" })
@@ -154,7 +154,7 @@ pub fn update_settings(
 ) -> io::Result<()> {
     let path = stepper_dir.join("setting.json");
     let mut value: serde_json::Value = match fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).map_err(|e| {
+        Ok(raw) => crate::parse_setting_jsonc(&raw).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{} is not valid JSON: {e}", path.display()),
@@ -254,7 +254,7 @@ pub fn set_scalar(stepper_dir: &Path, key: &str, raw: &str) -> Result<(), String
 
     let settings_path = stepper_dir.join("setting.json");
     let mut root: serde_json::Value = match fs::read_to_string(&settings_path) {
-        Ok(text) => serde_json::from_str(&text)
+        Ok(text) => crate::parse_setting_jsonc(&text)
             .map_err(|e| format!("{} is not valid JSON: {e}", settings_path.display()))?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             serde_json::json!({ "$schema": "stepper://setting.schema.json" })
@@ -379,6 +379,47 @@ mod tests {
         assert!(after.contains("\"mode\""), "other keys preserved: {after}");
         // a configured pipeline is not clobbered
         assert!(!set_pipeline_steps_if_empty(root, &["other".into()]).unwrap());
+    }
+
+    #[test]
+    fn runtime_writes_accept_a_jsonc_annotated_setting_file() {
+        // `Config::load` accepts comments / trailing commas, so the runtime
+        // read-modify-write seams must too — otherwise a user who annotated
+        // `setting.json` can never persist a `/model` pick, a `config set`, or an
+        // initial pipeline (the old strict `from_str` rejected the loadable file).
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path();
+        let annotated = "{\n  // my settings\n  \"$schema\": \"x\",\n  \"mode\": \"auto\",\n}\n";
+        std::fs::write(sd.join("setting.json"), annotated).unwrap();
+
+        // update_settings (e.g. a /model pick) succeeds and keeps the other keys.
+        update_settings(sd, |obj| {
+            obj.insert("defaultModel".into(), serde_json::json!("openai/gpt-5"));
+        })
+        .unwrap();
+        // set_scalar (config set) succeeds on the same annotated file.
+        set_scalar(sd, "limits.turnTimeoutSecs", "90").unwrap();
+
+        let raw = std::fs::read_to_string(sd.join("setting.json")).unwrap();
+        let parsed: crate::settings::SettingsFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.default_model.as_deref(), Some("openai/gpt-5"));
+        assert_eq!(parsed.mode.as_deref(), Some("auto"), "the pre-existing key survives");
+        assert_eq!(parsed.limits.unwrap().turn_timeout_secs, Some(90));
+
+        // And set_pipeline_steps_if_empty (which takes a project root and joins
+        // `.stepper/setting.json` itself) no longer clobbers an annotated file's
+        // existing pipeline by misreading the un-parseable JSONC as empty.
+        let proj = tempfile::tempdir().unwrap();
+        let root = proj.path();
+        std::fs::create_dir_all(root.join(".stepper")).unwrap();
+        std::fs::write(
+            root.join(".stepper/setting.json"),
+            "{\n  // keep mine\n  \"step\": [\"mine\"],\n}\n",
+        )
+        .unwrap();
+        assert!(!set_pipeline_steps_if_empty(root, &["other".into()]).unwrap());
+        let after = std::fs::read_to_string(root.join(".stepper/setting.json")).unwrap();
+        assert!(after.contains("mine") && !after.contains("other"), "existing pipeline preserved: {after}");
     }
 
     #[test]

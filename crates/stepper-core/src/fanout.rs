@@ -29,6 +29,9 @@ pub struct FanoutTask {
     pub formatters: Arc<Vec<Formatter>>,
     /// LSP diagnostics provider for this worker (shared from the orchestrator).
     pub lsp: Option<Arc<dyn LspDiagnostics>>,
+    /// The turn's shared step/budget gate, or `None` when uncapped. Workers charge
+    /// the same gate so a fan-out cannot bypass `--max-turns`/`--max-budget-usd`.
+    pub budget: Option<Arc<crate::orchestrator::TurnBudget>>,
 }
 
 /// Hard ceiling on the number of workers a single fan-out (parallel layer or
@@ -115,6 +118,7 @@ pub async fn run_parallel(
                 worker: Some(index),
                 formatters: task.formatters,
                 lsp: task.lsp,
+                budget: task.budget,
             };
             let outcome = agent.drive(task.system, task.messages).await;
             let status = if outcome.is_ok() {

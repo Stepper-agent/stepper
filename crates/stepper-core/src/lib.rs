@@ -249,12 +249,18 @@ pub fn spawn_core(
                     // count to keep when rewinding the conversation. Prefer the count
                     // recorded with the checkpoint (robust to a drifted turn-id after
                     // failed turns or /compact); fall back to parsing N-1 from the id.
-                    let keep = snapshotter.checkpoint_turns(&checkpoint_id).or_else(|| {
-                        checkpoint_id
-                            .strip_prefix("turn-")
-                            .and_then(|s| s.parse::<usize>().ok())
-                            .map(|n| n.saturating_sub(1))
-                    });
+                    let keep = snapshotter
+                        .checkpoint_turns(&checkpoint_id)
+                        .or_else(|| {
+                            checkpoint_id
+                                .strip_prefix("turn-")
+                                .and_then(|s| s.parse::<usize>().ok())
+                                .map(|n| n.saturating_sub(1))
+                        })
+                        // Clamp to the live turn count: a stale checkpoint (left by
+                        // an earlier rewind) records more turns than the session now
+                        // has, which would set turn_id past the real count.
+                        .map(|k| k.min(session.turns.len()));
                     let restore_files = !matches!(scope, RewindScope::ConversationOnly);
                     let restore_convo = !matches!(scope, RewindScope::CodeOnly);
                     // Restore the working tree first (skipped for conversation-only).
@@ -269,6 +275,10 @@ pub fn spawn_core(
                         session.turns.truncate(keep);
                         turn_id = keep as u64;
                         let _ = store.save(&session);
+                        // Drop the now-abandoned "future" checkpoints so they can't
+                        // be re-selected later and restore a tree newer than the
+                        // (now shorter) conversation.
+                        snapshotter.prune_forward(keep);
                         // Reseed the live conversation to the rewound point so the
                         // next turn's context matches the tree.
                         orchestrator.resume_seed = session.seed_messages();
@@ -697,6 +707,11 @@ async fn run_watched(
     };
     tokio::pin!(timer);
     let mut timed_out = false;
+    // Once the action channel closes (sender dropped — app shutdown/panic), `recv`
+    // returns `None` immediately and forever. Without disabling the branch the
+    // `select!` would busy-spin at 100% CPU until `work` finishes; the flag parks
+    // it so only `work`/`timer` are awaited after the channel closes.
+    let mut rx_closed = false;
     loop {
         tokio::select! {
             _ = &mut work => return Control::Continue,
@@ -713,8 +728,12 @@ async fn run_watched(
                     .await;
                 turn_cancel.cancel();
             }
-            action = action_rx.recv() => match action {
-                Some(Action::Interrupt) | None => turn_cancel.cancel(),
+            action = action_rx.recv(), if !rx_closed => match action {
+                Some(Action::Interrupt) => turn_cancel.cancel(),
+                None => {
+                    turn_cancel.cancel();
+                    rx_closed = true;
+                }
                 Some(Action::Quit) => {
                     turn_cancel.cancel();
                     return Control::Quit;
@@ -833,6 +852,14 @@ fn handle_session_meta(
         let p = std::path::PathBuf::from(args.trim());
         if p.is_absolute() { p } else { project_root.join(p) }
     };
+    // Create the destination's parent (mirrors the default branch, which makes
+    // `.stepper/exports`) so a user path with a not-yet-existing subdirectory
+    // — `/export reports/out.md` — writes instead of failing with ENOENT.
+    if let Some(parent) = dest.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return (NoticeLevel::Warn, format!("export failed: {e}"));
+    }
     match std::fs::write(&dest, session.to_transcript_md()) {
         Ok(()) => (NoticeLevel::Info, format!("exported transcript to {}", dest.display())),
         Err(e) => (NoticeLevel::Warn, format!("export failed: {e}")),
@@ -978,5 +1005,28 @@ async fn run_shell(
                 })
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod session_meta_tests {
+    use super::*;
+    use crate::session::{SessionStore, TurnRecord};
+
+    #[test]
+    fn export_to_a_not_yet_existing_subdirectory_creates_it() {
+        // `/export reports/out.md` must create `reports/` (mirroring the default
+        // branch that makes `.stepper/exports`) instead of failing with ENOENT.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = SessionStore::new(root);
+        let mut session = SessionRecord::fresh();
+        session.turns.push(TurnRecord { user: "hi".into(), ..Default::default() });
+
+        let (level, msg) =
+            handle_session_meta("export", "reports/out.md", &mut session, &store, root);
+        assert!(matches!(level, NoticeLevel::Info), "export succeeded: {msg}");
+        let written = std::fs::read_to_string(root.join("reports/out.md")).unwrap();
+        assert!(written.contains("hi"), "transcript body present");
     }
 }

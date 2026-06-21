@@ -391,6 +391,71 @@ async fn edit_missing_old_string_is_invalid_args() {
     assert!(matches!(err, ToolError::InvalidArgs(_)));
 }
 
+/// An approver whose `ask` never returns — stands in for a user staring at the
+/// question overlay while the turn is cancelled (timeout / Interrupt) out from
+/// under them. `request` is unused here.
+struct NeverAsk;
+#[async_trait]
+impl Approver for NeverAsk {
+    async fn request(&self, _approval: Approval) -> Decision {
+        Decision::Allow
+    }
+    async fn ask(&self, _question: &str, _options: &[String]) -> Option<usize> {
+        std::future::pending::<()>().await;
+        None
+    }
+}
+
+#[tokio::test]
+async fn ask_user_question_unwinds_when_the_turn_is_cancelled() {
+    // A parked question must be interruptible: with the cancel token already
+    // fired, the tool returns the "interrupted" result promptly instead of
+    // hanging on the never-answering approver (which would hang the whole turn).
+    let dir = tempfile::tempdir().unwrap();
+    let cx = cx_with(dir.path(), PermissionMode::Auto, Arc::new(NeverAsk));
+    cx.cancel.cancel();
+    let reg = ToolRegistry::builtins();
+
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reg.get("ask_user_question").unwrap().call(
+            json!({"question": "pick", "options": ["a", "b"]}),
+            &cx,
+        ),
+    )
+    .await
+    .expect("ask must not hang when cancelled")
+    .unwrap();
+    let text = res.content_text();
+    assert!(text.contains("interrupted"), "expected interrupted result, got: {text}");
+}
+
+#[tokio::test]
+async fn edit_empty_old_string_is_rejected_not_a_whole_file_splice() {
+    // An empty `old_string` matches at every char boundary: `replace` would
+    // splice `new_string` between every character (file corruption). It must be
+    // rejected before any read/gate/write, with and without replace_all.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+    let reg = ToolRegistry::builtins();
+    let cx = cx_with(dir.path(), PermissionMode::AcceptEdits, Arc::new(AllowAll));
+
+    for replace_all in [false, true] {
+        let err = reg
+            .get("edit_file")
+            .unwrap()
+            .call(
+                json!({"path": "a.txt", "old_string": "", "new_string": "X", "replace_all": replace_all}),
+                &cx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)), "replace_all={replace_all}");
+    }
+    // The file is untouched.
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "hello\n");
+}
+
 #[tokio::test]
 async fn secret_files_are_denied_for_write_and_edit() {
     let dir = tempfile::tempdir().unwrap();
@@ -1489,6 +1554,31 @@ async fn apply_patch_adds_updates_and_deletes() {
         "alpha\nBETA\ngamma\n"
     );
     assert!(!dir.path().join("gone.txt").exists(), "delete removed the file");
+}
+
+#[tokio::test]
+async fn apply_patch_add_refuses_to_clobber_an_existing_file() {
+    // `Add File` over an existing path would silently destroy its contents (the
+    // approval diff would show an empty `old`). It must be rejected, leaving the
+    // file untouched, so the model uses `Update File` instead.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("exists.txt"), "precious\n").unwrap();
+    let reg = ToolRegistry::builtins();
+    let cx = cx_with(dir.path(), PermissionMode::Auto, Arc::new(AllowAll));
+
+    let patch = ["*** Begin Patch", "*** Add File: exists.txt", "+overwrite", "*** End Patch"].join("\n");
+    let err = reg
+        .get("apply_patch")
+        .unwrap()
+        .call(json!({ "patch": patch }), &cx)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ToolError::InvalidArgs(_)), "Add over existing is rejected");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("exists.txt")).unwrap(),
+        "precious\n",
+        "the existing file is untouched"
+    );
 }
 
 #[tokio::test]

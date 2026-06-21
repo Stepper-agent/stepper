@@ -44,6 +44,7 @@ fn task(dir: &std::path::Path, label: &str, say: &str) -> FanoutTask {
     FanoutTask {
         formatters: Default::default(),
         lsp: Default::default(),
+        budget: None,
         label: label.into(),
         worker_index: 0,
         provider: Box::new(SayProvider(say.into())),
@@ -131,6 +132,7 @@ fn gated_task(
     FanoutTask {
         formatters: Default::default(),
         lsp: Default::default(),
+        budget: None,
         label: label.into(),
         worker_index: 0,
         provider: Box::new(GatedProvider { in_flight, peak }),
@@ -224,6 +226,7 @@ fn task_with(dir: &std::path::Path, label: &str, provider: Box<dyn LlmProvider>)
     FanoutTask {
         formatters: Default::default(),
         lsp: Default::default(),
+        budget: None,
         label: label.into(),
         worker_index: 0,
         provider,

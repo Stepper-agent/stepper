@@ -462,9 +462,16 @@ async fn handle_compact(
         .as_ref()
         .and_then(|m| orchestrator.resolver.resolve(m).ok());
     let summary = match summarizer {
-        Some(p) => crate::compaction::summarize_with_model(p.as_ref(), &dropped, instructions)
-            .await
-            .unwrap_or_else(|| crate::compaction::heuristic_summary(&dropped)),
+        // Manual `/compact` runs outside an active turn, so there is no turn-cancel
+        // to thread; a fresh (never-cancelled) token keeps the prior behavior.
+        Some(p) => crate::compaction::summarize_with_model(
+            p.as_ref(),
+            &dropped,
+            instructions,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|| crate::compaction::heuristic_summary(&dropped)),
         None => crate::compaction::heuristic_summary(&dropped),
     };
     messages.insert(0, crate::compaction::marker(&summary));
@@ -1037,7 +1044,10 @@ async fn handle_settings(orchestrator: &Orchestrator, tx: &EventTx) {
 
 fn read_settings(dir: &Path) -> Option<stepper_config::SettingsFile> {
     let raw = std::fs::read_to_string(dir.join("setting.json")).ok()?;
-    serde_json::from_str(&raw).ok()
+    // JSONC, mirroring `Config::load`, so a commented `setting.json` shows real
+    // values in `/settings` instead of being silently read as empty.
+    let value = stepper_config::parse_setting_jsonc(&raw).ok()?;
+    serde_json::from_value(value).ok()
 }
 
 /// `/rewind` (and the TUI's Esc-Esc): list the `turn-N` working-tree

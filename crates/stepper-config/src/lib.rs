@@ -380,6 +380,15 @@ fn parse_jsonc(raw: &str, path: &Path) -> Result<Value, ConfigError> {
     Ok(if value.is_null() { Value::Object(Default::default()) } else { value })
 }
 
+/// The single public JSONC seam for `setting.json` text. Every read-modify-write
+/// path (runtime persistence in `scaffold`, `stepper import`, the `/settings`
+/// snapshot in core) must route through this so that any file `Config::load`
+/// accepts — comments and trailing commas included — is accepted everywhere
+/// else too. Empty / comment-only / `null` input normalizes to an empty object.
+pub fn parse_setting_jsonc(raw: &str) -> Result<Value, ConfigError> {
+    parse_jsonc(raw, Path::new("setting.json"))
+}
+
 /// Apply the env config-override layers (highest precedence), mirroring
 /// opencode's `OPENCODE_CONFIG` / `OPENCODE_CONFIG_CONTENT`: a custom JSONC file
 /// (`STEPPER_CONFIG=<path>`) then inline JSONC (`STEPPER_CONFIG_CONTENT=<json>`),

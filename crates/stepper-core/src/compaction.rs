@@ -161,6 +161,7 @@ pub async fn summarize_with_model(
     provider: &dyn LlmProvider,
     dropped: &[Message],
     instructions: Option<&str>,
+    cancel: &CancellationToken,
 ) -> Option<String> {
     let mut system = String::from(
         "Summarize the earlier conversation excerpt below concisely. Preserve key \
@@ -172,7 +173,10 @@ pub async fn summarize_with_model(
     let request = ChatRequest::new(provider.model())
         .with_system(system)
         .with_messages(vec![Message::user(render(dropped))]);
-    let response = provider.chat(request, CancellationToken::new()).await.ok()?;
+    // Thread the turn's cancel so an Esc during the summary call unwinds it
+    // (the caller falls back to the heuristic summary) instead of parking the
+    // turn on the summarizer until it finishes or the provider times out.
+    let response = provider.chat(request, cancel.clone()).await.ok()?;
     let text = response.text().trim().to_string();
     if text.is_empty() { None } else { Some(text) }
 }

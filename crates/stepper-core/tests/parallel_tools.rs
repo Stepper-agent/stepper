@@ -135,6 +135,7 @@ fn agent<'a>(
     AgentLoop {
         formatters: Default::default(),
         lsp: Default::default(),
+        budget: None,
         layer_name: "test".into(),
         provider,
         tools: registry,

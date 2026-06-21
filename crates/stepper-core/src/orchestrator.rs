@@ -80,7 +80,11 @@ impl TurnBudget {
         }
     }
 
-    fn admit_step(&self) -> bool {
+    /// Charge one logical ReAct step against the turn caps. Called once per step
+    /// by `AgentLoop::drive` (NOT per `chat_stream`, so a step's transient retries
+    /// don't each consume the step budget). Returns `false` and trips the matching
+    /// cap when over `--max-turns` or `--max-budget-usd`.
+    pub(crate) fn admit_step(&self) -> bool {
         if let Some(max) = self.max_steps
             && self.steps.fetch_add(1, Ordering::SeqCst) >= max
         {
@@ -140,9 +144,9 @@ impl LlmProvider for BudgetedProvider {
         request: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<ChatStream, ProviderError> {
-        if !self.budget.admit_step() {
-            return Err(ProviderError::Cancelled);
-        }
+        // Step admission moved to `AgentLoop::drive` (once per logical step). This
+        // wrapper only folds streamed usage into the session spend — a step's
+        // transient retries re-enter here but must not re-charge the step budget.
         let stream = self.inner.chat_stream(request, cancel).await?;
         let budget = self.budget.clone();
         let info = self.info;
@@ -368,14 +372,19 @@ impl Orchestrator {
         let mut pending_tasks: Vec<SubTask> = Vec::new();
 
         for (index, step) in self.steps.iter().enumerate() {
-            let provider = self.resolver.resolve(&step.model_ref)?;
+            // Resolve the primary, but DON'T fail the turn here: a resolve-time
+            // failure (misconfigured / not-logged-in primary) must fall through to
+            // the fallback chain below, exactly like a runtime failure would.
+            let primary = self.resolver.resolve(&step.model_ref);
 
-            let _ = event_tx
-                .send(AppEvent::ModelChanged(ModelView {
-                    provider: provider.provider().to_string(),
-                    model: provider.model().to_string(),
-                }))
-                .await;
+            if let Ok(provider) = &primary {
+                let _ = event_tx
+                    .send(AppEvent::ModelChanged(ModelView {
+                        provider: provider.provider().to_string(),
+                        model: provider.model().to_string(),
+                    }))
+                    .await;
+            }
             let _ = event_tx
                 .send(AppEvent::LayerStarted {
                     index,
@@ -440,7 +449,6 @@ impl Orchestrator {
             // The rates the successful run is priced at — swapped if the
             // fallback model ends up serving the layer.
             let mut active_info = model_info;
-            let provider = budget_wrap(provider, &budget, model_info);
             let layer_rules = layer_ruleset(&self.rules_snapshot(), &step.permission);
             let mut tools = self
                 .base_tools
@@ -515,7 +523,20 @@ impl Orchestrator {
 
             let mut succeeded = None;
             let mut last_err = None;
+            // budget-wrap the primary if it resolved; on a resolve failure record
+            // the error so the loop is skipped and the fallback chain takes over.
+            let primary_provider = match primary {
+                Ok(provider) => Some(budget_wrap(provider, &budget, model_info)),
+                Err(e) => {
+                    last_err = Some(e);
+                    None
+                }
+            };
             for attempt in 0..=step.retries {
+                // The primary didn't resolve — drop straight to the fallback chain.
+                let Some(provider) = &primary_provider else {
+                    break;
+                };
                 let cx = ToolCx {
                     cwd: self.cwd.clone(),
                     project_root: self.project_root.clone(),
@@ -546,6 +567,7 @@ impl Orchestrator {
                     worker: None,
                     formatters: self.formatters.clone(),
                     lsp: self.lsp.clone(),
+                    budget: budget.clone(),
                 };
                 match agent.drive(system.clone(), initial.clone()).await {
                     Ok(outcome) => {
@@ -615,6 +637,14 @@ impl Orchestrator {
                                     ),
                                 })
                                 .await;
+                            // Reflect the model now serving the layer (the primary's
+                            // may never have been announced if it failed to resolve).
+                            let _ = event_tx
+                                .send(AppEvent::ModelChanged(ModelView {
+                                    provider: provider.provider().to_string(),
+                                    model: provider.model().to_string(),
+                                }))
+                                .await;
                             let fallback_info = self.resolver.model_info(fallback_ref);
                             let provider = budget_wrap(provider, &budget, fallback_info);
                             let agent = AgentLoop {
@@ -644,6 +674,7 @@ impl Orchestrator {
                                 worker: None,
                                 formatters: self.formatters.clone(),
                                 lsp: self.lsp.clone(),
+                                budget: budget.clone(),
                             };
                             match agent.drive(system.clone(), initial.clone()).await {
                                 Ok(outcome) => {
@@ -809,6 +840,7 @@ impl Orchestrator {
                         messages: handoff.worker_messages(&sub.prompt),
                         formatters: self.formatters.clone(),
                         lsp: self.lsp.clone(),
+                        budget: budget.clone(),
                     });
                 }
                 Err(e) => sections.push((

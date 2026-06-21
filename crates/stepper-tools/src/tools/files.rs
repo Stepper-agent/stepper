@@ -224,6 +224,13 @@ impl Tool for EditFile {
 
     async fn call(&self, args: Value, cx: &ToolCx) -> Result<ToolResult, ToolError> {
         let a: EditArgs = parse_args(args)?;
+        // An empty `old_string` matches at every char boundary: `replace` would
+        // splice `new_string` between every character (corrupting the file) and
+        // `matches().count()` would report `len + 1` (a bogus "not unique"). Reject
+        // it outright — an edit must name the text it replaces.
+        if a.old_string.is_empty() {
+            return Err(ToolError::InvalidArgs("old_string must not be empty".into()));
+        }
         let path = cx.resolve(&a.path);
         if is_secret_path_resolved(&path) {
             return Err(ToolError::Denied(format!(

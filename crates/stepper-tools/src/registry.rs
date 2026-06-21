@@ -92,44 +92,28 @@ impl ToolRegistry {
         if allowed_servers.is_empty() {
             return self.clone();
         }
-        // Scope by tool ORIGIN (its MCP server), not by string prefix on the
-        // namespaced name: `mcp__<server>__<tool>` cannot be parsed back into
-        // (server, tool) once either contains `__`, so a prefix match leaks a
-        // server whose sanitized name is a prefix of another (`alpha` vs
-        // `alpha__beta`). Server names are sanitized identically to how the bridge
-        // namespaces them, so a `.`/space/`:` name still matches.
-        let allowed: std::collections::HashSet<String> = allowed_servers
+        // Scope by tool ORIGIN (its MCP server), compared against the *original*
+        // config server keys. `mcp_server()` returns the raw config key and
+        // allow/always_load lists hold the same raw keys, so a direct match is
+        // exact and injective. (Sanitizing both sides — to mirror the bridge's
+        // tool-name namespacing — would collapse distinct servers like `a.b` and
+        // `a_b` to one key, leaking one server's tools into the other's scope.)
+        let allowed: std::collections::HashSet<&str> = allowed_servers
             .iter()
             .chain(always_load_servers.iter())
-            .map(|s| sanitize_mcp_segment(s))
+            .map(|s| s.as_str())
             .collect();
         let tools = self
             .tools
             .iter()
             .filter(|(_, tool)| match tool.mcp_server() {
                 None => true, // built-in tools are never MCP-scoped
-                Some(server) => allowed.contains(&sanitize_mcp_segment(server)),
+                Some(server) => allowed.contains(server),
             })
             .map(|(name, tool)| (name.clone(), tool.clone()))
             .collect();
         ToolRegistry { tools }
     }
-}
-
-/// Mirror of the MCP tool-name sanitizer (stepper-mcp `bridge::sanitize`): a
-/// server name is namespaced into tool names with every non-[A-Za-z0-9_-] char
-/// replaced by `_`. Kept here (not imported) because stepper-mcp depends on
-/// stepper-tools, not the reverse.
-fn sanitize_mcp_segment(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -212,17 +196,35 @@ mod tests {
     }
 
     #[test]
-    fn filter_mcp_scopes_special_char_server_via_sanitized_prefix() {
-        // A server keyed "my.server" namespaces its tools as `mcp__my_server__*`;
-        // the allow-list must sanitize identically or the match silently fails.
-        let names = registry_with(&["read_file", "mcp__my_server__x", "mcp__other__y"])
-            .filter_mcp(&["my.server".into()], &[])
-            .names();
+    fn filter_mcp_scopes_special_char_server_by_original_key() {
+        // A server keyed "my.server" namespaces its tools as `mcp__my_server__*`,
+        // but its origin (and the allow-list) is the raw key "my.server". Scoping
+        // keys on the original server name, so the allow-list matches exactly.
+        let mut r = ToolRegistry::new();
+        r.register(named("mcp__my_server__x", Some("my.server")));
+        r.register(named("mcp__other__y", Some("other")));
+        let names = r.filter_mcp(&["my.server".into()], &[]).names();
         assert!(
             names.contains(&"mcp__my_server__x".to_string()),
-            "allowed special-char server matches via sanitized prefix"
+            "allowed special-char server matches by its original key"
         );
         assert!(!names.contains(&"mcp__other__y".to_string()));
+    }
+
+    #[test]
+    fn filter_mcp_does_not_leak_sanitize_colliding_servers() {
+        // Two distinct servers whose *sanitized* names collide: "a.b" and "a_b"
+        // both sanitize to "a_b". Sanitize-based scoping would let allowing only
+        // "a.b" leak "a_b"'s tools; original-key scoping keeps them separate.
+        let mut r = ToolRegistry::new();
+        r.register(named("mcp__a_b__x", Some("a.b")));
+        r.register(named("mcp__a_b__y", Some("a_b")));
+        let names = r.filter_mcp(&["a.b".into()], &[]).names();
+        assert!(names.contains(&"mcp__a_b__x".to_string()), "the allowed server's tool is kept");
+        assert!(
+            !names.contains(&"mcp__a_b__y".to_string()),
+            "a server that merely sanitize-collides is NOT leaked"
+        );
     }
 
     #[test]

@@ -513,6 +513,63 @@ async fn fallback_chain_walks_past_an_unresolvable_link_to_the_next_one() {
     );
 }
 
+/// The primary model can't even be RESOLVED (misconfigured / not logged in); only
+/// the fallback resolves.
+struct UnresolvablePrimaryResolver {
+    backup_seen: Arc<Mutex<Option<String>>>,
+}
+
+impl ProviderResolver for UnresolvablePrimaryResolver {
+    fn resolve(&self, model_ref: &str) -> Result<Box<dyn LlmProvider>, CoreError> {
+        match model_ref {
+            "backup/m" => Ok(Box::new(ScriptedProvider {
+                provider_name: "backup".into(),
+                model_name: "m".into(),
+                reply: "rescued by fallback".into(),
+                loops_forever: false,
+                seen_first_user: self.backup_seen.clone(),
+            })),
+            // primary/m (and anything else) cannot be resolved.
+            other => Err(CoreError::NoModel(other.to_string())),
+        }
+    }
+    fn model_info(&self, _model_ref: &str) -> ModelInfo {
+        ModelInfo {
+            context_window: 200_000,
+            max_output_tokens: 0,
+            input_per_mtok: 0.0,
+            output_per_mtok: 0.0,
+            cache_read_per_mtok: 0.0,
+            cache_write_per_mtok: 0.0,
+            estimated: false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn fallback_engages_when_the_primary_fails_to_resolve() {
+    // A resolve-time failure of the primary (not just a runtime failure) must drop
+    // to the fallback chain instead of aborting the whole turn.
+    let dir = tempfile::tempdir().unwrap();
+    let backup_seen = Arc::new(Mutex::new(None));
+    let resolver = Arc::new(UnresolvablePrimaryResolver { backup_seen: backup_seen.clone() });
+    let mut orch = orchestrator(resolver, dir.path().to_path_buf());
+    orch.steps = vec![step("solo", "primary/m", 5)];
+    orch.fallback_models = vec!["backup/m".into()];
+
+    let (tx, mut rx) = mpsc::channel(256);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    let summaries = orch
+        .run_turn("go".into(), Vec::new(), &tx, Arc::new(AllowAll), CancellationToken::new())
+        .await
+        .expect("an unresolvable primary still falls back")
+        .summaries;
+
+    assert_eq!(summaries[0].1, "rescued by fallback");
+    assert!(backup_seen.lock().unwrap().is_some(), "the fallback model was driven");
+}
+
 #[tokio::test]
 async fn non_retryable_failure_without_fallback_fails_without_retry() {
     let dir = tempfile::tempdir().unwrap();

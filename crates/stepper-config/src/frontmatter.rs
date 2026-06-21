@@ -184,10 +184,12 @@ pub fn parse_output_style(stem: &str, content: &str) -> Result<OutputStyleDef, C
     })
 }
 
-/// A path-scoped rule file (`.stepper/rules/*.md`): an optional `paths:` glob
-/// list (relative to the project root) plus the rule body. With no `paths` the
-/// rule always applies; otherwise it loads only when the working directory
-/// matches one of the globs.
+/// A path-scoped rule file (`.stepper/rules/*.md`): an optional `paths:`
+/// directory-scope list (relative to the project root) plus the rule body. With
+/// no `paths` the rule always applies; otherwise it loads only when the working
+/// directory is one of the scopes or beneath it. Each entry is a directory — a
+/// bare dir, `dir/`, `dir/*`, or `dir/**` (all "this dir and below"); a non-
+/// trailing wildcard (`**/x`, `*.rs`) is not a supported scope.
 #[derive(Debug, Clone)]
 pub struct RuleDef {
     pub paths: Vec<String>,

@@ -104,6 +104,7 @@ async fn react_loop_runs_a_tool_then_finishes() {
     let agent = AgentLoop {
         formatters: Default::default(),
         lsp: Default::default(),
+        budget: None,
         layer_name: "test".into(),
         provider: &provider,
         tools: &registry,

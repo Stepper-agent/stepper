@@ -364,6 +364,7 @@ impl Dispatcher for OrchestratorDispatcher {
                         messages: vec![Message::user(req.prompt)],
                         formatters: self.formatters.clone(),
                         lsp: self.lsp.clone(),
+                        budget: self.budget.clone(),
                     });
                 }
                 Err(e) => failed.push(DispatchResult {
