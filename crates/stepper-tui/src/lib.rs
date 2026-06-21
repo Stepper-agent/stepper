@@ -7,6 +7,7 @@
 mod app;
 mod files;
 mod input;
+mod keybindings;
 mod markdown;
 mod render;
 mod state;
@@ -52,6 +53,9 @@ pub struct TuiInit {
     /// `None` = the built-in footer. The event loop runs it with a JSON context
     /// on stdin and renders its first stdout line in place of the footer.
     pub status_line_cmd: Option<Vec<String>>,
+    /// Extra key bindings from `keybindings.json` as `(action, chord)` pairs
+    /// (e.g. `("external-editor", "ctrl+t")`). Additive: built-in keys still work.
+    pub keybindings: Vec<(String, String)>,
 }
 
 /// A slash command shown in the `/` palette: its name, a one-line description,

@@ -61,6 +61,22 @@ pub fn lower_event(event: &Event, state: &AppState) -> Lowered {
         };
     }
 
+    // User key bindings (additive) win first, so a custom chord maps to its
+    // action even if the key would otherwise type or do something else. The
+    // built-in defaults below still work — these only ADD keys.
+    if let Some(action) = state.keybindings.action_for(key) {
+        use crate::keybindings::BindableAction;
+        match action {
+            BindableAction::Newline => return Lowered::Action(Action::InsertNewline),
+            BindableAction::CycleMode => return Lowered::Action(Action::CycleMode),
+            BindableAction::ExternalEditor => return Lowered::Action(Action::OpenEditor),
+            BindableAction::ScrollUp => return Lowered::Action(Action::ScrollUp(SCROLL_PAGE)),
+            BindableAction::ScrollDown => return Lowered::Action(Action::ScrollDown(SCROLL_PAGE)),
+            // History search opens a TUI overlay (no `Action`); handled in app.rs.
+            BindableAction::HistorySearch => {}
+        }
+    }
+
     match key.code {
         KeyCode::Char('c') if ctrl => Lowered::Action(Action::Quit),
         // Shift+Tab cycles Auto -> Plan -> AcceptEdits -> Default (Claude Code
@@ -166,6 +182,7 @@ mod tests {
             notify_on_error: false,
             history_path: None,
             status_line_cmd: None,
+            keybindings: Vec::new(),
         })
     }
 

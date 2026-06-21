@@ -759,6 +759,8 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         .collect();
     // Per-project prompt-history file, resolved before the orchestrator moves.
     let history_path = history_file_path(&orchestrator.project_root);
+    // Extra key bindings (~/.stepper + project .stepper keybindings.json).
+    let keybindings = load_keybindings(&orchestrator.project_root);
     let event_rx = spawn_core(orchestrator, session, action_rx, cancel.clone());
     if let Some(provider) = key_prompt {
         let _ = action_tx
@@ -828,8 +830,28 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         notify_on_error: notify.2,
         history_path,
         status_line_cmd,
+        keybindings,
     };
     run_tui(event_rx, action_tx, init, cancel).await
+}
+
+/// Load `keybindings.json` (an `{ "action": "chord" }` object) from `~/.stepper`
+/// then the project `.stepper` (project entries win), flattened to `(action,
+/// chord)` pairs for the TUI. Missing/invalid files contribute nothing.
+fn load_keybindings(project_root: &std::path::Path) -> Vec<(String, String)> {
+    let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut load = |path: std::path::PathBuf| {
+        if let Ok(body) = std::fs::read_to_string(&path)
+            && let Ok(obj) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&body)
+        {
+            map.extend(obj);
+        }
+    };
+    if let Some(home) = std::env::var_os("HOME") {
+        load(std::path::PathBuf::from(home).join(".stepper").join("keybindings.json"));
+    }
+    load(project_root.join(".stepper").join("keybindings.json"));
+    map.into_iter().collect()
 }
 
 /// The per-project prompt-history file: `~/.stepper/history/<slug>-<hash>.json`.

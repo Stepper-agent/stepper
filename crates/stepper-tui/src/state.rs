@@ -641,6 +641,9 @@ pub struct AppState {
     /// Latest stdout (first line) from the status-line command, rendered in place
     /// of the built-in footer. `None` until the first run produces output.
     pub status_line: Option<String>,
+    /// User key bindings (additive over the built-in defaults), consulted first
+    /// by `lower_event`.
+    pub keybindings: crate::keybindings::KeyBindings,
 }
 
 /// Cap on persisted prompt history (newest kept). Bounds the on-disk file and
@@ -702,6 +705,7 @@ impl AppState {
             history_draft: None,
             status_line_cmd: init.status_line_cmd,
             status_line: None,
+            keybindings: crate::keybindings::KeyBindings::from_overrides(&init.keybindings),
             commands: init.commands,
             palette_selected: 0,
             esc_armed: false,
@@ -1867,6 +1871,7 @@ mod tests {
             notify_on_error: false,
             history_path: None,
             status_line_cmd: None,
+            keybindings: Vec::new(),
         })
     }
 

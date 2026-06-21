@@ -1254,6 +1254,7 @@ mod tests {
             notify_on_error: false,
             history_path: None,
             status_line_cmd: None,
+            keybindings: Vec::new(),
         })
     }
 

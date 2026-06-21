@@ -403,10 +403,12 @@ fn handle_terminal_event(
         return Ok(false);
     }
 
-    // Ctrl+R opens reverse search over the prompt history (shell convention).
+    // Ctrl+R (or a custom `history-search` binding) opens reverse search over the
+    // prompt history (shell convention).
     if let Event::Key(k) = &ev
-        && k.code == KeyCode::Char('r')
-        && k.modifiers.contains(KeyModifiers::CONTROL)
+        && ((k.code == KeyCode::Char('r') && k.modifiers.contains(KeyModifiers::CONTROL))
+            || state.keybindings.action_for(k)
+                == Some(crate::keybindings::BindableAction::HistorySearch))
     {
         state.open_history_search();
         return Ok(false);
@@ -865,6 +867,7 @@ mod tests {
             notify_on_error: false,
             history_path: None,
             status_line_cmd: None,
+            keybindings: Vec::new(),
         });
         s.overlay = Some(Overlay::ApiKey(ApiKeyOverlay {
             provider: "anthropic".into(),
