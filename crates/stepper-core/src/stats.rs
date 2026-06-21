@@ -186,8 +186,19 @@ impl SessionStats {
             out.push_str("\nby tool (calls)\n");
             let mut rows: Vec<(&String, &u64)> = self.per_tool.iter().collect();
             rows.sort_by_key(|r| std::cmp::Reverse(*r.1));
-            for (tool, count) in rows.into_iter().take(limit.max(1)) {
-                out.push_str(&format!("  {tool}: {count}\n"));
+            let displayed: Vec<(&String, u64)> = rows.into_iter().take(limit.max(1)).map(|(t, c)| (t, *c)).collect();
+            let max_count = displayed.iter().map(|&(_, c)| c).max().unwrap_or(1);
+            let total_calls: u64 = self.per_tool.values().sum();
+            for (tool, count) in displayed {
+                let bar_len = (count.saturating_mul(20) / max_count).max(1) as usize;
+                let bar = "█".repeat(bar_len);
+                let pct = if total_calls == 0 { 0.0 } else { count as f64 / total_calls as f64 * 100.0 };
+                let name = if tool.chars().count() > 18 {
+                    format!("{}..", tool.chars().take(16).collect::<String>())
+                } else {
+                    tool.clone()
+                };
+                out.push_str(&format!("  {name:<18} {bar:<20} {count:>3} ({pct:>4.1}%)\n"));
             }
         }
         out
@@ -318,8 +329,15 @@ mod tests {
         let s = aggregate_stats(&[session(vec![t])], None, 0);
         assert_eq!(s.per_tool["bash"], 2);
         assert_eq!(s.per_tool["read_file"], 1);
+        // The by-tool section renders an opencode-style bar + percentage: bash is
+        // the max (2/3) so it gets the full 20-wide bar and 66.7%, read_file 33.3%,
+        // and the raw count is preserved.
         let text = s.render_text(false, Some(10));
-        assert!(text.contains("bash: 2"), "tool section: {text}");
+        assert!(text.contains(&"█".repeat(20)), "max tool gets a full bar: {text}");
+        assert!(text.contains("2 (66.7%)"), "count preserved + percentage: {text}");
+        assert!(text.contains("(33.3%)"), "minority tool percentage: {text}");
+        // Without `--tools` the section (and its bars) is omitted entirely.
+        assert!(!s.render_text(false, None).contains('█'), "tools=None omits bars: {text}");
     }
 
     #[test]
