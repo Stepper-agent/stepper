@@ -1326,6 +1326,15 @@ impl AppState {
         }
     }
 
+    /// Number of options on the open question overlay (0 when none), so a
+    /// number-key press past the last option can be ignored rather than cancel.
+    pub fn question_option_count(&self) -> usize {
+        match &self.overlay {
+            Some(Overlay::Question(q)) => q.req.options.len(),
+            _ => 0,
+        }
+    }
+
     pub fn overlay_picker_move(&mut self, delta: i32) {
         if let Some(Overlay::Picker(p)) = &mut self.overlay {
             p.move_sel(delta);
@@ -1720,10 +1729,11 @@ impl AppState {
                 if let Some(Overlay::Approval(req)) = self.overlay.take() {
                     if req.id == request_id {
                         let _ = req.reply.send(decision);
-                        // surface the next queued worker's approval, if any.
-                        if let Some(next) = self.pending_approvals.pop_front() {
-                            self.overlay = Some(Overlay::Approval(next));
-                        }
+                        // Surface the next queued overlay (approval → question →
+                        // api-key prompt). Must go through `overlay_close` so a
+                        // question/prompt queued behind this approval isn't
+                        // stranded (its tool would hang on its oneshot).
+                        self.overlay_close();
                     } else {
                         self.overlay = Some(Overlay::Approval(req));
                     }
@@ -2005,6 +2015,21 @@ mod tests {
         s.answer_question(s.question_selected());
         assert!(s.overlay.is_none(), "answering closes the overlay");
         assert_eq!(rx.blocking_recv().unwrap(), Some(1), "the chosen index is sent back");
+    }
+
+    #[test]
+    fn question_option_count_reports_the_open_question_size() {
+        let mut s = test_state();
+        assert_eq!(s.question_option_count(), 0, "no question open");
+        let (tx, _rx) = tokio::sync::oneshot::channel::<Option<usize>>();
+        s.apply_event(AppEvent::QuestionAsked(stepper_protocol::QuestionRequest {
+            id: uuid::Uuid::new_v4(),
+            question: "Which?".into(),
+            options: vec!["a".into(), "b".into()],
+            reply: tx,
+        }));
+        // The app.rs digit handler uses this to ignore out-of-range numbers.
+        assert_eq!(s.question_option_count(), 2);
     }
 
     #[test]
@@ -2511,6 +2536,38 @@ mod tests {
         s.apply_action(Action::Approve { request_id: id2, decision: ApprovalDecision::Deny });
         assert!(matches!(rx2.blocking_recv(), Ok(ApprovalDecision::Deny)));
         assert!(s.overlay.is_none());
+    }
+
+    #[test]
+    fn question_queued_behind_an_approval_surfaces_when_the_approval_is_answered() {
+        use stepper_protocol::{ApprovalDecision, ApprovalKind, ApprovalRequest};
+        use tokio::sync::oneshot;
+        use uuid::Uuid;
+        let mut s = test_state();
+        let id = Uuid::new_v4();
+        let (reply, _rx) = oneshot::channel();
+        s.apply_event(AppEvent::ApprovalRequested(ApprovalRequest {
+            id,
+            kind: ApprovalKind::Mcp { server: "a".into(), tool: "x".into() },
+            reply,
+        }));
+        // A question arrives while the approval is on screen → it queues.
+        let (qtx, qrx) = oneshot::channel::<Option<usize>>();
+        s.apply_event(AppEvent::QuestionAsked(stepper_protocol::QuestionRequest {
+            id: Uuid::new_v4(),
+            question: "Which?".into(),
+            options: vec!["a".into(), "b".into()],
+            reply: qtx,
+        }));
+        assert_eq!(s.pending_questions.len(), 1);
+        // Answering the approval (via the real Action path) must surface the queued
+        // question, not strand it (which would hang the asking tool's oneshot).
+        s.apply_action(Action::Approve { request_id: id, decision: ApprovalDecision::AllowOnce });
+        assert!(matches!(&s.overlay, Some(Overlay::Question(_))), "question now shown");
+        assert!(s.pending_questions.is_empty());
+        // And the question's oneshot is still live (not dropped).
+        s.answer_question(Some(0));
+        assert_eq!(qrx.blocking_recv().unwrap(), Some(0));
     }
 
     #[test]

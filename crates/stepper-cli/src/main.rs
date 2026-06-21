@@ -943,8 +943,12 @@ async fn oneshot(
     let mut input = Action::SubmitInput(prompt);
     let mut assistant = String::new();
     let mut turn_error: Option<String> = None;
+    // The canonical parsed JSON, set once a reply validates against the schema.
+    let mut validated: Option<serde_json::Value> = None;
     // attempt 0 = the original prompt; up to `output_schema_retries` corrections.
-    let max_attempts = if validator.is_some() { global.output_schema_retries + 1 } else { 1 };
+    // saturating_add guards against a pathological `--output-schema-retries u32::MAX`.
+    let max_attempts =
+        if validator.is_some() { global.output_schema_retries.saturating_add(1) } else { 1 };
     for _attempt in 0..max_attempts {
         let (reply, err) = drive_one_turn(
             &mut event_rx,
@@ -953,6 +957,7 @@ async fn oneshot(
             stream_live,
             emit_json,
             global.dangerously_auto_approve,
+            validator.is_some(),
         )
         .await;
         assistant = reply;
@@ -965,7 +970,10 @@ async fn oneshot(
             break; // no schema → one turn only
         };
         match validate_output(validator, &assistant) {
-            Ok(()) => break,
+            Ok(value) => {
+                validated = Some(value);
+                break;
+            }
             Err(reason) => {
                 // Re-prompt with the validation error so the model can correct.
                 input = Action::SubmitInput(format!(
@@ -983,8 +991,12 @@ async fn oneshot(
         }
         println!("{}", serde_json::json!({ "type": "done" }));
     } else if validator.is_some() {
-        // Print the final structured result (the valid JSON, or the last attempt).
-        println!("{}", assistant.trim());
+        // Print the canonical validated JSON (re-serialized, so a fenced reply
+        // still emits parseable JSON); on failure print the last raw attempt.
+        match &validated {
+            Some(value) => println!("{}", serde_json::to_string(value).unwrap_or_default()),
+            None => println!("{}", assistant.trim()),
+        }
     } else {
         println!();
     }
@@ -999,6 +1011,8 @@ async fn oneshot(
 /// completes, returning the accumulated assistant text and any terminal error.
 /// `stream_live` prints text deltas to stdout as they arrive; `emit_json` writes
 /// one JSON event per tool/error line; `auto_approve` blindly allows approvals.
+/// `final_layer_only` resets the buffer at each `LayerStarted` so a multi-step
+/// pipeline yields just the LAST layer's reply (for `--output-schema` validation).
 async fn drive_one_turn(
     event_rx: &mut stepper_protocol::EventRx,
     action_tx: &stepper_protocol::ActionTx,
@@ -1006,6 +1020,7 @@ async fn drive_one_turn(
     stream_live: bool,
     emit_json: bool,
     auto_approve: bool,
+    final_layer_only: bool,
 ) -> (String, Option<String>) {
     let _ = action_tx.send(input).await;
     let mut stdout = std::io::stdout();
@@ -1016,6 +1031,9 @@ async fn drive_one_turn(
             println!("{line}");
         }
         match event {
+            // Schema mode validates only the final layer's reply, so drop earlier
+            // layers' text when the next layer begins.
+            AppEvent::LayerStarted { .. } if final_layer_only => assistant.clear(),
             AppEvent::AssistantTokenDelta(t) => {
                 assistant.push_str(&t);
                 if stream_live {
@@ -1074,14 +1092,19 @@ fn compile_output_schema(spec: &str) -> anyhow::Result<jsonschema::Validator> {
     jsonschema::validator_for(&schema).map_err(|e| anyhow::anyhow!("invalid JSON Schema: {e}"))
 }
 
-/// Validate a reply against the output schema. The reply must be a single JSON
-/// value (a leading/trailing ```` ```json ```` fence is tolerated) that conforms.
-fn validate_output(validator: &jsonschema::Validator, reply: &str) -> Result<(), String> {
+/// Validate a reply against the output schema, returning the parsed JSON value on
+/// success. The reply must be a single JSON value (a leading/trailing ```` ```json
+/// ```` fence is tolerated) that conforms. The caller prints the returned value
+/// (re-serialized), so a fenced-but-valid reply still emits parseable JSON.
+fn validate_output(
+    validator: &jsonschema::Validator,
+    reply: &str,
+) -> Result<serde_json::Value, String> {
     let trimmed = strip_code_fence(reply.trim());
     let value: serde_json::Value =
         serde_json::from_str(trimmed).map_err(|e| format!("reply is not valid JSON ({e})"))?;
     match validator.validate(&value) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(value),
         Err(error) => Err(error.to_string()),
     }
 }
@@ -1674,9 +1697,11 @@ mod tests {
             "properties": { "name": { "type": "string" } }
         });
         let v = jsonschema::validator_for(&schema).unwrap();
-        // Conforming (bare and fenced).
-        assert!(validate_output(&v, "{\"name\":\"ok\"}").is_ok());
-        assert!(validate_output(&v, "```json\n{\"name\":\"ok\"}\n```").is_ok());
+        // Conforming (bare and fenced) → returns the PARSED value, so the caller
+        // prints clean JSON even when the model wrapped it in a code fence.
+        assert_eq!(validate_output(&v, "{\"name\":\"ok\"}").unwrap()["name"], "ok");
+        let fenced = validate_output(&v, "```json\n{\"name\":\"ok\"}\n```").unwrap();
+        assert_eq!(serde_json::to_string(&fenced).unwrap(), "{\"name\":\"ok\"}", "fence stripped, re-serialized");
         // Missing required key, wrong type, and non-JSON all fail.
         assert!(validate_output(&v, "{\"other\":1}").is_err());
         assert!(validate_output(&v, "{\"name\":5}").is_err());

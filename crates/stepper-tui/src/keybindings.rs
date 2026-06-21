@@ -69,6 +69,19 @@ impl Chord {
             && key.modifiers.contains(KeyModifiers::ALT) == self.alt
             && key.modifiers.contains(KeyModifiers::SHIFT) == self.shift
     }
+
+    /// A binding is safe only if it can't shadow ordinary typing or a load-bearing
+    /// key: a plain character chord must carry Ctrl or Alt (Shift alone is just a
+    /// capital letter and would still eat keystrokes), and the submit/cancel keys
+    /// (Enter, Esc, Backspace) are never rebindable. Other named keys are fine.
+    fn is_bindable(&self) -> bool {
+        match self.code {
+            KeyCode::Char(_) => self.ctrl || self.alt,
+            // Enter=submit, Esc=interrupt, Backspace=edit must always work.
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Backspace => false,
+            _ => true,
+        }
+    }
 }
 
 /// Map a key-token to a `KeyCode` (named keys + single characters).
@@ -106,7 +119,12 @@ impl KeyBindings {
         let extra = overrides
             .iter()
             .filter_map(|(name, chord)| {
-                Some((Chord::parse(chord)?, BindableAction::from_name(name)?))
+                let chord = Chord::parse(chord)?;
+                // Reject footgun bindings (a bare letter would eat all typing).
+                if !chord.is_bindable() {
+                    return None;
+                }
+                Some((chord, BindableAction::from_name(name)?))
             })
             .collect();
         KeyBindings { extra }
@@ -154,5 +172,21 @@ mod tests {
         // An unbound key, and the skipped bogus action, match nothing.
         assert_eq!(kb.action_for(&key(KeyCode::Char('z'), KeyModifiers::CONTROL)), None);
         assert_eq!(kb.action_for(&key(KeyCode::Char('t'), KeyModifiers::NONE)), None);
+    }
+
+    #[test]
+    fn bare_letter_bindings_are_rejected_so_typing_still_works() {
+        // A modifier-less letter would shadow all typing of that letter — dropped.
+        let kb = KeyBindings::from_overrides(&[("external-editor".into(), "e".into())]);
+        assert_eq!(kb.action_for(&key(KeyCode::Char('e'), KeyModifiers::NONE)), None);
+        // Shift+letter is also just a capital — dropped.
+        let kb = KeyBindings::from_overrides(&[("external-editor".into(), "shift+e".into())]);
+        assert_eq!(kb.action_for(&key(KeyCode::Char('e'), KeyModifiers::SHIFT)), None);
+        // A named key with no modifier is fine (can't be typed as text).
+        let kb = KeyBindings::from_overrides(&[("scroll-up".into(), "pageup".into())]);
+        assert_eq!(kb.action_for(&key(KeyCode::PageUp, KeyModifiers::NONE)), Some(BindableAction::ScrollUp));
+        // Load-bearing keys (Enter/Esc/Backspace) are never rebindable.
+        let kb = KeyBindings::from_overrides(&[("scroll-up".into(), "enter".into())]);
+        assert_eq!(kb.action_for(&key(KeyCode::Enter, KeyModifiers::NONE)), None, "Enter stays submit");
     }
 }

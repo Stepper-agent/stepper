@@ -614,9 +614,13 @@ fn handle_overlay_key(state: &mut AppState, action_tx: &ActionTx, ev: &Event) {
                 KeyCode::Down => state.question_move(1),
                 KeyCode::Enter => state.answer_question(state.question_selected()),
                 KeyCode::Esc => state.answer_question(None),
+                // A digit picks that option directly — but only if it exists, so a
+                // stray out-of-range digit is a no-op, not an accidental dismissal.
                 KeyCode::Char(c @ '1'..='9') => {
                     let idx = c as usize - '1' as usize;
-                    state.answer_question(Some(idx));
+                    if idx < state.question_option_count() {
+                        state.answer_question(Some(idx));
+                    }
                 }
                 _ => {}
             }
