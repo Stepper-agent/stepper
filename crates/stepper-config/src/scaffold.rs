@@ -122,11 +122,21 @@ pub fn scaffold_default_pipeline(project_root: &Path) -> io::Result<Vec<PathBuf>
 /// already configured.
 pub fn set_pipeline_steps_if_empty(project_root: &Path, steps: &[String]) -> io::Result<bool> {
     let path = project_root.join(".stepper").join("setting.json");
-    let mut value: serde_json::Value = if path.exists() {
-        crate::parse_setting_jsonc(&fs::read_to_string(&path)?)
-            .unwrap_or_else(|_| serde_json::json!({ "$schema": "stepper://setting.schema.json" }))
-    } else {
-        serde_json::json!({ "$schema": "stepper://setting.schema.json" })
+    let mut value: serde_json::Value = match fs::read_to_string(&path) {
+        // A present-but-unparseable file must be an error, not silently replaced
+        // by the skeleton: that would clobber the user's providers/permissions/mcp
+        // (same rule `update_settings`/`import` follow). Only an absent file gets
+        // the schema-stamped skeleton.
+        Ok(raw) => crate::parse_setting_jsonc(&raw).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not valid JSON: {e}", path.display()),
+            )
+        })?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            serde_json::json!({ "$schema": "stepper://setting.schema.json" })
+        }
+        Err(e) => return Err(e),
     };
     let already = value
         .get("step")
@@ -420,6 +430,22 @@ mod tests {
         assert!(!set_pipeline_steps_if_empty(root, &["other".into()]).unwrap());
         let after = std::fs::read_to_string(root.join(".stepper/setting.json")).unwrap();
         assert!(after.contains("mine") && !after.contains("other"), "existing pipeline preserved: {after}");
+    }
+
+    #[test]
+    fn set_pipeline_steps_refuses_to_clobber_an_unparseable_setting_file() {
+        // A syntax error in setting.json (not JSONC — a truly broken file) used to
+        // be swallowed into the skeleton, so scaffolding overwrote the user's whole
+        // config. It must now surface as an error and leave the file untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".stepper")).unwrap();
+        let broken = r#"{ "providers": { "x": [ }"#;
+        std::fs::write(root.join(".stepper/setting.json"), broken).unwrap();
+        let err = set_pipeline_steps_if_empty(root, &["a".into()]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let after = std::fs::read_to_string(root.join(".stepper/setting.json")).unwrap();
+        assert_eq!(after, broken, "the unparseable file is left exactly as-is");
     }
 
     #[test]

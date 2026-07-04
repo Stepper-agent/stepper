@@ -113,6 +113,28 @@ impl Tool for ApplyPatch {
             changes.push(compute_change(cx, hunk).await?);
         }
 
+        // Two sections touching the same file would silently keep only the LAST
+        // one (each change is derived from the same on-disk original, and the
+        // summary/diffs would still show both as applied) — refuse instead, like
+        // the reference implementation.
+        let mut touched = std::collections::BTreeSet::new();
+        for c in &changes {
+            let mut paths = vec![c.path.clone()];
+            if let Some(dest) = &c.move_to
+                && dest != &c.path
+            {
+                paths.push(dest.clone());
+            }
+            for p in paths {
+                if !touched.insert(p.clone()) {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "apply_patch: {} appears in more than one section — combine the edits into a single section",
+                        p.display()
+                    )));
+                }
+            }
+        }
+
         // Phase 2: gate every change (fail-closed) before applying anything, so a
         // patch is all-or-nothing on permission too.
         for c in &changes {
@@ -307,6 +329,16 @@ async fn compute_change(cx: &ToolCx, hunk: &Hunk) -> Result<Change, ToolError> {
                 Some(mp) => {
                     let mq = cx.resolve(mp);
                     secret_check(&mq, "move")?;
+                    // `Move to` renames. Refuse to clobber an existing
+                    // destination: its contents would be silently destroyed, and
+                    // the approval diff shows the SOURCE file's old text, hiding
+                    // the loss (same contract as the `Add File` guard).
+                    if mq != p && tokio::fs::try_exists(&mq).await.unwrap_or(false) {
+                        return Err(ToolError::InvalidArgs(format!(
+                            "apply_patch: move destination {} already exists — delete it first or update it in place",
+                            mq.display()
+                        )));
+                    }
                     Some(mq)
                 }
                 None => None,

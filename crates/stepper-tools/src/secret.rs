@@ -62,6 +62,14 @@ pub fn find_secret_path_in_command(
     let tokens = shell_words::split(command)
         .map_err(|e| format!("command cannot be tokenized for secret-path screening: {e}"))?;
     for token in tokens {
+        // A glob pattern (`*.pem`, `id_*`, `[abc].key`) is an argument to a
+        // command like `find -name`/`ls`, not a literal file the command reads
+        // or writes — screening it blocks common, harmless dev commands. A
+        // literal secret path (`~/.ssh/id_rsa`, `.env`) has no metacharacters and
+        // is still caught.
+        if token.contains(['*', '?', '[']) {
+            continue;
+        }
         let looks_like_path =
             token.contains('/') || token.starts_with('~') || is_secret_path(Path::new(&token));
         if !looks_like_path {
@@ -128,6 +136,24 @@ mod tests {
     fn public_certs_are_not_flagged() {
         assert!(!is_secret_path(&PathBuf::from("/p/server.crt")));
         assert!(!is_secret_path(&PathBuf::from("/p/ca.cer")));
+    }
+
+    #[test]
+    fn glob_patterns_are_not_screened_but_literal_secret_paths_still_are() {
+        let cwd = PathBuf::from("/proj");
+        // Globs used as find/ls args touch no literal file → allowed.
+        for cmd in ["find . -name '*.pem'", "ls *.key", "rg -g '*.env' TODO"] {
+            assert_eq!(
+                find_secret_path_in_command(cmd, &cwd, None).unwrap(),
+                None,
+                "{cmd} should not be screened"
+            );
+        }
+        // A literal secret path is still refused.
+        assert!(find_secret_path_in_command("cat /home/u/.ssh/id_rsa", &cwd, Some(Path::new("/home/u")))
+            .unwrap()
+            .is_some());
+        assert!(find_secret_path_in_command("cat .env", &cwd, None).unwrap().is_some());
     }
 
     #[test]

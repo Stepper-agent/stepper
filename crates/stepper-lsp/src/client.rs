@@ -11,7 +11,7 @@ use crate::protocol::{read_message, write_message};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::BufReader;
@@ -54,12 +54,21 @@ pub struct LspClient {
     state: Arc<State>,
     /// Open documents → their last version (so re-touch sends `didChange`).
     open: Mutex<HashMap<PathBuf, i64>>,
+    /// Cleared when the reader task sees stdout EOF (the server exited/crashed),
+    /// so the manager can evict and respawn a dead client instead of writing to
+    /// a broken pipe forever.
+    alive: Arc<AtomicBool>,
     _child: tokio::process::Child,
 }
 
 impl LspClient {
     pub fn server_id(&self) -> &str {
         &self.server_id
+    }
+
+    /// Whether the server process is still connected (its stdout has not hit EOF).
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 
     /// Spawn `command` (argv) rooted at `root` and complete the LSP handshake.
@@ -97,6 +106,8 @@ impl LspClient {
             notify: Notify::new(),
         });
 
+        let alive = Arc::new(AtomicBool::new(true));
+
         // Reader task: dispatch responses, server→client requests, and pushed
         // diagnostics until the server closes stdout.
         {
@@ -106,13 +117,16 @@ impl LspClient {
             let server_id = server_id.clone();
             let root = root.to_path_buf();
             let initialization = initialization.clone();
+            let alive = alive.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout);
                 while let Ok(Some(msg)) = read_message(&mut reader).await {
                     handle_incoming(&msg, &pending, &state, &stdin, &server_id, &root, &initialization)
                         .await;
                 }
-                // EOF: fail any in-flight requests so callers don't hang.
+                // EOF: the server exited. Mark it dead and fail any in-flight
+                // requests so callers don't hang.
+                alive.store(false, Ordering::Relaxed);
                 pending.lock().unwrap().clear();
             });
         }
@@ -125,6 +139,7 @@ impl LspClient {
             pending,
             state,
             open: Mutex::new(HashMap::new()),
+            alive,
             _child: child,
         };
 

@@ -52,7 +52,14 @@ pub fn build_request_body(req: &ChatRequest, model: &str, stream: bool) -> Value
     // which return a 400 on Opus 4.7+. Older Claude and non-Claude anthropic-dialect
     // proxies keep the legacy surface they already accepted.
     let adaptive = adaptive_effort_capable(model);
-    if !adaptive {
+    // Sampling params are dropped when reasoning is active: Anthropic 400s on
+    // `temperature`/`top_p` alongside any thinking block ("temperature may only
+    // be set to 1 when thinking is enabled"). Adaptive models drop them
+    // unconditionally (they never take the legacy surface); legacy models drop
+    // them only when a `thinking-budget` is in play — e.g. the default `haiku`
+    // alias with `/effort` on and a configured temperature used to hard-400.
+    let thinking_active = adaptive || req.thinking.is_some();
+    if !thinking_active {
         if let Some(t) = req.temperature {
             body.insert("temperature".into(), json!(t));
         }

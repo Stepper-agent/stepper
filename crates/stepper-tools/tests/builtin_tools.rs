@@ -750,6 +750,37 @@ async fn bash_timeout_kills_long_process_within_budget() {
 }
 
 #[tokio::test]
+async fn bash_returns_at_command_exit_not_when_a_backgrounded_child_closes_pipes() {
+    // A command that backgrounds a subprocess inheriting the pipes used to stall
+    // the full timeout waiting for pipe EOF, then falsely report a timeout.
+    // Completion must key off the foreground command exiting.
+    let dir = tempfile::tempdir().unwrap();
+    let reg = ToolRegistry::builtins();
+    let cx = cx_with(dir.path(), PermissionMode::Auto, Arc::new(AllowAll));
+
+    let start = Instant::now();
+    let result = reg
+        .get("bash")
+        .unwrap()
+        .call(
+            json!({"command": "sleep 30 & echo started", "timeout_ms": 10_000}),
+            &cx,
+        )
+        .await
+        .expect("foreground command exits promptly");
+    let elapsed = start.elapsed();
+    let text = match &result.content[0] {
+        stepper_provider::ToolContent::Text { text } => text.clone(),
+        other => panic!("expected text, got {other:?}"),
+    };
+    assert!(text.contains("started"), "foreground output captured: {text}");
+    assert!(
+        elapsed.as_secs() < 5,
+        "must return at bash exit, not stall on the backgrounded child's pipe: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn bash_cancellation_token_aborts_run() {
     let dir = tempfile::tempdir().unwrap();
     let reg = ToolRegistry::builtins();
@@ -1608,6 +1639,79 @@ async fn apply_patch_renames_with_move_to() {
     assert_eq!(
         std::fs::read_to_string(dir.path().join("new.rs")).unwrap(),
         "fn b() {}\n"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_move_to_refuses_to_clobber_an_existing_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("old.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(dir.path().join("keep.rs"), "IMPORTANT\n").unwrap();
+    let reg = ToolRegistry::builtins();
+    let cx = cx_with(dir.path(), PermissionMode::Auto, Arc::new(AllowAll));
+
+    let patch = [
+        "*** Begin Patch",
+        "*** Update File: old.rs",
+        "*** Move to: keep.rs",
+        "@@",
+        "-fn a() {}",
+        "+fn b() {}",
+        "*** End Patch",
+    ]
+    .join("\n");
+    let err = reg
+        .get("apply_patch")
+        .unwrap()
+        .call(json!({ "patch": patch }), &cx)
+        .await
+        .unwrap_err();
+    match err {
+        ToolError::InvalidArgs(msg) => assert!(msg.contains("already exists"), "got {msg}"),
+        other => panic!("expected refusal, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("keep.rs")).unwrap(),
+        "IMPORTANT\n",
+        "the destination is not clobbered"
+    );
+    assert!(dir.path().join("old.rs").exists(), "the source is untouched on refusal");
+}
+
+#[tokio::test]
+async fn apply_patch_refuses_two_sections_targeting_the_same_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("m.rs"), "one\ntwo\n").unwrap();
+    let reg = ToolRegistry::builtins();
+    let cx = cx_with(dir.path(), PermissionMode::Auto, Arc::new(AllowAll));
+
+    let patch = [
+        "*** Begin Patch",
+        "*** Update File: m.rs",
+        "@@",
+        "-one",
+        "+ONE",
+        "*** Update File: m.rs",
+        "@@",
+        "-two",
+        "+TWO",
+        "*** End Patch",
+    ]
+    .join("\n");
+    let err = reg
+        .get("apply_patch")
+        .unwrap()
+        .call(json!({ "patch": patch }), &cx)
+        .await
+        .unwrap_err();
+    match err {
+        ToolError::InvalidArgs(msg) => assert!(msg.contains("more than one section"), "got {msg}"),
+        other => panic!("expected refusal, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("m.rs")).unwrap(),
+        "one\ntwo\n",
+        "nothing is written when a duplicate target is rejected"
     );
 }
 

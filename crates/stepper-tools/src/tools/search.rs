@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use stepper_permission::PermissionRequest;
 use stepper_provider::{ToolError, ToolResult, ToolSpec};
+use tokio_util::sync::CancellationToken;
 
 const MAX_MATCHES: usize = 200;
 
@@ -88,7 +89,8 @@ impl Tool for Grep {
             Regex::new(&a.pattern).map_err(|e| ToolError::InvalidArgs(format!("bad regex: {e}")))?;
 
         let gate = cx.read_gate();
-        let result = tokio::task::spawn_blocking(move || grep_walk(&base, &regex, &gate))
+        let cancel = cx.cancel.clone();
+        let result = tokio::task::spawn_blocking(move || grep_walk(&base, &regex, &gate, &cancel))
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
         Ok(ToolResult::text(result))
@@ -104,9 +106,15 @@ fn project_walker(base: &Path) -> WalkBuilder {
     w
 }
 
-fn grep_walk(base: &Path, regex: &Regex, gate: &ReadGate) -> String {
+fn grep_walk(base: &Path, regex: &Regex, gate: &ReadGate, cancel: &CancellationToken) -> String {
     let mut out = Vec::new();
     for entry in project_walker(base).build().flatten() {
+        // The blocking walk can't be aborted, so observe the turn's cancel token
+        // cooperatively — Esc during a large-tree search returns promptly instead
+        // of running to completion.
+        if cancel.is_cancelled() {
+            break;
+        }
         if out.len() >= MAX_MATCHES {
             out.push("… [more matches truncated]".to_string());
             break;
@@ -177,9 +185,13 @@ impl Tool for GlobTool {
             .compile_matcher();
 
         let gate = cx.read_gate();
+        let cancel = cx.cancel.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();
             for entry in project_walker(&base).build().flatten() {
+                if cancel.is_cancelled() {
+                    break;
+                }
                 let path = entry.path();
                 if is_secret_path_resolved(path) || gate.denies(path) {
                     continue;

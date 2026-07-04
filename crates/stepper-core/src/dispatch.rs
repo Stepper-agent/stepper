@@ -375,23 +375,28 @@ impl Dispatcher for OrchestratorDispatcher {
             }
         }
 
-        let mut results: Vec<DispatchResult> =
-            run_parallel(tasks, self.concurrency.max(1), self.event_tx.clone())
-                .await
-                .into_iter()
-                .map(|(label, outcome)| match outcome {
-                    Ok(o) => DispatchResult {
-                        label,
-                        ok: true,
-                        summary: o.summary,
-                    },
-                    Err(e) => DispatchResult {
-                        label,
-                        ok: false,
-                        summary: format!("failed: {e}"),
-                    },
-                })
-                .collect();
+        let raw = run_parallel(tasks, self.concurrency.max(1), self.event_tx.clone()).await;
+        let mut results: Vec<DispatchResult> = Vec::with_capacity(raw.len());
+        for (label, outcome) in raw {
+            // Every finished dispatched sub-agent (the `task` tool, and the
+            // `dispatch` tool's parallel workers) is a sub-agent stop — fire the
+            // hook like the fan-out layer does, so a SubagentStop cleanup hook is
+            // not silently dead on this entry point. A FRESH token so it still
+            // runs when the turn was cancelled mid-dispatch.
+            let _ = self
+                .hooks
+                .run(
+                    "SubagentStop",
+                    Some(&label),
+                    &serde_json::json!({ "worker": &label }),
+                    &CancellationToken::new(),
+                )
+                .await;
+            results.push(match outcome {
+                Ok(o) => DispatchResult { label, ok: true, summary: o.summary },
+                Err(e) => DispatchResult { label, ok: false, summary: format!("failed: {e}") },
+            });
+        }
         results.extend(failed);
         results
     }
@@ -511,6 +516,40 @@ mod tests {
             "a spent budget must block the dispatched sub-agent: {:?}",
             results[0]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_fires_the_subagent_stop_hook_per_worker() {
+        // A SubagentStop hook used to fire only for parallel-layer workers, never
+        // for `task`/`dispatch` — so cleanup/notify hooks were silently dead on the
+        // standard sub-agent entry point.
+        use std::collections::BTreeMap;
+        use stepper_config::HookEntry;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("subagent_stopped.txt");
+        let mut hooks = BTreeMap::new();
+        hooks.insert(
+            "SubagentStop".to_string(),
+            vec![HookEntry {
+                matcher: None,
+                command: format!("echo done >> {}", marker.display()),
+                timeout: None,
+            }],
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel::<AppEvent>(64);
+        let mut d = dispatcher(None, "", tx, dir.path().to_path_buf());
+        d.hooks = Arc::new(HookHost::new(hooks, dir.path().to_path_buf()));
+
+        let results = d
+            .dispatch(vec![DispatchRequest {
+                label: "reviewer".into(),
+                prompt: "review".into(),
+                model_ref: None,
+                ..Default::default()
+            }])
+            .await;
+        assert!(results[0].ok, "the worker completed: {:?}", results[0]);
+        assert!(marker.exists(), "SubagentStop hook fired for the dispatched worker");
     }
 
     #[test]

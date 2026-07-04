@@ -91,41 +91,79 @@ impl Tool for ReadFile {
         )
         .await?;
 
-        let raw = tokio::fs::read(&path)
-            .await
-            .map_err(|e| ToolError::Execution(format!("read {}: {e}", path.display())))?;
-        let text = String::from_utf8_lossy(&raw);
-
         let body = match (a.offset, a.limit) {
             // A whole-file read of a large file is rejected (it would blow the
             // context window), but `offset`/`limit` slice FIRST so a window of a
             // big file is still readable; only the slice is size-capped.
             (None, None) => {
+                let raw = tokio::fs::read(&path)
+                    .await
+                    .map_err(|e| ToolError::Execution(format!("read {}: {e}", path.display())))?;
                 if raw.len() > MAX_READ_BYTES {
                     return Err(ToolError::Execution(format!(
                         "file is {} bytes (> {MAX_READ_BYTES} limit); pass offset/limit to read a slice",
                         raw.len()
                     )));
                 }
-                text.into_owned()
+                String::from_utf8_lossy(&raw).into_owned()
             }
-            (offset, limit) => {
-                let start = offset.unwrap_or(1).saturating_sub(1);
-                let mut sliced = text
-                    .lines()
-                    .skip(start)
-                    .take(limit.unwrap_or(usize::MAX))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if sliced.len() > MAX_READ_BYTES {
-                    crate::truncate_on_char_boundary(&mut sliced, MAX_READ_BYTES);
-                    sliced.push_str("\n… [truncated at the read-size limit — narrow the offset/limit]");
-                }
-                sliced
-            }
+            // Stream line by line so reading a window of a multi-GB file never
+            // pulls the whole thing into memory (which the size-limited whole-read
+            // above directs the model toward, and would OOM on a file bigger than
+            // RAM).
+            (offset, limit) => read_line_window(&path, offset.unwrap_or(1), limit).await?,
         };
         Ok(ToolResult::text(body))
     }
+}
+
+/// Read lines `[offset, offset+limit)` (1-based) without loading the whole file:
+/// skip to the window, collect up to the read-size cap, then stop. `offset` is
+/// clamped to at least 1.
+async fn read_line_window(
+    path: &std::path::Path,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<String, ToolError> {
+    use tokio::io::AsyncBufReadExt;
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| ToolError::Execution(format!("read {}: {e}", path.display())))?;
+    let mut lines = tokio::io::BufReader::new(file).lines();
+    let start = offset.saturating_sub(1);
+    let take = limit.unwrap_or(usize::MAX);
+    let mut out = String::new();
+    let mut index = 0usize;
+    let mut kept = 0usize;
+    let mut capped = false;
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|e| ToolError::Execution(format!("read {}: {e}", path.display())))?
+    {
+        if index < start {
+            index += 1;
+            continue;
+        }
+        if kept >= take {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&line);
+        kept += 1;
+        if out.len() > MAX_READ_BYTES {
+            crate::truncate_on_char_boundary(&mut out, MAX_READ_BYTES);
+            capped = true;
+            break;
+        }
+        index += 1;
+    }
+    if capped {
+        out.push_str("\n… [truncated at the read-size limit — narrow the offset/limit]");
+    }
+    Ok(out)
 }
 
 impl Default for WriteFile {

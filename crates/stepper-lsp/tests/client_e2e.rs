@@ -44,6 +44,31 @@ async fn a_re_edit_reuses_the_server_and_still_reports() {
 }
 
 #[tokio::test]
+async fn a_crashed_server_is_respawned_so_diagnostics_do_not_vanish() {
+    // The fake exits when it opens a file containing `CRASH`. After that, a later
+    // edit must respawn the server and still report — a dead cached client used to
+    // be reused forever, silently returning a false "clean".
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("c.demo");
+    std::fs::write(&file, "ok\n").unwrap();
+    let mgr = LspManager::new(dir.path().to_path_buf(), vec![fake_spec(vec![".demo".into()])]);
+
+    assert!(mgr.diagnostics_after_edit(&file).await.contains("fake error"));
+    // Trigger the crash: the server exits on this open.
+    std::fs::write(&file, "CRASH\n").unwrap();
+    let _ = mgr.diagnostics_after_edit(&file).await;
+    // Give the reader task a beat to observe EOF and mark the client dead.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Next edit must respawn and report again.
+    std::fs::write(&file, "back\n").unwrap();
+    assert!(
+        mgr.diagnostics_after_edit(&file).await.contains("fake error"),
+        "a crashed server is respawned and diagnostics resume"
+    );
+    mgr.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_non_matching_extension_yields_no_report() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("z.other");

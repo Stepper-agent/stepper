@@ -108,6 +108,11 @@ impl Compactor {
 /// enough that a few large reads/greps don't dominate the window.
 const MICRO_TOOL_RESULT_CAP: usize = 2_000;
 
+/// chars/4-equivalent estimate for one image block: ~1.6k vision tokens, the
+/// provider-side cap after downscaling. Deliberately independent of the base64
+/// payload size (see the Image arm in [`message_chars`]).
+const IMAGE_ESTIMATE_CHARS: usize = 6_400;
+
 /// chars/4 token estimate over every block kind (text, thinking, tool inputs
 /// and results), so tool-heavy histories — usually the bulk — are counted.
 pub fn estimate_tokens(messages: &[Message]) -> u64 {
@@ -121,9 +126,12 @@ fn message_chars(message: &Message) -> usize {
         .iter()
         .map(|block| match block {
             ContentBlock::Text(text) => text.len(),
-            // An image's char-size proxy: the base64 payload length (compaction
-            // only needs a rough magnitude, not real vision-token accounting).
-            ContentBlock::Image { data, .. } => data.len(),
+            // Vision tokens are dimension-based (≈ w·h/750, capped by provider
+            // downscaling at roughly 1.6k tokens) — the base64 payload length
+            // overestimates them 200-300×, which used to fire a full compaction
+            // (dropping the whole recent conversation) the moment a screenshot
+            // was pasted. A flat cap-level estimate keeps the magnitude right.
+            ContentBlock::Image { .. } => IMAGE_ESTIMATE_CHARS,
             ContentBlock::Thinking { text, .. } => text.len(),
             ContentBlock::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
             ContentBlock::ToolResult { content, .. } => tool_result_chars(content),
@@ -326,6 +334,29 @@ mod tests {
         // 400 text + 40 thinking + (4 name + 16 serialized input) + 2 result = 462
         assert_eq!(estimate_tokens(&messages), 462 / 4);
         assert_eq!(estimate_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn a_pasted_image_is_estimated_by_vision_tokens_not_base64_length() {
+        // A 1MB PNG is ~1.33MB of base64 → the old length-based estimate said
+        // ~349k tokens and instantly forced a full compaction of a session with
+        // plenty of real headroom. The estimate must stay at the vision cap.
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "A".repeat(1_400_000),
+            }],
+        }];
+        assert_eq!(estimate_tokens(&messages), (IMAGE_ESTIMATE_CHARS / 4) as u64);
+        let c = Compactor::new(200_000);
+        let mut m = convo(20);
+        m.push(messages[0].clone());
+        let estimated = estimate_tokens(&m);
+        assert!(
+            c.plan(&m, estimated).is_none(),
+            "a big screenshot alone must not push a small conversation over the threshold"
+        );
     }
 
     #[test]

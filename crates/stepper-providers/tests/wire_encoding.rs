@@ -240,6 +240,50 @@ fn anthropic_emits_top_level_thinking_config_only_when_requested() {
 }
 
 #[test]
+fn anthropic_drops_sampling_params_when_thinking_is_active_on_a_legacy_model() {
+    // A legacy model (`haiku`) with a set temperature AND a thinking budget must
+    // not send `temperature`/`top_p` alongside thinking — Anthropic 400s.
+    let mut req = convo();
+    req.temperature = Some(0.0);
+    req.top_p = Some(0.5);
+    let no_thinking = wire::anthropic::build_request_body(&req, "claude-haiku-4-5", true);
+    assert_eq!(no_thinking["temperature"], json!(0.0), "sampling kept without thinking");
+
+    req.thinking = Some(ThinkingConfig { budget_tokens: 4096 });
+    let with_thinking = wire::anthropic::build_request_body(&req, "claude-haiku-4-5", true);
+    assert_eq!(with_thinking["thinking"]["type"], "enabled");
+    assert!(with_thinking.get("temperature").is_none(), "temperature dropped with thinking");
+    assert!(with_thinking.get("top_p").is_none(), "top_p dropped with thinking");
+}
+
+#[test]
+fn openai_reasoning_models_drop_sampling_params() {
+    let mut req = convo();
+    req.temperature = Some(0.5);
+    req.top_p = Some(0.25);
+
+    // Non-reasoning model keeps them.
+    let chat = wire::openai::build_request_body(&req, "gpt-4o", true);
+    assert!(chat.get("temperature").is_some(), "gpt-4o keeps temperature");
+    let resp = wire::responses::build_request_body(&req, "gpt-4o", true, false);
+    assert!(resp.get("temperature").is_some(), "gpt-4o responses keeps temperature");
+
+    // Reasoning model by name (no effort set) drops them.
+    for m in ["o3-mini", "gpt-5", "provider/o1"] {
+        let chat = wire::openai::build_request_body(&req, m, true);
+        assert!(chat.get("temperature").is_none(), "{m}: chat drops temperature");
+        assert!(chat.get("top_p").is_none(), "{m}: chat drops top_p");
+        let resp = wire::responses::build_request_body(&req, m, true, false);
+        assert!(resp.get("temperature").is_none(), "{m}: responses drops temperature");
+    }
+
+    // A configured effort marks any model as reasoning.
+    req.reasoning_effort = Some("high".into());
+    let chat = wire::openai::build_request_body(&req, "gpt-4o", true);
+    assert!(chat.get("temperature").is_none(), "effort set → drop temperature");
+}
+
+#[test]
 fn openai_and_responses_map_reasoning_effort_per_dialect() {
     let mut req = convo();
     req.reasoning_effort = Some("high".into());
@@ -430,7 +474,10 @@ fn anthropic_date_suffixed_legacy_ids_stay_on_the_legacy_surface() {
     assert_eq!(body["thinking"]["type"], "enabled", "Opus 4.0 keeps legacy extended thinking");
     assert_eq!(body["thinking"]["budget_tokens"], json!(8_192));
     assert!(body.get("output_config").is_none(), "no output_config.effort on a pre-4.6 model");
-    assert!(body.get("temperature").is_some(), "legacy keeps sampling params");
+    assert!(
+        body.get("temperature").is_none(),
+        "sampling params 400 alongside active thinking even on a legacy model — suppressed"
+    );
 
     // A date-suffixed MODERN id still classifies by its real minor (4.6), adaptive.
     let mut modern = ChatRequest::new("claude-opus-4-6-20251101");
@@ -477,7 +524,16 @@ fn anthropic_legacy_models_keep_budget_tokens_thinking() {
     assert_eq!(body["thinking"]["type"], "enabled");
     assert_eq!(body["thinking"]["budget_tokens"], json!(8_192));
     assert!(body.get("output_config").is_none());
-    assert!(body.get("temperature").is_some(), "legacy keeps sampling params");
+    assert!(
+        body.get("temperature").is_none(),
+        "temperature 400s alongside legacy thinking — suppressed"
+    );
+
+    // Without thinking, the same legacy model keeps its sampling params.
+    let mut plain = ChatRequest::new("claude-sonnet-4-5");
+    plain.temperature = Some(0.3);
+    let body = wire::anthropic::build_request_body(&plain, "claude-sonnet-4-5", true);
+    assert!(body.get("temperature").is_some(), "legacy keeps sampling params without thinking");
 }
 
 #[test]

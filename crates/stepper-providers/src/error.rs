@@ -16,19 +16,70 @@ pub(crate) fn api_error_from_body(status: u16, body: &str) -> ProviderError {
 }
 
 /// Extract a retry delay from rate-limit headers: `Retry-After` (delta-seconds)
-/// first, then `x-ratelimit-reset-requests` / `x-ratelimit-reset` (OpenAI emits
-/// leading integer seconds). HTTP-date `Retry-After` is not parsed (rare on the
-/// streaming APIs); it falls back to the client's backoff.
+/// first, then OpenAI's `x-ratelimit-reset-*` headers. Those reset headers use a
+/// Go-style duration (`6m0s`, `88ms`, `2m59.56s`), NOT plain seconds — reading
+/// only the leading integer turned `6m0s` into 6s and `88ms` into 88s. Plain
+/// integer/`Ns` values still parse. HTTP-date `Retry-After` is not parsed (rare
+/// on the streaming APIs); it falls back to the client's backoff.
 pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
-    let leading_secs = |name: &str| -> Option<u64> {
-        let raw = headers.get(name)?.to_str().ok()?;
-        let digits: String = raw.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
-        digits.parse::<u64>().ok()
-    };
-    leading_secs("retry-after")
-        .or_else(|| leading_secs("x-ratelimit-reset-requests"))
-        .or_else(|| leading_secs("x-ratelimit-reset"))
-        .map(std::time::Duration::from_secs)
+    let header = |name: &str| headers.get(name)?.to_str().ok().map(str::to_string);
+    header("retry-after")
+        .and_then(|v| parse_delay(&v))
+        .or_else(|| header("x-ratelimit-reset-requests").and_then(|v| parse_delay(&v)))
+        .or_else(|| header("x-ratelimit-reset-tokens").and_then(|v| parse_delay(&v)))
+        .or_else(|| header("x-ratelimit-reset").and_then(|v| parse_delay(&v)))
+}
+
+/// Parse a rate-limit delay: a plain number is seconds (`12`, `12.5`); otherwise
+/// a Go-style duration of `<number><unit>` parts with units `h`/`m`/`s`/`ms`
+/// (`6m0s`, `2m59.56s`, `88ms`). Returns `None` on anything unrecognized. The
+/// result is clamped to a sane ceiling by the caller's backoff, so overflow is
+/// not a concern here.
+fn parse_delay(raw: &str) -> Option<std::time::Duration> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Plain seconds (possibly fractional).
+    if let Ok(secs) = s.parse::<f64>() {
+        return (secs >= 0.0).then(|| std::time::Duration::from_secs_f64(secs));
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut total = 0.0f64;
+    let mut matched = false;
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            i += 1;
+        }
+        if i == start {
+            return None; // a unit with no preceding number
+        }
+        let value: f64 = s[start..i].parse().ok()?;
+        let seconds = match &bytes[i..] {
+            [b'm', b's', ..] => {
+                i += 2;
+                value / 1000.0
+            }
+            [b'h', ..] => {
+                i += 1;
+                value * 3600.0
+            }
+            [b'm', ..] => {
+                i += 1;
+                value * 60.0
+            }
+            [b's', ..] => {
+                i += 1;
+                value
+            }
+            _ => return None,
+        };
+        total += seconds;
+        matched = true;
+    }
+    matched.then(|| std::time::Duration::from_secs_f64(total))
 }
 
 fn extract_error(body: &str) -> (Option<String>, Option<String>) {
@@ -98,5 +149,26 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap());
         assert_eq!(parse_retry_after(&h), None, "http-date is not parsed");
+    }
+
+    #[test]
+    fn parse_delay_reads_go_style_durations_not_just_leading_digits() {
+        // OpenAI reset headers are Go durations: `6m0s` is 360s, `88ms` ~0s —
+        // the old leading-digit parse said 6s and 88s respectively.
+        assert_eq!(parse_delay("6m0s"), Some(std::time::Duration::from_secs(360)));
+        assert_eq!(parse_delay("88ms"), Some(std::time::Duration::from_millis(88)));
+        assert_eq!(parse_delay("2m59.5s"), Some(std::time::Duration::from_secs_f64(179.5)));
+        assert_eq!(parse_delay("1h1m1s"), Some(std::time::Duration::from_secs(3661)));
+        // Plain numbers stay seconds.
+        assert_eq!(parse_delay("12"), Some(std::time::Duration::from_secs(12)));
+        assert_eq!(parse_delay("0.5"), Some(std::time::Duration::from_millis(500)));
+        assert_eq!(parse_delay("nonsense"), None);
+    }
+
+    #[test]
+    fn parse_retry_after_reads_the_reset_tokens_header_too() {
+        let mut h = HeaderMap::new();
+        h.insert("x-ratelimit-reset-tokens", "6m0s".parse().unwrap());
+        assert_eq!(parse_retry_after(&h), Some(std::time::Duration::from_secs(360)));
     }
 }

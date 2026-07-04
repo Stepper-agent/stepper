@@ -19,11 +19,15 @@ pub fn build_request_body(req: &ChatRequest, model: &str, stream: bool) -> Value
         body.insert("tools".into(), json!(map_tools(req)));
         body.insert("tool_choice".into(), map_tool_choice(&req.tool_choice));
     }
-    if let Some(t) = req.temperature {
-        body.insert("temperature".into(), json!(t));
-    }
-    if let Some(p) = req.top_p {
-        body.insert("top_p".into(), json!(p));
+    // OpenAI reasoning models (o-series, gpt-5) 400 on any `temperature`/`top_p`
+    // ≠ default, so suppress them there (mirrors the Anthropic adaptive path).
+    if !is_reasoning_model(model, req.reasoning_effort.as_deref()) {
+        if let Some(t) = req.temperature {
+            body.insert("temperature".into(), json!(t));
+        }
+        if let Some(p) = req.top_p {
+            body.insert("top_p".into(), json!(p));
+        }
     }
     if let Some(m) = req.max_tokens {
         body.insert("max_tokens".into(), json!(m));
@@ -51,6 +55,20 @@ pub(crate) fn clamp_openai_effort(level: &str) -> &str {
         "xhigh" | "max" => "high",
         other => other,
     }
+}
+
+/// Whether the target is an OpenAI reasoning model that rejects sampling params.
+/// A configured `reasoning_effort` is a strong signal; the model name (o-series
+/// `o1`/`o3`/`o4`, or `gpt-5`) is the fallback for when effort is left default.
+pub(crate) fn is_reasoning_model(model: &str, reasoning_effort: Option<&str>) -> bool {
+    if reasoning_effort.is_some() {
+        return true;
+    }
+    let m = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+    m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.starts_with("gpt-5")
 }
 
 fn map_messages(req: &ChatRequest) -> Vec<Value> {

@@ -37,8 +37,15 @@ impl LspManager {
 
     async fn ensure(&self, spec: &ServerSpec) -> Option<Arc<LspClient>> {
         let mut clients = self.clients.lock().await;
-        if let Some(slot) = clients.get(&spec.id) {
-            return slot.clone();
+        match clients.get(&spec.id) {
+            // A live cached client is reused; a dead one (server crashed mid
+            // session) is evicted below and respawned, so diagnostics don't
+            // silently vanish for the rest of the session.
+            Some(Some(client)) if client.is_alive() => return Some(client.clone()),
+            // A cached `None` marks a server that already failed to start —
+            // don't hammer it every edit.
+            Some(None) => return None,
+            _ => {}
         }
         let client = LspClient::spawn(
             spec.id.clone(),
@@ -52,6 +59,12 @@ impl LspManager {
         .map(Arc::new);
         clients.insert(spec.id.clone(), client.clone());
         client
+    }
+
+    /// Drop a cached client (used when its process turns out to be dead) so the
+    /// next `ensure` respawns it rather than returning the cached `None`.
+    async fn evict(&self, id: &str) {
+        self.clients.lock().await.remove(id);
     }
 
     /// Open/sync the edited file with each matching server and return a combined
@@ -88,9 +101,18 @@ impl LspManager {
                 continue;
             };
             let after = Instant::now();
-            if client.open(path, &text).await.is_err() {
-                continue;
-            }
+            let client = if client.open(path, &text).await.is_err() {
+                // A write to a crashed server's stdin fails; evict it and try one
+                // fresh spawn so this edit still gets diagnostics rather than a
+                // false "clean" from a dead server.
+                self.evict(&spec.id).await;
+                match self.ensure(spec).await {
+                    Some(fresh) if fresh.open(path, &text).await.is_ok() => fresh,
+                    _ => continue,
+                }
+            } else {
+                client
+            };
             let diags = client.wait_diagnostics(path, after, WAIT).await;
             let block = report(&rel, &diags);
             if !block.is_empty() {

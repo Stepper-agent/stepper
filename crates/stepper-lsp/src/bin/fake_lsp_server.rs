@@ -22,6 +22,17 @@ async fn main() {
                 .await;
             }
             "textDocument/didOpen" | "textDocument/didChange" => {
+                // A document containing `CRASH` makes the fake exit (simulating a
+                // server that dies mid-session) so the manager's respawn path can
+                // be tested.
+                let text = msg
+                    .pointer("/params/textDocument/text")
+                    .or_else(|| msg.pointer("/params/contentChanges/0/text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if text.contains("CRASH") {
+                    break;
+                }
                 let uri = msg
                     .pointer("/params/textDocument/uri")
                     .cloned()

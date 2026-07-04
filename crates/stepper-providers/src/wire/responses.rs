@@ -24,11 +24,15 @@ pub fn build_request_body(req: &ChatRequest, model: &str, stream: bool, store: b
         body.insert("tools".into(), json!(map_tools(req)));
         body.insert("tool_choice".into(), map_tool_choice(&req.tool_choice));
     }
-    if let Some(t) = req.temperature {
-        body.insert("temperature".into(), json!(t));
-    }
-    if let Some(p) = req.top_p {
-        body.insert("top_p".into(), json!(p));
+    // Reasoning models (o-series, gpt-5) 400 on non-default sampling params —
+    // suppress them (mirrors the Chat and Anthropic adaptive paths).
+    if !super::openai::is_reasoning_model(model, req.reasoning_effort.as_deref()) {
+        if let Some(t) = req.temperature {
+            body.insert("temperature".into(), json!(t));
+        }
+        if let Some(p) = req.top_p {
+            body.insert("top_p".into(), json!(p));
+        }
     }
     if let Some(m) = req.max_tokens {
         body.insert("max_output_tokens".into(), json!(m));

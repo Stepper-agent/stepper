@@ -200,9 +200,24 @@ pub struct RuleDef {
 pub fn parse_rule(content: &str) -> Result<RuleDef, ConfigError> {
     let (data, body) = split_frontmatter(content, "rule")?;
     Ok(RuleDef {
-        paths: string_or_list(data.get("paths")),
+        paths: comma_list(data.get("paths")),
         body,
     })
+}
+
+/// Like [`string_or_list`] but a scalar string splits ONLY on commas — a path
+/// scope can legitimately contain spaces (`paths: my dir`), so whitespace must
+/// not fragment it into separate (mis-scoped) globs.
+fn comma_list(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::String(s)) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => string_or_list(value),
+    }
 }
 
 pub fn parse_command(name: &str, content: &str) -> Result<CommandDef, ConfigError> {
@@ -302,6 +317,19 @@ fn frontmatter_err(which: &str, message: &str) -> ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule_paths_split_only_on_commas_so_a_path_may_contain_spaces() {
+        // A single path with a space must stay one scope (not two mis-scoped globs).
+        let one = parse_rule("---\npaths: my feature\n---\nbody").unwrap();
+        assert_eq!(one.paths, vec!["my feature"]);
+        // A comma-separated list still splits, trimming each.
+        let many = parse_rule("---\npaths: src/**, docs/x\n---\nbody").unwrap();
+        assert_eq!(many.paths, vec!["src/**", "docs/x"]);
+        // A YAML list works too.
+        let list = parse_rule("---\npaths:\n  - a\n  - b c\n---\nbody").unwrap();
+        assert_eq!(list.paths, vec!["a", "b c"]);
+    }
 
     #[test]
     fn parses_layer_frontmatter_and_body() {

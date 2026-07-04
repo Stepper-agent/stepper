@@ -151,6 +151,7 @@ pub async fn build_orchestrator_with_fallback(
     // Effective limits: a CLI flag wins; otherwise fall back to `setting.json`
     // `limits`; otherwise no limit. (Set at first-run setup, per project.)
     let limits = merge_limits(limits, config.settings.limits.as_ref());
+    apply_model_override(&mut config, model);
     let default_model = model.unwrap_or(DEFAULT_MODEL).to_string();
     // Precedence: `--mode` flag > `setting.json` `mode` >
     // `permissions.defaultMode` > Auto. Auto is the autonomous default: it runs
@@ -422,10 +423,49 @@ fn convention_provider(name: &str) -> Option<ProviderConfig> {
     Some(pc)
 }
 
+/// An explicit `--model` must beat BOTH `setting.json` sources
+/// (`orchestrator.model` and `defaultModel`): it used to reach `build_steps`
+/// only as the last-resort fallback, so any configured model silently won
+/// while the footer and the API-key prompt showed the flag's model.
+fn apply_model_override(config: &mut Config, model: Option<&str>) {
+    let Some(m) = model else {
+        return;
+    };
+    config.settings.default_model = Some(m.to_string());
+    if let Some(orch) = config.settings.orchestrator.as_mut() {
+        orch.model = Some(m.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use stepper_config::LspServerEntry;
+
+    #[test]
+    fn model_flag_overrides_both_default_model_and_orchestrator_model() {
+        let settings = stepper_config::SettingsFile {
+            default_model: Some("cfg/one".into()),
+            orchestrator: Some(stepper_config::OrchestratorConfig {
+                model: Some("cfg/two".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut config = Config::from_settings(settings);
+        apply_model_override(&mut config, Some("cli/three"));
+        assert_eq!(config.orchestrator_model().as_deref(), Some("cli/three"));
+        let steps = stepper_core::setup::build_steps(&config, "cli/three");
+        assert_eq!(steps[0].model_ref, "cli/three");
+        // No flag → the configured model stands.
+        let settings = stepper_config::SettingsFile {
+            default_model: Some("cfg/one".into()),
+            ..Default::default()
+        };
+        let mut config = Config::from_settings(settings);
+        apply_model_override(&mut config, None);
+        assert_eq!(config.orchestrator_model().as_deref(), Some("cfg/one"));
+    }
 
     #[test]
     fn lsp_omitted_or_false_runs_no_servers() {
