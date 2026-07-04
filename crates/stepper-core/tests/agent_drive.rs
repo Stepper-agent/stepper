@@ -204,6 +204,7 @@ async fn blocking_pretooluse_hook_denies_the_tool() {
         vec![HookEntry {
             matcher: Some("write_file".into()),
             command: "echo policy denied >&2; exit 2".into(),
+            timeout: None,
         }],
     );
     let hooks = Arc::new(HookHost::new(hook_map, root.clone()));
@@ -286,6 +287,7 @@ async fn posttooluse_hook_runs_after_the_tool_without_blocking_the_loop() {
         vec![HookEntry {
             matcher: Some("write_file".into()),
             command: "touch post-hook-ran.txt; exit 0".into(),
+            timeout: None,
         }],
     );
     let hooks = Arc::new(HookHost::new(hook_map, root.clone()));
@@ -419,6 +421,7 @@ async fn pretooluse_matcher_is_exact_and_does_not_substring_match() {
         vec![HookEntry {
             matcher: Some("write".into()),
             command: "echo should not run >&2; exit 2".into(),
+            timeout: None,
         }],
     );
     let hooks = Arc::new(HookHost::new(hook_map, root.clone()));

@@ -122,6 +122,10 @@ pub enum AppEvent {
     OpenEditor {
         seed: String,
     },
+    /// `/copy` — copy this text (the last assistant reply) to the OS clipboard.
+    /// The text is resolved core-side (from the session record); the clipboard
+    /// write is TUI-only (arboard).
+    CopyToClipboard(String),
     /// The session reasoning-effort level changed (`/effort`); `None` = off. The
     /// TUI shows it in the status footer.
     EffortChanged(Option<String>),

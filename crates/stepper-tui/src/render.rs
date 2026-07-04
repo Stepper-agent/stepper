@@ -939,7 +939,7 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     };
     // Surface staged clipboard images (Ctrl+V) in the input title.
     let title = if state.pending_image_count > 0 {
-        format!("{base_title}· 🖼 {} ", state.pending_image_count)
+        format!("{base_title}· {} image(s) ", state.pending_image_count)
     } else {
         base_title.to_string()
     };
@@ -956,9 +956,31 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     // renders its own cursor correctly over wide / CJK glyphs.
     if state.picker.is_none() && state.agent_picker.is_none() && state.overlay.is_none() {
         let sc = state.textarea.screen_cursor();
+        // `screen_cursor().row` is the ABSOLUTE row; when a long prompt overflows
+        // the box the widget scrolls internally and draws the cursor at
+        // `row - top`. Its viewport isn't public, so mirror its scroll rule
+        // (`next_scroll_top`) with a retained offset — otherwise the terminal
+        // cursor drifts from the highlighted text once the input scrolls.
+        let top = next_scroll_top(state.input_scroll_top.get(), sc.row as u16, inner.height);
+        state.input_scroll_top.set(top);
         let x = inner.x + (sc.col as u16).min(inner.width.saturating_sub(1));
-        let y = inner.y + (sc.row as u16).min(inner.height.saturating_sub(1));
+        let y = inner.y + (sc.row as u16).saturating_sub(top).min(inner.height.saturating_sub(1));
         frame.set_cursor_position((x, y));
+    }
+}
+
+/// ratatui-textarea's own vertical scroll rule (`widget::next_scroll_top`): keep
+/// the previous top unless the cursor left the viewport, then scroll minimally to
+/// bring it back to the nearest edge. Replicated here because the widget's
+/// viewport offset is `pub(crate)`. Self-correcting: any render pins `top` into
+/// `[cursor - height + 1, cursor]`, so a stale value heals in one frame.
+fn next_scroll_top(prev_top: u16, cursor_row: u16, height: u16) -> u16 {
+    if cursor_row < prev_top {
+        cursor_row
+    } else if height > 0 && prev_top + height <= cursor_row {
+        cursor_row + 1 - height
+    } else {
+        prev_top
     }
 }
 
@@ -1216,6 +1238,21 @@ mod tests {
 
     use crate::state::Queued;
 
+    #[test]
+    fn next_scroll_top_keeps_the_cursor_in_the_viewport() {
+        // Cursor visible → top unchanged.
+        assert_eq!(next_scroll_top(3, 4, 8), 3);
+        // Cursor above the top → scroll up so it becomes the first row.
+        assert_eq!(next_scroll_top(5, 2, 8), 2);
+        // Cursor below the bottom → scroll down so it becomes the last row.
+        assert_eq!(next_scroll_top(0, 10, 8), 3, "row 10 with height 8 → top 3 (rows 3..10)");
+        // The visible cursor row (sc.row - top) is always within [0, height-1].
+        for (top, row, h) in [(0u16, 0u16, 8u16), (5, 2, 8), (0, 10, 8), (3, 4, 8)] {
+            let new_top = next_scroll_top(top, row, h);
+            assert!(row >= new_top && row - new_top < h, "row {row} visible under top {new_top}, h {h}");
+        }
+    }
+
     fn render_to_string(state: &AppState, width: u16, height: u16) -> String {
         let theme = Theme::default();
         let backend = TestBackend::new(width, height);
@@ -1255,6 +1292,7 @@ mod tests {
             history_path: None,
             status_line_cmd: None,
             keybindings: Vec::new(),
+            initial_prompt: None,
         })
     }
 

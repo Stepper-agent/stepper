@@ -228,6 +228,21 @@ fn finish_atom(text: &mut String, masked: &mut String, out: &mut Vec<BashAtom>) 
         return Some(());
     }
     let (reads, writes, escalate) = parse_redirections(&masked_atom)?;
+    // A process wrapper (`sudo`, `timeout 5`, `env X=1`, `nice`, `nohup`, …) runs
+    // the command that FOLLOWS it — so a deny rule like `Bash(rm *)` must still
+    // catch `timeout 5 rm -rf x`. Gate the unwrapped inner command as an extra
+    // atom (the engine takes the most-restrictive verdict across atoms), which can
+    // only tighten: a denied inner command is caught, an allowed one is unaffected.
+    if let Some(inner) = strip_wrappers(&command)
+        && inner != command
+    {
+        out.push(BashAtom {
+            command: inner,
+            reads: Vec::new(),
+            writes: Vec::new(),
+            escalate: false,
+        });
+    }
     out.push(BashAtom {
         command,
         reads,
@@ -235,6 +250,57 @@ fn finish_atom(text: &mut String, masked: &mut String, out: &mut Vec<BashAtom>) 
         escalate,
     });
     Some(())
+}
+
+/// Peel leading process-wrapper tokens off a command so the inner command can be
+/// gated on its own. Returns the inner command, or `None` if the head is not a
+/// wrapper. Handles each wrapper's simple option grammar (value-taking flags and
+/// the one positional `timeout`/`nice` takes); unknown shapes stop peeling.
+fn strip_wrappers(command: &str) -> Option<String> {
+    const WRAPPERS: &[&str] = &[
+        "sudo", "env", "nice", "timeout", "nohup", "stdbuf", "setsid", "ionice", "chrt", "time",
+        "xargs",
+    ];
+    // Flags that consume the next token as their value.
+    const VALUE_FLAGS: &[&str] = &[
+        "-u", "--user", "-s", "--signal", "-k", "--kill-after", "-n", "--adjustment", "-P", "-o",
+    ];
+    let mut tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut peeled = false;
+    // Stop when the head is not a wrapper (or nothing is left).
+    while let Some(&wrapper) = tokens.first().filter(|h| WRAPPERS.contains(h)) {
+        let mut i = 1;
+        // Skip options / assignments the wrapper accepts before its command.
+        while i < tokens.len() {
+            let t = tokens[i];
+            if t.contains('=') && !t.starts_with('-') {
+                i += 1; // env VAR=val
+            } else if VALUE_FLAGS.contains(&t) {
+                i += 2; // flag + its value
+            } else if t.starts_with('-') {
+                i += 1; // bare flag
+            } else {
+                break;
+            }
+        }
+        // `timeout DURATION cmd` / `nice N cmd`: one bare positional before cmd.
+        if matches!(wrapper, "timeout" | "nice") && i < tokens.len() {
+            let t = tokens[i];
+            let numeric = t
+                .trim_end_matches(['s', 'm', 'h', 'd'])
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.');
+            if numeric && !t.is_empty() {
+                i += 1;
+            }
+        }
+        if i >= tokens.len() {
+            break; // nothing left to run — not a wrapping of another command
+        }
+        tokens = tokens.split_off(i);
+        peeled = true;
+    }
+    peeled.then(|| tokens.join(" "))
 }
 
 fn matching_paren(chars: &[char], start: usize) -> Option<usize> {

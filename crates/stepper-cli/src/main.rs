@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
     // `None` (no `--log-level`) installs nothing — the tracing macros stay no-ops.
     let _log_guard = logging::init_logging(&cli.global);
     match cli.command {
-        None | Some(Command::Run) => launch(cli.global).await,
+        None | Some(Command::Run) => launch(cli.global, cli.prompt).await,
         Some(Command::Auth(args)) => match args.cmd {
             AuthCmd::Login(login) => auth_login(login.codex).await,
             AuthCmd::SetKey { provider } => set_key(&provider),
@@ -464,10 +464,12 @@ async fn doctor_cmd(global: GlobalArgs) -> anyhow::Result<()> {
     let proxy = config.settings.proxy.clone();
     let mcp_servers = config.settings.mcp_servers.clone();
     let base_dir = config.project_root.clone().unwrap_or_else(|| cwd.clone());
+    // Check the SAME model a run would use: `orchestrator_model()` prefers
+    // `orchestrator.model` over `defaultModel` (as `build_steps` does), so a
+    // project that sets only `orchestrator.model` is diagnosed against the model
+    // it actually runs, not the convention default.
     let default_model = config
-        .settings
-        .default_model
-        .clone()
+        .orchestrator_model()
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let fallback_models = core_setup::resolve_fallback_models(&global.fallback_model, &config);
     // Mirror `launch`: synthesize the convention provider for the default model +
@@ -698,7 +700,7 @@ fn delete_key(provider: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
+async fn launch(global: GlobalArgs, positional: Vec<String>) -> anyhow::Result<()> {
     let cwd = match &global.cwd {
         Some(p) => p.clone(),
         None => std::env::current_dir()?,
@@ -710,9 +712,25 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         global.turn_timeout.map(std::time::Duration::from_secs),
     );
 
-    if let Some(prompt) = global.print.clone() {
+    // Piped stdin becomes prompt text (`cat task.md | stepper [-p]`). Only read it
+    // when stdin is NOT a terminal, so an interactive launch never blocks on a
+    // read that will never arrive.
+    let piped = read_piped_stdin();
+
+    if let Some(flag) = global.print.clone() {
+        // Headless `-p`: the flag's text, then piped stdin (either can be empty,
+        // but not both). `-p` alone (empty value) uses stdin as the whole prompt.
+        let prompt = merge_prompt(Some(flag), piped);
+        let Some(prompt) = prompt.filter(|p| !p.trim().is_empty()) else {
+            anyhow::bail!("-p needs a prompt: pass it as `-p \"...\"` or pipe it on stdin");
+        };
         return oneshot(&global, cli_mode, cwd, prompt, limits).await;
     }
+
+    // Interactive: a positional prompt (`stepper "fix the bug"`) or piped stdin
+    // seeds the first turn; otherwise the session opens at an empty prompt.
+    let positional = (!positional.is_empty()).then(|| positional.join(" "));
+    let initial_prompt = merge_prompt(positional, piped).filter(|p| !p.trim().is_empty());
 
     // First-run setup runs only on the interactive path (headless returned
     // above). When it writes a config its chosen model becomes this session's
@@ -836,8 +854,32 @@ async fn launch(global: GlobalArgs) -> anyhow::Result<()> {
         history_path,
         status_line_cmd,
         keybindings,
+        initial_prompt,
     };
     run_tui(event_rx, action_tx, init, cancel).await
+}
+
+/// Read piped (non-TTY) stdin as prompt text, or `None` when stdin is a terminal
+/// or empty. An interactive launch with a real terminal never blocks here.
+fn read_piped_stdin() -> Option<String> {
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        return None;
+    }
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf).ok()?;
+    let trimmed = buf.trim_end().to_string();
+    (!trimmed.trim().is_empty()).then_some(trimmed)
+}
+
+/// Combine an explicit prompt with piped stdin: both present → text then stdin
+/// (a two-line join); either alone passes through; neither → `None`.
+fn merge_prompt(explicit: Option<String>, piped: Option<String>) -> Option<String> {
+    match (explicit.filter(|s| !s.trim().is_empty()), piped) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (Some(a), None) => Some(a),
+        (None, other) => other,
+    }
 }
 
 /// Load `keybindings.json` (an `{ "action": "chord" }` object) from `~/.stepper`
@@ -1179,13 +1221,14 @@ fn attach_files(files: &[std::path::PathBuf], prompt: &str, cwd: &std::path::Pat
 
 /// Resolve a `--system-prompt[-file]` / `--append-system-prompt[-file]` pair to
 /// the text to use: inline text wins, else the file is read (clap already rejects
-/// passing both). `None` when neither is set.
-fn read_prompt_arg(text: Option<&str>, file: Option<&std::path::Path>) -> anyhow::Result<Option<String>> {
+/// passing both). `flag` names the file flag for a read error. `None` when
+/// neither is set.
+fn read_prompt_arg(text: Option<&str>, file: Option<&std::path::Path>, flag: &str) -> anyhow::Result<Option<String>> {
     if let Some(t) = text {
         return Ok(Some(t.to_string()));
     }
     if let Some(p) = file {
-        let body = std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("--system-prompt-file {}: {e}", p.display()))?;
+        let body = std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("{flag} {}: {e}", p.display()))?;
         return Ok(Some(body));
     }
     Ok(None)
@@ -1207,10 +1250,18 @@ fn appended_role(role: &str, extra: &str) -> String {
 /// orchestrator. The base-context replacement also reaches dispatched sub-agents
 /// (they clone `base_context`); the append affects the main layers' roles only.
 fn apply_system_prompt_overrides(orchestrator: &mut Orchestrator, global: &GlobalArgs) -> anyhow::Result<()> {
-    if let Some(base) = read_prompt_arg(global.system_prompt.as_deref(), global.system_prompt_file.as_deref())? {
+    if let Some(base) = read_prompt_arg(
+        global.system_prompt.as_deref(),
+        global.system_prompt_file.as_deref(),
+        "--system-prompt-file",
+    )? {
         orchestrator.base_context = base;
     }
-    if let Some(extra) = read_prompt_arg(global.append_system_prompt.as_deref(), global.append_system_prompt_file.as_deref())? {
+    if let Some(extra) = read_prompt_arg(
+        global.append_system_prompt.as_deref(),
+        global.append_system_prompt_file.as_deref(),
+        "--append-system-prompt-file",
+    )? {
         let extra = extra.trim();
         if !extra.is_empty() {
             for step in &mut orchestrator.steps {
@@ -1521,6 +1572,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn merge_prompt_combines_explicit_and_piped_stdin() {
+        assert_eq!(merge_prompt(Some("hi".into()), None).as_deref(), Some("hi"));
+        assert_eq!(merge_prompt(None, Some("piped".into())).as_deref(), Some("piped"));
+        assert_eq!(
+            merge_prompt(Some("text".into()), Some("stdin".into())).as_deref(),
+            Some("text\n\nstdin"),
+        );
+        // An empty explicit value (bare `-p`) defers to stdin.
+        assert_eq!(merge_prompt(Some("".into()), Some("stdin".into())).as_deref(), Some("stdin"));
+        assert!(merge_prompt(None, None).is_none());
+    }
+
+    #[test]
     fn attach_files_inlines_contents_then_prompt() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "hello from a").unwrap();
@@ -1537,16 +1601,19 @@ mod tests {
     #[test]
     fn read_prompt_arg_prefers_inline_text_else_file() {
         // Inline text wins.
-        assert_eq!(read_prompt_arg(Some("inline"), None).unwrap().as_deref(), Some("inline"));
+        assert_eq!(read_prompt_arg(Some("inline"), None, "--system-prompt-file").unwrap().as_deref(), Some("inline"));
         // File is read when no inline text.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("sys.txt");
         std::fs::write(&p, "from file").unwrap();
-        assert_eq!(read_prompt_arg(None, Some(p.as_path())).unwrap().as_deref(), Some("from file"));
+        assert_eq!(read_prompt_arg(None, Some(p.as_path()), "--system-prompt-file").unwrap().as_deref(), Some("from file"));
         // Neither → None.
-        assert!(read_prompt_arg(None, None).unwrap().is_none());
-        // Missing file errors.
-        assert!(read_prompt_arg(None, Some(std::path::Path::new("/no/such/file"))).is_err());
+        assert!(read_prompt_arg(None, None, "--system-prompt-file").unwrap().is_none());
+        // A missing file's error names the flag it was called for.
+        let err = read_prompt_arg(None, Some(std::path::Path::new("/no/such/file")), "--append-system-prompt-file")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--append-system-prompt-file"), "error names the right flag: {err}");
     }
 
     #[test]

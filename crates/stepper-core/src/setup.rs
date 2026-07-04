@@ -130,13 +130,19 @@ pub fn load_base_context(config: &Config, cwd: &std::path::Path) -> String {
         candidates.push((dir.join("stepper.md"), dir.clone()));
     }
     if let Some(root) = config.project_root.as_ref() {
+        // `CLAUDE.md` then `AGENTS.md` (the cross-agent standard) at the project
+        // root, so a repo using either convention is picked up without migration.
         candidates.push((root.join("CLAUDE.md"), root.clone()));
+        candidates.push((root.join("AGENTS.md"), root.clone()));
     }
     if let Some(dir) = config.user_dir.as_ref() {
         candidates.push((dir.join("stepper.md"), dir.clone()));
     }
     if let Some(claude) = home.as_ref().map(|h| h.join(".claude")) {
         candidates.push((claude.join("CLAUDE.md"), claude));
+    }
+    if let Some(h) = home.as_ref() {
+        candidates.push((h.join(".config").join("AGENTS.md"), h.join(".config")));
     }
     let mut context = String::new();
     for (file, base) in candidates {
@@ -586,6 +592,26 @@ mod tests {
         // No stepper.md anywhere → falls back to the project-root CLAUDE.md.
         let ctx = load_base_context(&cfg, cfg.project_root.as_deref().unwrap());
         assert!(ctx.contains("PROJECT CLAUDE RULES"), "reads ./CLAUDE.md fallback: {ctx}");
+    }
+
+    #[test]
+    fn base_context_reads_project_root_agents_md_when_no_claude_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let stepper_dir = root.join(".stepper");
+        std::fs::create_dir_all(&stepper_dir).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "AGENTS RULES").unwrap();
+
+        let mut cfg = Config::from_settings(Default::default());
+        cfg.project_dir = Some(stepper_dir);
+        cfg.project_root = Some(root.clone());
+        let ctx = load_base_context(&cfg, &root);
+        assert!(ctx.contains("AGENTS RULES"), "reads ./AGENTS.md: {ctx}");
+
+        // CLAUDE.md still wins when both exist (it is tried first).
+        std::fs::write(root.join("CLAUDE.md"), "CLAUDE WINS").unwrap();
+        let ctx = load_base_context(&cfg, &root);
+        assert!(ctx.contains("CLAUDE WINS") && !ctx.contains("AGENTS RULES"), "CLAUDE.md precedence: {ctx}");
     }
 
     #[test]

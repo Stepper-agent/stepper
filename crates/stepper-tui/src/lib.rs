@@ -56,6 +56,10 @@ pub struct TuiInit {
     /// Extra key bindings from `keybindings.json` as `(action, chord)` pairs
     /// (e.g. `("external-editor", "ctrl+t")`). Additive: built-in keys still work.
     pub keybindings: Vec<(String, String)>,
+    /// A prompt to submit automatically on startup (`stepper "fix the bug"` or a
+    /// piped stdin), so the interactive session opens straight into that turn.
+    /// `None` starts at an empty prompt.
+    pub initial_prompt: Option<String>,
 }
 
 /// A slash command shown in the `/` palette: its name, a one-line description,

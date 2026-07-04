@@ -19,6 +19,7 @@ pub mod orchestrator;
 pub mod ports;
 pub mod proc;
 pub mod resolver;
+pub mod review;
 pub mod session;
 pub mod setup;
 pub mod skills;
@@ -73,13 +74,13 @@ pub fn spawn_core(
     let (tx, rx) = mpsc::channel::<AppEvent>(128);
     let store = SessionStore::new(&orchestrator.project_root);
     let snapshotter = Snapshotter::new(orchestrator.project_root.clone());
-    // A fresh session must not inherit a prior (crashed/abandoned) session's
-    // checkpoints: the project-global store would otherwise let `/rewind` restore
-    // an unrelated tree and delete the current work. Continued/resumed sessions
-    // (-c/--resume) have turns and keep their own checkpoints.
-    if session.turns.is_empty() {
-        let _ = snapshotter.clear();
-    }
+    // Checkpoints belong to the session whose turns produced them, but the
+    // store is project-global — a fresh session, a crash leftover, or a resume
+    // into a DIFFERENT session (`--resume <other>`, `--fork`) must not inherit
+    // another timeline's `turn-N` trees, or `/rewind`/`/undo` would restore an
+    // unrelated tree and delete the current work. Resuming the owning session
+    // (-c / --resume of the last run) keeps its checkpoints.
+    let _ = snapshotter.reconcile_owner(&session.id);
     // The redo stack is in-memory only, so any `redo-<n>` dir left on disk (a crash
     // between /undo and /redo) is unreferenced — GC it. A resumed session keeps its
     // `turn-<N>` checkpoints but never a live redo, so this is always safe.
@@ -228,6 +229,11 @@ pub fn spawn_core(
                             // ever held the `--resume` history, so a live session
                             // forgot everything between turns.
                             orchestrator.resume_seed = session.seed_messages();
+                            // `seed_messages()` now synthesizes digest pairs for any
+                            // old-format turns, so the digest folded into base_context
+                            // at launch is redundant — drop it, or those turns show up
+                            // BOTH in the system prompt and in resume_seed every turn.
+                            orchestrator.base_context = base_context_original.clone();
                         }
                         Some(Err(e)) if !matches!(e, CoreError::Cancelled) => {
                             let _ = tx.send(AppEvent::Error(e.to_string())).await;
@@ -305,7 +311,17 @@ pub fn spawn_core(
                         Some(loaded) => {
                             session = loaded;
                             turn_id = session.turns.len() as u64;
+                            // Switching sessions orphans the store's checkpoints
+                            // (they trace the PREVIOUS session's file timeline);
+                            // clear them so `/rewind` can't offer another
+                            // session's tree. Resuming into the owning session
+                            // keeps them.
+                            let _ = snapshotter.reconcile_owner(&session.id);
                             orchestrator.resume_seed = session.seed_messages();
+                            // The loaded session's own history now lives in
+                            // resume_seed; drop any launch digest still folded into
+                            // base_context so it doesn't leak across the switch.
+                            orchestrator.base_context = base_context_original.clone();
                             let _ = tx
                                 .send(AppEvent::SessionResumed {
                                     id: session.id.clone(),
@@ -395,13 +411,19 @@ pub fn spawn_core(
                             // snapshotter.clear() below removes the redo-* dirs too;
                             // just drop the stale stack entries.
                             redo_stack.clear();
-                            if let Err(e) = snapshotter.clear() {
-                                let _ = tx
-                                    .send(AppEvent::Notice {
-                                        level: NoticeLevel::Warn,
-                                        text: format!("checkpoint clear failed: {e}"),
-                                    })
-                                    .await;
+                            match snapshotter.clear() {
+                                // Re-stamp ownership: /clear swapped in a fresh
+                                // session id, /compact keeps the id — either way
+                                // the emptied store belongs to the live session.
+                                Ok(()) => snapshotter.stamp_owner(&session.id),
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(AppEvent::Notice {
+                                            level: NoticeLevel::Warn,
+                                            text: format!("checkpoint clear failed: {e}"),
+                                        })
+                                        .await;
+                                }
                             }
                         }
                         continue;
@@ -422,6 +444,30 @@ pub fn spawn_core(
                         .await
                         .ok()
                         .flatten(),
+                        // `/code-review` is the one built-in that RUNS a turn (the
+                        // `builtins::handle` entries never do), so it expands here
+                        // and flows through the command-turn path below. A user
+                        // command file with the same name still shadows it.
+                        None if name == "code-review" => {
+                            match tokio::task::spawn_blocking(move || {
+                                review::code_review_prompt(&cmd_args, &cwd)
+                            })
+                            .await
+                            .ok()
+                            {
+                                Some(Ok(prompt)) => Some(prompt),
+                                Some(Err(msg)) => {
+                                    let _ = tx
+                                        .send(AppEvent::Notice {
+                                            level: NoticeLevel::Warn,
+                                            text: msg,
+                                        })
+                                        .await;
+                                    continue;
+                                }
+                                None => None,
+                            }
+                        }
                         None => None,
                     };
 
@@ -500,8 +546,11 @@ pub fn spawn_core(
                                 });
                                 let _ = store.save(&session);
                                 // Same as the chat path: carry the conversation
-                                // forward so the next turn remembers this one.
+                                // forward so the next turn remembers this one, and
+                                // drop the now-redundant launch digest from
+                                // base_context (else old turns double-expose).
                                 orchestrator.resume_seed = session.seed_messages();
+                                orchestrator.base_context = base_context_original.clone();
                             }
                             let _ = tx.send(AppEvent::TurnComplete { turn_id }).await;
                             pending.extend(deferred);
@@ -772,6 +821,11 @@ async fn checkpoint_turn(
     tx: &mpsc::Sender<AppEvent>,
 ) {
     let id = format!("turn-{turn_id}");
+    // A `/undo` followed by this new turn abandons the undone turns' future
+    // checkpoints (turn-N taken when MORE than `turns_completed` turns were
+    // done). They are unreachable now — drop them so the rewind picker can't
+    // offer a stale tree that would overwrite this turn's work.
+    snapshotter.prune_forward(turns_completed);
     if let Err(e) = snapshotter.snapshot(&id) {
         let _ = tx
             .send(AppEvent::Notice {

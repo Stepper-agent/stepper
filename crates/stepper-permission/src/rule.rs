@@ -68,7 +68,15 @@ impl Rule {
         project_root: &Path,
         home: Option<&Path>,
     ) -> bool {
-        if !self.tool.eq_ignore_ascii_case(request_tool) {
+        // A `*` in the tool NAME position matches by glob (`*` = every tool,
+        // `Mcp*`/`Web*` = a family) so a blanket `deny: ["*"]` / `ask: ["Web*"]`
+        // works; without a `*` it stays an exact (case-insensitive) name match.
+        let tool_matches = if self.tool.contains('*') {
+            glob_eq(&self.tool.to_ascii_lowercase(), &request_tool.to_ascii_lowercase())
+        } else {
+            self.tool.eq_ignore_ascii_case(request_tool)
+        };
+        if !tool_matches {
             return false;
         }
         match (&self.spec, target) {
@@ -172,6 +180,23 @@ mod tests {
         // adjacent token like `git pushx` / `git push-all`.
         assert!(!push.matches("Bash", &MatchTarget::Command("git pushx"), &root, None));
         assert!(!push.matches("Bash", &MatchTarget::Command("git push-all"), &root, None));
+    }
+
+    #[test]
+    fn tool_name_wildcards_match_by_glob() {
+        let root = PathBuf::from("/p");
+        // A bare `*` matches every tool.
+        let star = Rule::parse("*").unwrap();
+        assert!(star.matches("Bash", &MatchTarget::Command("rm -rf x"), &root, None));
+        assert!(star.matches("WebFetch", &MatchTarget::Text("http://x"), &root, None));
+        // A prefix glob matches a family.
+        let web = Rule::parse("Web*").unwrap();
+        assert!(web.matches("WebFetch", &MatchTarget::Text("http://x"), &root, None));
+        assert!(!web.matches("Bash", &MatchTarget::Command("ls"), &root, None));
+        // Without a `*`, the name is still an exact match.
+        let exact = Rule::parse("Read").unwrap();
+        assert!(exact.matches("Read", &MatchTarget::Path(&PathBuf::from("/p/a")), &root, None));
+        assert!(!exact.matches("Write", &MatchTarget::Path(&PathBuf::from("/p/a")), &root, None));
     }
 
     #[test]

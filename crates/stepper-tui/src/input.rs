@@ -183,6 +183,7 @@ mod tests {
             history_path: None,
             status_line_cmd: None,
             keybindings: Vec::new(),
+            initial_prompt: None,
         })
     }
 

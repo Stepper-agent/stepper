@@ -34,12 +34,14 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("layer", "<name>", "new layer"),
     ("command", "<name>", "new slash command"),
     ("import", "[claude|codex|cursor|gemini|all] [apply]", "migrate another agent's config"),
+    ("code-review", "[<ref>|<a>..<b>|#<pr>] [--fix]", "review a diff for bugs & cleanups"),
     ("connect", "", "add a provider from models.dev"),
     ("login", "[provider]", "set an API key"),
     ("model", "[provider/model]", "show or switch"),
     ("models", "", "pick from fetched models"),
     ("theme", "", "edit the TUI color theme"),
     ("editor", "[text]", "compose the prompt in $EDITOR"),
+    ("copy", "", "copy the last reply to the clipboard"),
     ("effort", "[off|low|medium|high|xhigh|max]", "reasoning effort"),
     ("permissions", "", "rules & approvals"),
     ("settings", "", "all settings (tabbed overview)"),
@@ -174,6 +176,10 @@ pub async fn handle(
             let _ = tx.send(AppEvent::OpenEditor { seed: args.trim().to_string() }).await;
             true
         }
+        "copy" => {
+            handle_copy(session, tx).await;
+            true
+        }
         "effort" => {
             handle_effort(args.trim(), orchestrator, tx).await;
             true
@@ -239,6 +245,25 @@ async fn handle_init(project_root: &Path, tx: &EventTx) {
             .await
         }
         Err(e) => notice(tx, NoticeLevel::Warn, format!("init failed: {e}")).await,
+    }
+}
+
+/// `/copy` — resolve the last assistant reply from the session record and hand it
+/// to the TUI to place on the OS clipboard (the clipboard write is TUI-only).
+async fn handle_copy(session: &SessionRecord, tx: &EventTx) {
+    let last = session.turns.iter().rev().find_map(|t| {
+        t.messages
+            .iter()
+            .rev()
+            .filter(|m| m.role == stepper_provider::Role::Assistant)
+            .map(|m| m.text())
+            .find(|s| !s.trim().is_empty())
+    });
+    match last {
+        Some(text) => {
+            let _ = tx.send(AppEvent::CopyToClipboard(text)).await;
+        }
+        None => notice(tx, NoticeLevel::Warn, "no reply to copy yet".into()).await,
     }
 }
 
@@ -1153,6 +1178,37 @@ mod tests {
         assert!(help.contains("/compact [instructions]"));
         for (name, _, _) in COMMANDS {
             assert!(help.contains(&format!("/{name}")), "/{name} listed in help");
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_emits_the_last_assistant_reply_or_warns_when_empty() {
+        use stepper_provider::Message;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AppEvent>(8);
+
+        // No turns → a warning, no clipboard event.
+        let empty = SessionRecord::fresh();
+        handle_copy(&empty, &tx).await;
+        match rx.recv().await.unwrap() {
+            AppEvent::Notice { level, .. } => assert!(matches!(level, NoticeLevel::Warn)),
+            other => panic!("expected a warning, got {other:?}"),
+        }
+
+        // With a reply → the last assistant text is copied.
+        let mut session = SessionRecord::fresh();
+        session.turns.push(TurnRecord {
+            user: "hi".into(),
+            summaries: Vec::new(),
+            messages: vec![Message::user("hi"), Message::assistant("the answer is 42")],
+            usage: Usage::default(),
+            cost_usd: 0.0,
+            model_ref: "m".into(),
+            ended_at: None,
+        });
+        handle_copy(&session, &tx).await;
+        match rx.recv().await.unwrap() {
+            AppEvent::CopyToClipboard(text) => assert_eq!(text, "the answer is 42"),
+            other => panic!("expected a clipboard event, got {other:?}"),
         }
     }
 }

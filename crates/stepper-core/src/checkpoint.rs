@@ -58,8 +58,11 @@ impl Snapshotter {
         // Copy the snapshot back verbatim. `standard_filters(false)` disables
         // every ignore rule (gitignore + hidden) so the checkpoint's own contents
         // restore exactly — a `.gitignore` added since the snapshot must never
-        // hide a file we deliberately captured.
+        // hide a file we deliberately captured. Individual copy failures are
+        // collected instead of aborting, so one bad path (a read-only occupant,
+        // a permission quirk) can't strand the tree half-restored.
         let mut snapshot: HashSet<PathBuf> = HashSet::new();
+        let mut errors: Vec<String> = Vec::new();
         for entry in WalkBuilder::new(&src).standard_filters(false).build().flatten() {
             let path = entry.path();
             if !path.is_file() {
@@ -67,16 +70,12 @@ impl Snapshotter {
             }
             let rel = path.strip_prefix(&src).unwrap_or(path).to_path_buf();
             let to = self.project_root.join(&rel);
-            if let Some(parent) = to.parent() {
-                std::fs::create_dir_all(parent).map_err(io)?;
+            if let Err(e) = restore_one(path, &to) {
+                errors.push(format!("{}: {e}", rel.display()));
             }
-            // A path that became a directory during the turn would make `copy` error
-            // and abort mid-restore, leaving a partial tree; replace it so restore
-            // is robust (the snapshot is the source of truth for that point in time).
-            if to.is_dir() {
-                std::fs::remove_dir_all(&to).map_err(io)?;
-            }
-            std::fs::copy(path, &to).map_err(io)?;
+            // Even on failure the path belongs to the snapshot: leaving it out
+            // would let the prune below DELETE the current copy — strictly worse
+            // than keeping the un-restored version.
             snapshot.insert(rel);
         }
 
@@ -87,7 +86,15 @@ impl Snapshotter {
                 let _ = std::fs::remove_file(self.project_root.join(&rel));
             }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(CoreError::Io(format!(
+                "restored with {} failure(s): {}",
+                errors.len(),
+                errors.join("; ")
+            )))
+        }
     }
 
     /// Keep at most the `retain` most-recent `turn-<N>` snapshots, removing the
@@ -208,6 +215,33 @@ impl Snapshotter {
         }
     }
 
+    /// Record `session_id` as the store's owner (best-effort). Checkpoints are
+    /// only meaningful for the session whose turns produced them, but the store
+    /// itself is project-global — the stamp is what lets [`reconcile_owner`]
+    /// detect a session switch.
+    ///
+    /// [`reconcile_owner`]: Snapshotter::reconcile_owner
+    pub fn stamp_owner(&self, session_id: &str) {
+        let _ = std::fs::create_dir_all(&self.store);
+        let _ = std::fs::write(self.store.join("owner"), session_id);
+    }
+
+    /// Clear the store unless `session_id` already owns it, then stamp the new
+    /// owner. Called wherever the live session's identity changes (process
+    /// start, in-session `/resume`) so `/rewind`/`/undo` can never restore
+    /// another session's tree over the current work. Returns `true` when the
+    /// store was cleared. A pre-owner-stamp store (older stepper) reads as
+    /// unowned and is cleared — checkpoints are a disposable safety net.
+    pub fn reconcile_owner(&self, session_id: &str) -> Result<bool, CoreError> {
+        let owner = std::fs::read_to_string(self.store.join("owner")).ok();
+        if owner.as_deref().map(str::trim) == Some(session_id) {
+            return Ok(false);
+        }
+        self.clear()?;
+        self.stamp_owner(session_id);
+        Ok(true)
+    }
+
     fn tracked_files(&self) -> Result<Vec<PathBuf>, CoreError> {
         let root = self.project_root.clone();
         let mut files = Vec::new();
@@ -244,6 +278,39 @@ impl Snapshotter {
 
 fn io(e: std::io::Error) -> CoreError {
     CoreError::Io(e.to_string())
+}
+
+/// Copy one snapshot file over the working tree. An existing occupant is
+/// removed first: `fs::copy` opens the destination for writing, so a read-only
+/// file (EACCES) or a path whose type changed during the turn (file↔dir) would
+/// otherwise abort the restore midway. Removal only needs write permission on
+/// the parent, and `copy` re-creates the file with the snapshot's own mode.
+fn restore_one(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = to.parent() {
+        ensure_dir(parent)?;
+    }
+    match std::fs::symlink_metadata(to) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(to)?,
+        Ok(_) => std::fs::remove_file(to)?,
+        Err(_) => {}
+    }
+    std::fs::copy(from, to)?;
+    Ok(())
+}
+
+/// `create_dir_all` that also clears any FILE occupying a directory component
+/// (a `foo/` dir replaced by a `foo` file mid-turn would otherwise block the
+/// restore of `foo/bar.txt`).
+fn ensure_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    if std::fs::symlink_metadata(dir).is_ok() {
+        std::fs::remove_file(dir)?;
+    } else if let Some(parent) = dir.parent() {
+        ensure_dir(parent)?;
+    }
+    std::fs::create_dir_all(dir)
 }
 
 #[cfg(test)]
@@ -499,6 +566,103 @@ mod tests {
         assert_eq!(snap.checkpoint_turns("turn-1"), Some(0), "turn sidecar kept");
         // Idempotent / no store = no-op.
         snap.clear_redo_snapshots();
+    }
+
+    #[test]
+    fn restore_overwrites_a_read_only_file_and_finishes_the_prune() {
+        // A tracked file without the owner write bit used to abort restore with
+        // EACCES midway (partial tree, prune never reached). Removal-then-copy
+        // only needs parent-dir write permission.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), "original").unwrap();
+        std::fs::write(root.join("locked.txt"), "locked-v1").unwrap();
+        let snap = Snapshotter::new(root.clone());
+        snap.snapshot("turn-1").unwrap();
+
+        std::fs::write(root.join("a.txt"), "changed").unwrap();
+        std::fs::write(root.join("new_after.txt"), "prune me").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.join("locked.txt"), std::fs::Permissions::from_mode(0o444))
+                .unwrap();
+        }
+
+        snap.restore("turn-1").unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "original");
+        assert_eq!(std::fs::read_to_string(root.join("locked.txt")).unwrap(), "locked-v1");
+        assert!(!root.join("new_after.txt").exists(), "prune still ran to completion");
+    }
+
+    #[test]
+    fn restore_replaces_a_dir_swapped_in_for_a_file_and_vice_versa() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/mod.rs"), "mod v1").unwrap();
+        std::fs::write(root.join("single.txt"), "file v1").unwrap();
+        let snap = Snapshotter::new(root.clone());
+        snap.snapshot("turn-1").unwrap();
+
+        // During the turn: the dir becomes a file, and the file becomes a dir.
+        std::fs::remove_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg"), "now a file").unwrap();
+        std::fs::remove_file(root.join("single.txt")).unwrap();
+        std::fs::create_dir_all(root.join("single.txt")).unwrap();
+        std::fs::write(root.join("single.txt/inner"), "x").unwrap();
+
+        snap.restore("turn-1").unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("pkg/mod.rs")).unwrap(), "mod v1");
+        assert_eq!(std::fs::read_to_string(root.join("single.txt")).unwrap(), "file v1");
+    }
+
+    #[test]
+    fn reconcile_owner_clears_for_a_different_or_missing_owner_and_keeps_for_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        let snap = Snapshotter::new(root.clone());
+        snap.snapshot("turn-1").unwrap();
+        let store = root.join(".stepper/checkpoints");
+
+        // Pre-owner-stamp store (older stepper) reads as unowned → cleared.
+        assert!(snap.reconcile_owner("session-a").unwrap());
+        assert!(!store.join("turn-1").exists(), "unowned checkpoints dropped");
+
+        // Same session again → kept.
+        snap.snapshot("turn-1").unwrap();
+        assert!(!snap.reconcile_owner("session-a").unwrap());
+        assert!(store.join("turn-1").is_dir(), "owning session keeps its checkpoints");
+
+        // A different session (resume/fork/clear) → cleared and re-stamped.
+        assert!(snap.reconcile_owner("session-b").unwrap());
+        assert!(!store.join("turn-1").exists(), "another session's checkpoints dropped");
+        assert!(!snap.reconcile_owner("session-b").unwrap(), "new owner stamped");
+    }
+
+    #[test]
+    fn owner_stamp_is_invisible_to_prune_and_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        let snap = Snapshotter::new(root.clone());
+        snap.stamp_owner("session-a");
+        for n in 1..=25 {
+            snap.snapshot(&format!("turn-{n}")).unwrap();
+        }
+        snap.prune(20).unwrap();
+        snap.prune_forward(30);
+        snap.clear_redo_snapshots();
+        let store = root.join(".stepper/checkpoints");
+        assert_eq!(
+            std::fs::read_to_string(store.join("owner")).unwrap(),
+            "session-a",
+            "the owner stamp survives every maintenance pass"
+        );
+        std::fs::write(root.join("a.txt"), "changed").unwrap();
+        snap.restore("turn-25").unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "x");
     }
 
     #[test]

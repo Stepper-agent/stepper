@@ -222,6 +222,7 @@ async fn user_prompt_submit_hook_fires_on_a_turn() {
         vec![stepper_config::HookEntry {
             matcher: None,
             command: format!("touch {}", marker.display()),
+            timeout: None,
         }],
     )]);
     let resolver = Arc::new(StubResolver {

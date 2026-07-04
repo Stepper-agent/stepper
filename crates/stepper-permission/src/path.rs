@@ -73,13 +73,55 @@ pub fn is_in_project(request_path: &Path, project_root: &Path) -> bool {
     target.starts_with(canonicalize_lenient(project_root))
 }
 
-/// Whether the path is inside the project's `.stepper/` config dir — a protected
-/// area (commands, hooks, settings) that controls the agent's own security and so
-/// must never be auto-approved for writes/edits, even in `accept-edits` mode.
+/// Whether a write/edit to this path must be explicitly confirmed even in an
+/// auto-approving mode (`auto`/`accept-edits`). Two kinds are protected: the
+/// project's own `.stepper/` config dir (commands, hooks, settings gate the
+/// agent's security), and files whose contents are EXECUTED or SOURCED by other
+/// tools — shell rc files, `.envrc`, git hooks, `.gitconfig` — where a silent
+/// auto-edit is an RCE vector. Secret files are refused outright elsewhere; this
+/// is the softer "ask first" tier for executable config.
 pub fn is_protected(request_path: &Path, project_root: &Path) -> bool {
     let target = resolve_request_path(request_path, project_root);
     let stepper = canonicalize_lenient(&project_root.join(".stepper"));
-    target.starts_with(&stepper)
+    target.starts_with(&stepper) || is_exec_config(&target)
+}
+
+/// Executable/sourced config whose auto-edit would be an RCE vector — matched by
+/// basename (case-insensitive) or by a `.git/hooks/` path component.
+fn is_exec_config(target: &Path) -> bool {
+    const EXEC_DOTFILES: &[&str] = &[
+        ".bashrc",
+        ".bash_profile",
+        ".bash_login",
+        ".profile",
+        ".zshrc",
+        ".zshenv",
+        ".zprofile",
+        ".zlogin",
+        ".envrc",
+        ".gitconfig",
+        ".git-blame-ignore-revs",
+    ];
+    // A file anywhere under a `.git/hooks/` dir (`pre-commit`, `post-merge`, …).
+    let names: Vec<&std::ffi::OsStr> = target
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    if names
+        .windows(2)
+        .any(|w| w[0] == std::ffi::OsStr::new(".git") && w[1] == std::ffi::OsStr::new("hooks"))
+    {
+        return true;
+    }
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    EXEC_DOTFILES.contains(&name.as_str())
 }
 
 /// Canonicalize as much of `abs` as exists on disk, appending any non-existent

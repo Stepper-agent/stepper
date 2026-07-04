@@ -29,6 +29,9 @@ pub enum Effect {
     /// Persist the prompt history to `path` (the event loop does the IO so
     /// `state.rs` stays pure). Carries the full capped list, written as a JSON array.
     PersistHistory { path: PathBuf, lines: Vec<String> },
+    /// Write this text (the last reply, via `/copy`) to the OS clipboard. The
+    /// arboard call lives in the event loop so `state.rs` stays IO-free.
+    CopyToClipboard(String),
 }
 
 pub type Effects = SmallVec<[Effect; 2]>;
@@ -593,6 +596,11 @@ pub struct AppState {
     /// Live-region scrollback offset: rows scrolled UP from the bottom (0 =
     /// pinned to the latest output). PgUp/PgDn and the mouse wheel adjust it.
     pub scroll_offset: u16,
+    /// Mirror of the input `textarea`'s internal vertical scroll offset, tracked
+    /// with the widget's own `next_scroll_top` rule so the real terminal cursor
+    /// lands on the row the widget actually drew it — the widget scrolls when a
+    /// long multi-line prompt overflows the box, and its viewport is not public.
+    pub input_scroll_top: std::cell::Cell<u16>,
     pub turn_active: bool,
     pub cwd: PathBuf,
     /// Known slash commands (name + description) for the `/` palette.
@@ -689,6 +697,7 @@ impl AppState {
             notice: None,
             spinner: 0,
             scroll_offset: 0,
+            input_scroll_top: std::cell::Cell::new(0),
             turn_active: false,
             cwd: init.cwd,
             theme: crate::theme::Theme::resolve(init.theme_preset.as_deref(), &init.theme_colors),
@@ -1598,6 +1607,10 @@ impl AppState {
             // `/editor [text]` — the event loop opens $EDITOR (it owns the
             // terminal); the slash argument is the seed.
             AppEvent::OpenEditor { seed } => self.editor_request = Some(seed),
+            AppEvent::CopyToClipboard(text) => {
+                self.notice = Some(info_notice("copied the last reply to the clipboard"));
+                effects.push(Effect::CopyToClipboard(text));
+            }
             AppEvent::EffortChanged(level) => self.effort = level,
             AppEvent::ApiKeyPrompt { provider } => {
                 // Never clobber a live overlay (esp. an approval's oneshot) and
@@ -1882,6 +1895,7 @@ mod tests {
             history_path: None,
             status_line_cmd: None,
             keybindings: Vec::new(),
+            initial_prompt: None,
         })
     }
 

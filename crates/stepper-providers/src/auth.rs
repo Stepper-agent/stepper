@@ -17,12 +17,34 @@ pub enum AuthSource {
     Codex(CodexTokenStore),
 }
 
-/// Resolve an API key with the precedence `explicit cfg > env > OS keyring`. The
-/// env var is `STEPPER_<PROVIDER>_API_KEY` (provider uppercased, `-`→`_`); the
-/// keyring entry is `Entry::new("stepper", "<provider>")`. Returns `None` when no
-/// key is found (caller decides if that is fatal).
+/// Resolve an API key with the precedence `explicit cfg > STEPPER_<P>_API_KEY >
+/// well-known provider env (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) > OS
+/// keyring`. The well-known tier lets someone who already exported the standard
+/// vendor variable (e.g. migrating from Claude Code) run keyless. Returns `None`
+/// when no key is found (caller decides if that is fatal).
 pub fn resolve_key(provider: &str, explicit: Option<&str>) -> Option<SecretString> {
     resolve_key_with(provider, explicit, key_from_keyring)
+}
+
+/// Standard vendor API-key env vars, keyed by provider id. Checked after the
+/// stepper-namespaced var so an explicit `STEPPER_<P>_API_KEY` still wins.
+fn well_known_env_var(provider: &str) -> Option<&'static str> {
+    match provider {
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "openai" => Some("OPENAI_API_KEY"),
+        "openrouter" => Some("OPENROUTER_API_KEY"),
+        "groq" => Some("GROQ_API_KEY"),
+        "mistral" => Some("MISTRAL_API_KEY"),
+        "deepseek" => Some("DEEPSEEK_API_KEY"),
+        "xai" => Some("XAI_API_KEY"),
+        "google" | "google-generative-ai" => Some("GEMINI_API_KEY"),
+        "cohere" => Some("COHERE_API_KEY"),
+        "perplexity" => Some("PERPLEXITY_API_KEY"),
+        "cerebras" => Some("CEREBRAS_API_KEY"),
+        "togetherai" => Some("TOGETHER_API_KEY"),
+        "fireworks" => Some("FIREWORKS_API_KEY"),
+        _ => None,
+    }
 }
 
 /// The precedence logic, with the keyring tier injected so it can be tested
@@ -42,14 +64,17 @@ fn resolve_key_with(
         }
     }
 
-    let env_var = format!(
+    let stepper_var = format!(
         "STEPPER_{}_API_KEY",
         provider.to_ascii_uppercase().replace('-', "_")
     );
-    if let Ok(v) = std::env::var(&env_var) {
-        let v = v.trim();
-        if !v.is_empty() {
-            return Some(SecretString::from(v.to_string()));
+    let candidates = [Some(stepper_var.as_str()), well_known_env_var(provider)];
+    for var in candidates.into_iter().flatten() {
+        if let Ok(v) = std::env::var(var) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(SecretString::from(v.to_string()));
+            }
         }
     }
 
@@ -108,6 +133,26 @@ mod tests {
         let k = resolve_key_with("krenvtest", None, from_keyring).unwrap();
         unsafe { std::env::remove_var(var) };
         assert_eq!(k.expose_secret(), "sk-env");
+    }
+
+    #[test]
+    fn well_known_vendor_env_is_recognized_after_the_stepper_var() {
+        // A migrator's exported ANTHROPIC_API_KEY resolves without STEPPER_ prefix.
+        let var = "ANTHROPIC_API_KEY";
+        let prior = std::env::var(var).ok();
+        // SAFETY: single-threaded test scope; restored below.
+        unsafe { std::env::set_var(var, "sk-vendor") };
+        let k = resolve_key_with("anthropic", None, |_| None).unwrap();
+        assert_eq!(k.expose_secret(), "sk-vendor");
+        // The stepper-namespaced var still takes precedence.
+        unsafe { std::env::set_var("STEPPER_ANTHROPIC_API_KEY", "sk-stepper") };
+        let k = resolve_key_with("anthropic", None, |_| None).unwrap();
+        assert_eq!(k.expose_secret(), "sk-stepper");
+        unsafe { std::env::remove_var("STEPPER_ANTHROPIC_API_KEY") };
+        match prior {
+            Some(v) => unsafe { std::env::set_var(var, v) },
+            None => unsafe { std::env::remove_var(var) },
+        }
     }
 
     #[test]

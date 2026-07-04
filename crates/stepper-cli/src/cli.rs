@@ -9,6 +9,11 @@ pub struct Cli {
     pub global: GlobalArgs,
     #[command(subcommand)]
     pub command: Option<Command>,
+    /// An opening prompt: `stepper "fix the failing test"` starts the interactive
+    /// session on that turn. Ignored when a subcommand or `-p` is given. Also
+    /// filled from piped stdin (`echo ... | stepper`).
+    #[arg(trailing_var_arg = true)]
+    pub prompt: Vec<String>,
 }
 
 #[derive(Args, Clone)]
@@ -46,8 +51,10 @@ pub struct GlobalArgs {
     /// Like `--append-system-prompt`, but read the appended text from a file.
     #[arg(long, global = true)]
     pub append_system_prompt_file: Option<PathBuf>,
-    /// One-shot non-interactive prompt (no inline viewport).
-    #[arg(short = 'p', long, global = true)]
+    /// One-shot non-interactive prompt (no inline viewport). The value is
+    /// optional: `-p` alone reads the prompt from piped stdin (`cat task.md |
+    /// stepper -p`); `-p "text"` uses the text (and appends piped stdin if any).
+    #[arg(short = 'p', long, global = true, num_args = 0..=1, default_missing_value = "")]
     pub print: Option<String>,
     /// Resume a saved session by id.
     #[arg(long, global = true)]

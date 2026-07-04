@@ -498,6 +498,10 @@ pub struct HookEntry {
     #[serde(default)]
     pub matcher: Option<String>,
     pub command: String,
+    /// Per-hook timeout in seconds. Overrides the default (30s) — a Stop hook that
+    /// runs a formatter/test suite may need longer. `None` uses the default.
+    #[serde(default)]
+    pub timeout: Option<u64>,
 }
 
 /// Deep-merge `over` (project) onto `base` (user): objects merge key-by-key,

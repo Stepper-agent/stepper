@@ -58,30 +58,43 @@ impl HookHost {
         let Some(entries) = self.hooks.get(event) else {
             return HookDecision::Continue;
         };
+        // Only `PreToolUse` gates a tool, so a non-zero exit there short-circuits
+        // (running further pre-hooks is pointless once the tool is denied). For
+        // every other event a non-zero exit is not a stop signal — a formatter
+        // returning exit 1 on an unformatted file, say — so ALL matched hooks
+        // must run (a second recording/notify hook used to be silently skipped).
+        let short_circuit = event == "PreToolUse";
+        let mut first_block: Option<String> = None;
         for entry in entries {
             if let Some(matcher) = &entry.matcher
                 && !matcher_matches(matcher, matcher_target)
             {
                 continue;
             }
-            match self.run_one(&entry.command, payload, cancel).await {
-                Ok((code, out)) if code != 0 => {
-                    let reason = if out.trim().is_empty() {
-                        format!("blocked by {event} hook (exit {code})")
-                    } else {
-                        out.trim().to_string()
-                    };
+            if let Ok((code, out)) = self.run_one(&entry.command, entry.timeout, payload, cancel).await
+                && code != 0
+            {
+                let reason = if out.trim().is_empty() {
+                    format!("blocked by {event} hook (exit {code})")
+                } else {
+                    out.trim().to_string()
+                };
+                if short_circuit {
                     return HookDecision::Block(reason);
                 }
-                _ => {}
+                first_block.get_or_insert(reason);
             }
         }
-        HookDecision::Continue
+        match first_block {
+            Some(reason) => HookDecision::Block(reason),
+            None => HookDecision::Continue,
+        }
     }
 
     async fn run_one(
         &self,
         command: &str,
+        timeout_secs: Option<u64>,
         payload: &Value,
         cancel: &CancellationToken,
     ) -> std::io::Result<(i32, String)> {
@@ -89,11 +102,16 @@ impl HookHost {
             .arg("-lc")
             .arg(command)
             .current_dir(&self.cwd)
+            // Expose the project dir to hook scripts, under both the stepper name
+            // and the Claude-Code name ported hooks hardcode.
+            .env("STEPPER_PROJECT_DIR", &self.cwd)
+            .env("CLAUDE_PROJECT_DIR", &self.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
+        let hook_timeout = timeout_secs.map(Duration::from_secs).unwrap_or(HOOK_TIMEOUT);
 
         // Take the pipes OUT of the child so `child.wait()` can run alongside the
         // drains without borrow conflicts.
@@ -107,7 +125,7 @@ impl HookHost {
         // Race the turn's cancellation (Esc) against the run so a hung hook is
         // interruptible like the rest of the loop; on cancel we drop `child`
         // (kill_on_drop reaps bash) and let the action proceed (code 0 = Continue).
-        let timed = tokio::time::timeout(HOOK_TIMEOUT, async {
+        let timed = tokio::time::timeout(hook_timeout, async {
             // Write stdin and drain both pipes CONCURRENTLY (so a hook that fills a
             // pipe can't deadlock the stdin write). Completion is the CHILD EXITING
             // (`child.wait()`), NOT pipe EOF: a hook that backgrounds a subprocess
@@ -213,7 +231,7 @@ mod tests {
         let host = HookHost::empty(std::env::temp_dir());
         let started = Instant::now();
         let (code, out) = host
-            .run_one("( sleep 30 ) & echo done; exit 0", &json!({}), &CancellationToken::new())
+            .run_one("( sleep 30 ) & echo done; exit 0", None, &json!({}), &CancellationToken::new())
             .await
             .unwrap();
         assert!(started.elapsed() < Duration::from_secs(8), "returned at bash exit, not the 30s pipe-EOF stall");
@@ -227,7 +245,7 @@ mod tests {
         // capped (and the process still completes rather than deadlocking).
         let host = HookHost::empty(std::env::temp_dir());
         let (code, out) = host
-            .run_one("head -c 2000000 /dev/zero | tr '\\0' 'x'; exit 0", &json!({}), &CancellationToken::new())
+            .run_one("head -c 2000000 /dev/zero | tr '\\0' 'x'; exit 0", None, &json!({}), &CancellationToken::new())
             .await
             .unwrap();
         assert_eq!(code, 0);
@@ -246,9 +264,62 @@ mod tests {
             c2.cancel();
         });
         let started = Instant::now();
-        let (code, _) = host.run_one("sleep 30", &json!({}), &cancel).await.unwrap();
+        let (code, _) = host.run_one("sleep 30", None, &json!({}), &cancel).await.unwrap();
         assert!(started.elapsed() < Duration::from_secs(5), "cancel interrupts before the 30s timeout");
         assert_eq!(code, 0, "a cancelled hook does not Block the action");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_non_blocking_events_hooks_all_run_despite_a_nonzero_exit() {
+        // Two PostToolUse hooks: the first exits non-zero (a formatter on an
+        // unformatted file), the second writes a marker file. The second must
+        // still run — a non-zero exit is not a stop signal off PreToolUse.
+        use std::collections::BTreeMap;
+        use stepper_config::HookEntry;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran.txt");
+        let mut hooks = BTreeMap::new();
+        hooks.insert(
+            "PostToolUse".to_string(),
+            vec![
+                HookEntry { matcher: None, command: "exit 1".into(), timeout: None },
+                HookEntry {
+                    matcher: None,
+                    command: format!("echo ok > {}", marker.display()),
+                    timeout: None,
+                },
+            ],
+        );
+        let host = HookHost::new(hooks, dir.path().to_path_buf());
+        host.run("PostToolUse", Some("bash"), &json!({}), &CancellationToken::new())
+            .await;
+        assert!(marker.exists(), "the second PostToolUse hook ran after the first exited non-zero");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pre_tool_use_short_circuits_on_the_first_block() {
+        use std::collections::BTreeMap;
+        use stepper_config::HookEntry;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("second.txt");
+        let mut hooks = BTreeMap::new();
+        hooks.insert(
+            "PreToolUse".to_string(),
+            vec![
+                HookEntry { matcher: None, command: "echo nope; exit 2".into(), timeout: None },
+                HookEntry {
+                    matcher: None,
+                    command: format!("echo ok > {}", marker.display()),
+                    timeout: None,
+                },
+            ],
+        );
+        let host = HookHost::new(hooks, dir.path().to_path_buf());
+        let decision = host
+            .run("PreToolUse", Some("bash"), &json!({}), &CancellationToken::new())
+            .await;
+        assert!(matches!(decision, super::HookDecision::Block(_)), "the tool is blocked");
+        assert!(!marker.exists(), "a denied PreToolUse short-circuits — the second hook does not run");
     }
 
     #[test]

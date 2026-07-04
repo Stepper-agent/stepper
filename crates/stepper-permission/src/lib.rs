@@ -402,6 +402,33 @@ mod tests {
     }
 
     #[test]
+    fn process_wrappers_do_not_bypass_a_deny_rule() {
+        let rules = RuleSet::from_lists(&[], &[], &["Bash(rm *)".into()]);
+        // A deny on `rm *` must catch the inner command through every wrapper.
+        for cmd in [
+            "rm -rf x",
+            "sudo rm -rf x",
+            "timeout 5 rm -rf x",
+            "timeout -k 1 5s rm -rf x",
+            "env FOO=1 rm -rf x",
+            "nice -n 10 rm -rf x",
+            "nohup rm -rf x",
+            "sudo -u root env A=b rm -rf x",
+        ] {
+            assert_eq!(
+                evaluate(&PermissionRequest::Bash(cmd.into()), &rules, &root(), None, PermissionMode::Auto),
+                Decision::Deny,
+                "wrapper must not smuggle past the rm deny: {cmd}",
+            );
+        }
+        // A non-denied wrapped command is unaffected (auto-allows in Auto).
+        assert_eq!(
+            evaluate(&PermissionRequest::Bash("timeout 5 ls -la".into()), &rules, &root(), None, PermissionMode::Auto),
+            Decision::Allow,
+        );
+    }
+
+    #[test]
     fn compound_bash_takes_most_restrictive() {
         let rules = RuleSet::from_lists(
             &["Bash(cargo *)".into()],
@@ -561,6 +588,36 @@ mod tests {
                 PermissionMode::AcceptEdits,
             ),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn writes_to_executable_dotfiles_escalate_even_in_auto() {
+        let rules = RuleSet::default();
+        // Editing shell rc / git hooks / .envrc is an RCE surface — auto/accept-edits
+        // must ask first, unlike an ordinary in-project source edit.
+        for p in [
+            "/project/.bashrc",
+            "/project/.zshenv",
+            "/project/.envrc",
+            "/project/.gitconfig",
+            "/project/.git/hooks/pre-commit",
+        ] {
+            assert_eq!(
+                evaluate(&PermissionRequest::Edit(p.into()), &rules, &root(), None, PermissionMode::Auto),
+                Decision::Ask,
+                "{p} must escalate to Ask in Auto",
+            );
+        }
+        // An ordinary source file still auto-allows.
+        assert_eq!(
+            evaluate(&PermissionRequest::Edit("/project/src/lib.rs".into()), &rules, &root(), None, PermissionMode::Auto),
+            Decision::Allow,
+        );
+        // Reading an rc file is fine — only writes/edits are gated.
+        assert_eq!(
+            evaluate(&PermissionRequest::Read("/project/.bashrc".into()), &rules, &root(), None, PermissionMode::Auto),
+            Decision::Allow,
         );
     }
 

@@ -35,6 +35,8 @@ pub async fn run(
     // Load the persisted prompt history (IO here keeps `state.rs` pure) before the
     // state takes ownership of `init`.
     let history = load_history_file(init.history_path.as_deref());
+    // A `stepper "query"` / piped-stdin prompt to fire once on startup.
+    let initial_prompt = init.initial_prompt.clone();
     // The live theme lives in AppState (the `/theme` editor mutates it).
     let mut state = AppState::new(init);
     state.set_history(history);
@@ -58,6 +60,14 @@ pub async fn run(
     let mut force_clear = false;
     let mut last_input_w = 0usize;
     draw(&mut guard.terminal, &state, &state.theme)?;
+
+    // Fire the startup prompt as if the user typed it and pressed Enter: it echoes
+    // to scrollback and streams a turn, then the session stays interactive.
+    if let Some(prompt) = initial_prompt.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
+        let effects = state.apply_action(stepper_protocol::Action::SubmitInput(prompt));
+        run_effects(&mut guard.terminal, &action_tx, effects)?;
+        dirty = true;
+    }
 
     loop {
         if state.should_quit {
@@ -336,9 +346,12 @@ fn handle_terminal_event(
 
     // Typing '@' at a word boundary opens the file picker (the filesystem scan
     // happens here, IO, so state.rs stays pure). Mid-word '@' (e.g. an email)
-    // falls through and is inserted literally.
+    // falls through and is inserted literally. Gated on `overlay.is_none()` (like
+    // `#`): opening the picker over an Approval/Question overlay would hide it and
+    // steal the y/a/n keys, stranding the awaiting worker.
     if let Event::Key(k) = &ev
         && let KeyCode::Char('@') = k.code
+        && state.overlay.is_none()
         && at_word_boundary(state)
     {
         open_or_refresh_picker(state, String::new());
@@ -842,6 +855,13 @@ fn run_effects(
                     let _ = std::fs::write(&path, body);
                 }
             }
+            Effect::CopyToClipboard(text) => {
+                // Best-effort: an unavailable clipboard (headless/SSH) is a quiet
+                // no-op — the notice already told the user we tried.
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    let _ = cb.set_text(text);
+                }
+            }
         }
     }
     Ok(committed)
@@ -880,6 +900,7 @@ mod tests {
             history_path: None,
             status_line_cmd: None,
             keybindings: Vec::new(),
+            initial_prompt: None,
         });
         s.overlay = Some(Overlay::ApiKey(ApiKeyOverlay {
             provider: "anthropic".into(),
@@ -917,5 +938,36 @@ mod tests {
         // Ctrl+C cancels the overlay instead of appending a literal 'c'.
         handle_overlay_key(&mut s, &tx, &key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(s.overlay.is_none(), "Ctrl+C must cancel, not type 'c'");
+    }
+
+    fn state_with_approval_overlay() -> AppState {
+        use stepper_protocol::{ApprovalKind, ApprovalRequest};
+        use tokio::sync::oneshot;
+        use uuid::Uuid;
+        let mut s = state_with_api_key_overlay();
+        let (reply, _rx) = oneshot::channel();
+        s.overlay = Some(crate::state::Overlay::Approval(ApprovalRequest {
+            id: Uuid::new_v4(),
+            kind: ApprovalKind::Command { cmd: "ls".into(), outside_project: false },
+            reply,
+        }));
+        s
+    }
+
+    #[test]
+    fn at_does_not_open_the_file_picker_over_an_approval_overlay() {
+        // The prompt is empty (a word boundary), so `@` would normally open the
+        // file picker — but an Approval is on screen. The overlay guard must veto
+        // it, or the picker would hide the approval and steal the y/a/n keys,
+        // stranding the awaiting worker. Mirror the exact `@` trigger condition.
+        let s = state_with_approval_overlay();
+        assert!(at_word_boundary(&s), "empty prompt is a word boundary");
+        let would_open = s.overlay.is_none() && at_word_boundary(&s);
+        assert!(!would_open, "@ must not open a picker while an overlay is up");
+
+        // With no overlay, the same empty prompt DOES open the picker.
+        let mut clear = s;
+        clear.overlay = None;
+        assert!(clear.overlay.is_none() && at_word_boundary(&clear));
     }
 }
