@@ -15,8 +15,8 @@ use std::path::Path;
 use stepper_permission::{PermissionMode, Rule};
 use stepper_protocol::{
     AppEvent, ApprovalRuleView, CheckpointView, ContextBreakdownView, EventTx, ModelView,
-    NoticeLevel, PermissionRuleView, PermissionsSnapshotView, SessionView, SettingsRowView,
-    SettingsSnapshotView, SettingsTabView,
+    NoticeLevel, PermissionRuleView, PermissionsSnapshotView, ProviderChoiceView, SessionView,
+    SettingsRowView, SettingsSnapshotView, SettingsTabView,
 };
 use stepper_provider::Usage;
 
@@ -32,6 +32,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("init", "", "create the .stepper/ skeleton"),
     ("scaffold-layer", "", "write a default plan→implement→review pipeline"),
     ("layer", "<name>", "new layer"),
+    ("create-layer", "<describe it>", "have the model create & place a layer"),
     ("command", "<name>", "new slash command"),
     ("import", "[claude|codex|cursor|gemini|all] [apply]", "migrate another agent's config"),
     ("code-review", "[<ref>|<a>..<b>|#<pr>] [--fix]", "review a diff for bugs & cleanups"),
@@ -699,24 +700,46 @@ async fn handle_models(orchestrator: &Orchestrator, tx: &EventTx) {
     let _ = tx.send(AppEvent::ModelList(models)).await;
 }
 
+/// The sentinel picker id for the "add custom provider" row of `/connect` —
+/// double-underscored so it can never collide with a models.dev catalog id.
+pub(crate) const CUSTOM_PROVIDER_ID: &str = "__custom__";
+
 /// `/connect [provider]`: with no arg, fetch the models.dev provider seed and
-/// open the picker; with a provider id, register it (wire kind + base URL derived
-/// from the catalog) into the live config *and* `setting.json`, then prompt for
-/// its API key (which the existing `/login` overlay stores in the OS keyring).
+/// open the picker (prefixed with an "add custom provider" row for endpoints
+/// the catalog doesn't know, e.g. a local LLM server); with a provider id,
+/// register it (wire kind + base URL derived from the catalog) into the live
+/// config *and* `setting.json`, then prompt for its API key (which the existing
+/// `/login` overlay stores in the OS keyring).
 async fn handle_connect(arg: &str, orchestrator: &Orchestrator, tx: &EventTx) {
     if arg.is_empty() {
         notice(tx, NoticeLevel::Info, "fetching providers…".into()).await;
-        let providers = orchestrator.resolver.list_providers().await;
+        let mut providers = orchestrator.resolver.list_providers().await;
         if providers.is_empty() {
             notice(
                 tx,
                 NoticeLevel::Warn,
-                "no providers found (models.dev unreachable?) — or use /login <provider>".into(),
+                "models.dev unreachable — only the custom option is available (or use /login <provider>)"
+                    .into(),
             )
             .await;
-            return;
         }
+        providers.insert(
+            0,
+            ProviderChoiceView {
+                id: CUSTOM_PROVIDER_ID.to_string(),
+                label: "add custom provider  ·  your own endpoint (e.g. a local LLM server)"
+                    .to_string(),
+                connectable: true,
+            },
+        );
         let _ = tx.send(AppEvent::ProviderList(providers)).await;
+        return;
+    }
+    if arg == CUSTOM_PROVIDER_ID {
+        // The picker routes the custom row back through `/connect __custom__`;
+        // the actual host/type entry happens in the TUI form, which replies
+        // with `Action::ConnectCustom` (handled in the core action loop).
+        let _ = tx.send(AppEvent::CustomProviderPrompt).await;
         return;
     }
     match orchestrator.resolver.connect_provider(arg).await {
@@ -739,6 +762,18 @@ async fn handle_connect(arg: &str, orchestrator: &Orchestrator, tx: &EventTx) {
     }
 }
 
+/// Where provider connections persist: project `.stepper/` wins, else user
+/// `~/.stepper/`. `None` when there is nowhere to persist (no `.stepper/`, no
+/// home) — the caller reports "not persisted" and the live config still works.
+fn settings_dir(orchestrator: &Orchestrator) -> Option<std::path::PathBuf> {
+    let project = orchestrator.project_root.join(".stepper");
+    if project.is_dir() {
+        Some(project)
+    } else {
+        orchestrator.home.as_ref().map(|home| home.join(".stepper"))
+    }
+}
+
 /// Merge a freshly connected provider into `setting.json` `providers` (project
 /// `.stepper/` wins, else user `~/.stepper/`) without clobbering existing ones.
 /// `Ok(false)` when there is nowhere to persist (no `.stepper/`, no home).
@@ -747,12 +782,7 @@ fn persist_provider(
     id: &str,
     connected: &ConnectedProvider,
 ) -> std::io::Result<bool> {
-    let project = orchestrator.project_root.join(".stepper");
-    let dir = if project.is_dir() {
-        project
-    } else if let Some(home) = orchestrator.home.as_ref() {
-        home.join(".stepper")
-    } else {
+    let Some(dir) = settings_dir(orchestrator) else {
         return Ok(false);
     };
     stepper_config::scaffold::update_settings(&dir, |obj| {
@@ -779,6 +809,107 @@ fn persist_provider(
         }
     })?;
     Ok(true)
+}
+
+/// `Action::ConnectCustom` — register a user-typed provider (the `/connect`
+/// custom form): validate, map the UI flavor onto a wire kind, inject it into
+/// the live config, persist it, and prompt for a key (API flavors) or point at
+/// `setting.json` for hand-editing (the `custom` flavor).
+pub(crate) async fn handle_connect_custom(
+    name: &str,
+    base_url: &str,
+    flavor: &str,
+    orchestrator: &Orchestrator,
+    tx: &EventTx,
+) {
+    let name = name.trim();
+    if !stepper_config::scaffold::is_safe_name(name) {
+        notice(
+            tx,
+            NoticeLevel::Warn,
+            "provider names use letters, digits, - or _ (max 64 chars)".into(),
+        )
+        .await;
+        return;
+    }
+    // `openai` = OpenAI-compatible (chat/completions), `claude` = Anthropic
+    // Messages. `custom` starts as openai-compat (the most common local-server
+    // dialect) and the notice points at setting.json for any other wire format.
+    let kind = match flavor {
+        "openai" | "custom" => "openai-compat",
+        "claude" => "anthropic",
+        other => {
+            notice(tx, NoticeLevel::Warn, format!("unknown provider type '{other}'")).await;
+            return;
+        }
+    };
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        notice(tx, NoticeLevel::Warn, "a base URL is required (e.g. https://localhost:11111/v1)".into())
+            .await;
+        return;
+    }
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        notice(tx, NoticeLevel::Warn, "the base URL must start with http:// or https://".into())
+            .await;
+        return;
+    }
+    if let Err(e) = orchestrator.resolver.connect_custom(name, kind, Some(base)) {
+        notice(tx, NoticeLevel::Warn, format!("cannot add '{name}': {e}")).await;
+        return;
+    }
+    let connected = ConnectedProvider { kind: kind.to_string(), base_url: Some(base.to_string()) };
+    let persisted = persist_custom_provider(orchestrator, name, &connected);
+    let settings_path = settings_dir(orchestrator)
+        .map(|d| d.join("setting.json").display().to_string())
+        .unwrap_or_else(|| ".stepper/setting.json".to_string());
+    let text = match (flavor, persisted) {
+        // The custom flavor's contract is "edit the spec file yourself": name
+        // the exact file and the accepted kinds, and leave the key to /login.
+        ("custom", _) => format!(
+            "added '{name}' as openai-compat @ {base} — for another wire format edit \
+             providers.{name}.kind in {settings_path} (openai-compat | anthropic | \
+             openai-responses); /login {name} sets its key"
+        ),
+        (_, true) => format!("added provider '{name}' ({kind} @ {base}) — enter its API key (Esc if none)"),
+        (_, false) => format!(
+            "added provider '{name}' ({kind} @ {base}) for this session only (no .stepper/ to persist) — enter its API key (Esc if none)"
+        ),
+    };
+    notice(tx, NoticeLevel::Info, text).await;
+    if flavor != "custom" {
+        let _ = tx.send(AppEvent::ApiKeyPrompt { provider: name.to_string() }).await;
+    }
+}
+
+/// Persist a custom provider, overwriting `kind`/`baseUrl` (the user just typed
+/// them) while preserving any apiKey/defaultModel/auth/contextWindow already in
+/// the entry. Returns whether it was persisted anywhere.
+fn persist_custom_provider(
+    orchestrator: &Orchestrator,
+    id: &str,
+    connected: &ConnectedProvider,
+) -> bool {
+    let Some(dir) = settings_dir(orchestrator) else {
+        return false;
+    };
+    stepper_config::scaffold::update_settings(&dir, |obj| {
+        let providers = obj
+            .entry("providers")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(map) = providers.as_object_mut() {
+            let entry = map
+                .entry(id.to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("kind".to_string(), serde_json::Value::String(connected.kind.clone()));
+                if let Some(base) = &connected.base_url {
+                    obj.insert("baseUrl".to_string(), serde_json::Value::String(base.clone()));
+                }
+            }
+        }
+    })
+    .is_ok()
 }
 
 /// chars/4, the same estimator the compactor uses for free text.

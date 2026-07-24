@@ -289,6 +289,25 @@ impl ProviderResolver for ConfigProviderResolver {
         }
         Ok(ConnectedProvider { kind, base_url })
     }
+
+    /// Register a user-typed provider into the live config. The kind and base
+    /// come straight from the custom form, so they overwrite stale values —
+    /// but an existing entry's key / model / context overrides are preserved
+    /// (only the two fields the form owns are touched).
+    fn connect_custom(
+        &self,
+        name: &str,
+        kind: &str,
+        base_url: Option<&str>,
+    ) -> Result<(), CoreError> {
+        let mut config = self.config.write().unwrap();
+        let entry = config.settings.providers.entry(name.to_string()).or_default();
+        entry.kind = kind.to_string();
+        if let Some(base) = base_url {
+            entry.base_url = Some(base.to_string());
+        }
+        Ok(())
+    }
 }
 
 /// Whether `connect_provider` can resolve an API base for this catalog entry —
@@ -709,6 +728,52 @@ mod tests {
         assert!(rp.api_key.is_none(), "no key injected — that rides the keyring");
         // An unknown catalog provider is an error, not a silent no-op.
         assert!(resolver.connect_provider("nope").await.is_err());
+    }
+
+    #[test]
+    fn connect_custom_overwrites_kind_and_base_but_preserves_other_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::load(dir.path()).unwrap();
+        // A pre-existing entry with a user key and default model: the custom
+        // form owns kind/baseUrl (the user just typed them) but must not touch
+        // the rest.
+        config.settings.providers.insert(
+            "local".into(),
+            ProviderConfig {
+                kind: "anthropic".into(),
+                base_url: Some("https://old.example/v1".into()),
+                api_key: Some("sk-keep".into()),
+                auth: None,
+                default_model: Some("local/m1".into()),
+                context_window: Some(64_000),
+                models: Default::default(),
+            },
+        );
+        let resolver = ConfigProviderResolver::new(
+            config,
+            ProviderFactory::new().unwrap(),
+            ModelRegistry::builtin(),
+            None,
+            None,
+        );
+        resolver
+            .connect_custom("local", "openai-compat", Some("https://localhost:11111/v1"))
+            .unwrap();
+        {
+            let config = resolver.config.read().unwrap();
+            let entry = &config.settings.providers["local"];
+            assert_eq!(entry.kind, "openai-compat");
+            assert_eq!(entry.base_url.as_deref(), Some("https://localhost:11111/v1"));
+            assert_eq!(entry.api_key.as_deref(), Some("sk-keep"));
+            assert_eq!(entry.default_model.as_deref(), Some("local/m1"));
+            assert_eq!(entry.context_window, Some(64_000));
+        }
+        // A brand-new name registers from scratch and resolves live (keyless is
+        // fine for a localhost openai-compat endpoint).
+        resolver.connect_custom("fresh", "openai-compat", Some("http://localhost:8080/v1")).unwrap();
+        let rp = resolver.config.read().unwrap().resolve_provider("fresh/some-model").unwrap();
+        assert_eq!(rp.kind, "openai-compat");
+        assert_eq!(rp.base_url.as_deref(), Some("http://localhost:8080/v1"));
     }
 
     #[test]

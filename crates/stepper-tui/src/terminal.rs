@@ -7,7 +7,8 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::supports_keyboard_enhancement;
-use ratatui::{DefaultTerminal, TerminalOptions, Viewport};
+use ratatui::backend::CrosstermBackend;
+use ratatui::{DefaultTerminal, Terminal, TerminalOptions, Viewport};
 
 /// Set while the Kitty keyboard-enhancement flags are pushed, so the panic hook
 /// (which has no handle to the guard) knows whether to pop them. Process-global
@@ -80,6 +81,33 @@ impl TerminalGuard {
             prev(info);
         }));
         Self { terminal: enter(inline_height), inline_height }
+    }
+
+    /// Rebuild the inline viewport at a new row count (the terminal was
+    /// resized). Stays in raw mode and keeps the keyboard-enhancement flags —
+    /// only the ratatui `Terminal` is replaced, so no panic-hook chaining and no
+    /// mode flicker. The caller forces a full repaint afterwards. Same-height
+    /// (and zero-height) calls are no-ops.
+    pub fn set_rows(&mut self, rows: u16) {
+        use crossterm::cursor::MoveTo;
+        use crossterm::terminal::{Clear, ClearType};
+        if rows == 0 || rows == self.inline_height {
+            return;
+        }
+        self.inline_height = rows;
+        // Clear the screen and home the cursor BEFORE rebuilding: ratatui
+        // re-anchors an inline viewport by appending `rows - 1` newlines from
+        // the CURRENT cursor row, and after a draw the cursor sits at the
+        // input box near the bottom — the append would scroll almost the whole
+        // stale painted frame (chrome + the retained reply) into native
+        // scrollback, permanently. From a blank origin the append never
+        // scrolls, so scrollback stays exactly the committed transcript.
+        // Clear(All) touches only the visible screen — never the scrollback.
+        let _ = execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0));
+        let options = TerminalOptions { viewport: Viewport::Inline(rows) };
+        if let Ok(terminal) = Terminal::with_options(CrosstermBackend::new(stdout()), options) {
+            self.terminal = terminal;
+        }
     }
 
     /// Hand the terminal back to the shell (for an external editor): leave the

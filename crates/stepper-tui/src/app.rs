@@ -31,7 +31,10 @@ pub async fn run(
     init: TuiInit,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let mut guard = TerminalGuard::new(init.inline_height);
+    // The inline viewport spans the full terminal height (fullscreen feel while
+    // `insert_before` keeps committing finished turns to native scrollback);
+    // `init.inline_height` is only the fallback when the size query fails.
+    let mut guard = TerminalGuard::new(full_viewport_rows(init.inline_height));
     // Load the persisted prompt history (IO here keeps `state.rs` pure) before the
     // state takes ownership of `init`.
     let history = load_history_file(init.history_path.as_deref());
@@ -52,6 +55,9 @@ pub async fn run(
 
     let mut tick = tokio::time::interval(Duration::from_millis(33));
     let mut dirty = true;
+    // A terminal resize arrives as an input event but is applied on the tick,
+    // coalescing a resize-drag burst into one viewport rebuild per frame.
+    let mut pending_rows: Option<u16> = None;
     // Force a full repaint on the next draw. Needed because overwriting a wide
     // (CJK) glyph with narrower content leaves its right half on screen — a
     // ratatui inline-viewport + wide-char diff limitation. We only force it when
@@ -77,10 +83,16 @@ pub async fn run(
             maybe_ev = input_rx.recv() => {
                 match maybe_ev {
                     Some(ev) => {
+                        // A resize re-anchors the full-height viewport (deferred
+                        // to the tick); width-only changes still force a repaint
+                        // so wrapped content re-flows cleanly.
+                        if let Event::Resize(_, rows) = ev {
+                            pending_rows = Some(rows);
+                            force_clear = true;
                         // An action can now commit to scrollback (e.g. echoing the
                         // submitted prompt), so route its effects through the same
                         // `run_effects` the core-event arm uses.
-                        if handle_terminal_event(&mut guard.terminal, &mut state, &action_tx, ev)? {
+                        } else if handle_terminal_event(&mut guard.terminal, &mut state, &action_tx, ev)? {
                             force_clear = true;
                         }
                         dirty = true;
@@ -89,6 +101,11 @@ pub async fn run(
                 }
             }
             _ = tick.tick() => {
+                if let Some(rows) = pending_rows.take() {
+                    guard.set_rows(rows);
+                    force_clear = true;
+                    dirty = true;
+                }
                 let iw = input_width(&state);
                 if last_input_w >= iw + 2 {
                     force_clear = true; // a wide glyph was removed
@@ -141,6 +158,14 @@ pub async fn run(
             running.store(false, Ordering::Relaxed);
             let _ = reader.join();
             open_external_editor(&mut guard, &mut state, &seed);
+            // The terminal may have been resized while the editor owned it (no
+            // Resize event reaches us then) — re-sync the viewport height, and
+            // drop any pre-editor Resize still pending so a stale height can't
+            // override this resync on the next tick.
+            pending_rows = None;
+            if let Ok((_, rows)) = crossterm::terminal::size() {
+                guard.set_rows(rows);
+            }
             running = Arc::new(AtomicBool::new(true));
             let (tx, rx) = mpsc::channel::<Event>(256);
             input_rx = rx;
@@ -153,7 +178,27 @@ pub async fn run(
     running.store(false, Ordering::Relaxed);
     drop(input_rx);
     let _ = reader.join();
+    // The final turn's block is retained on screen rather than committed (see
+    // `TurnComplete` in state.rs) — flush it now and clear the viewport, so the
+    // terminal ends with the whole transcript in scrollback exactly once and no
+    // painted full-screen panel left behind. `Terminal::clear` restores the
+    // cursor to where the last draw left it (the input box, mid-screen), so
+    // home it explicitly — the shell prompt then starts at the top of the
+    // blank screen, right under the scrolled-off transcript.
+    let _ = run_effects(&mut guard.terminal, &action_tx, state.take_final_commit());
+    let _ = guard.terminal.clear();
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::MoveTo(0, 0));
     Ok(())
+}
+
+/// The full terminal height for the inline viewport (the app owns the whole
+/// screen; committed turns still scroll into native scrollback). `fallback`
+/// covers a failed/degenerate size query.
+fn full_viewport_rows(fallback: u16) -> u16 {
+    match crossterm::terminal::size() {
+        Ok((_, rows)) if rows > 0 => rows,
+        _ => fallback,
+    }
 }
 
 /// Run the custom status-line command off the UI loop: pipe the JSON `ctx` to its
@@ -298,12 +343,16 @@ fn handle_terminal_event(
 
     // Ctrl+C is the universal "get me out" key. A picker or a captured overlay
     // would otherwise swallow it (no quit, or it types into a filter), trapping
-    // the user; route it to Quit uniformly. The ApiKey overlay keeps its own
-    // Ctrl+C = cancel (don't end the whole session over a mistyped key prompt).
+    // the user; route it to Quit uniformly. The ApiKey and custom-provider
+    // overlays keep their own Ctrl+C = cancel (don't end the whole session over
+    // a mistyped form).
     if let Event::Key(k) = &ev
         && k.code == KeyCode::Char('c')
         && k.modifiers.contains(KeyModifiers::CONTROL)
-        && !matches!(state.overlay, Some(crate::state::Overlay::ApiKey(_)))
+        && !matches!(
+            state.overlay,
+            Some(crate::state::Overlay::ApiKey(_) | crate::state::Overlay::ConnectCustom(_))
+        )
     {
         let effects = state.apply_action(stepper_protocol::Action::Quit);
         return run_effects(terminal, action_tx, effects);
@@ -498,6 +547,35 @@ fn handle_overlay_key(state: &mut AppState, action_tx: &ActionTx, ev: &Event) {
                 // Only insert printable chars typed without ctrl/alt.
                 KeyCode::Char(c) if !ctrl && !k.modifiers.contains(KeyModifiers::ALT) => {
                     state.api_key_push(c)
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+    // The custom-provider form: Tab/↑↓ move fields, ←/→ cycle the wire type on
+    // its row, typed chars edit the focused text field, Enter submits (invalid
+    // input keeps it open with a notice), Esc/Ctrl+C cancel.
+    if matches!(state.overlay, Some(Overlay::ConnectCustom(_))) {
+        if let Event::Key(k) = ev {
+            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+            match k.code {
+                KeyCode::Enter => {
+                    for eff in state.connect_custom_submit() {
+                        if let Effect::Send(action) = eff {
+                            let _ = action_tx.try_send(action);
+                        }
+                    }
+                }
+                KeyCode::Esc => state.overlay_close(),
+                KeyCode::Char('c') if ctrl => state.overlay_close(),
+                KeyCode::Tab | KeyCode::Down => state.connect_custom_move(1),
+                KeyCode::BackTab | KeyCode::Up => state.connect_custom_move(-1),
+                KeyCode::Left => state.connect_custom_cycle(-1),
+                KeyCode::Right => state.connect_custom_cycle(1),
+                KeyCode::Backspace => state.connect_custom_backspace(),
+                KeyCode::Char(c) if !ctrl && !k.modifiers.contains(KeyModifiers::ALT) => {
+                    state.connect_custom_push(c)
                 }
                 _ => {}
             }

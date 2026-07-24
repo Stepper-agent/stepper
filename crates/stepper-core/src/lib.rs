@@ -8,6 +8,7 @@ pub mod builtins;
 pub mod checkpoint;
 pub mod commands;
 pub mod compaction;
+pub mod create_layer;
 pub mod dispatch;
 pub mod error;
 pub mod exit_plan;
@@ -444,13 +445,38 @@ pub fn spawn_core(
                         .await
                         .ok()
                         .flatten(),
-                        // `/code-review` is the one built-in that RUNS a turn (the
-                        // `builtins::handle` entries never do), so it expands here
-                        // and flows through the command-turn path below. A user
-                        // command file with the same name still shadows it.
+                        // `/code-review` and `/create-layer` are the built-ins that
+                        // RUN a turn (the `builtins::handle` entries never do), so
+                        // they expand here and flow through the command-turn path
+                        // below. A user command file with the same name still
+                        // shadows either.
                         None if name == "code-review" => {
                             match tokio::task::spawn_blocking(move || {
                                 review::code_review_prompt(&cmd_args, &cwd)
+                            })
+                            .await
+                            .ok()
+                            {
+                                Some(Ok(prompt)) => Some(prompt),
+                                Some(Err(msg)) => {
+                                    let _ = tx
+                                        .send(AppEvent::Notice {
+                                            level: NoticeLevel::Warn,
+                                            text: msg,
+                                        })
+                                        .await;
+                                    continue;
+                                }
+                                None => None,
+                            }
+                        }
+                        None if name == "create-layer" => {
+                            match tokio::task::spawn_blocking(move || {
+                                create_layer::create_layer_prompt(
+                                    &cmd_args,
+                                    &project_root,
+                                    home.as_deref(),
+                                )
                             })
                             .await
                             .ok()
@@ -594,6 +620,10 @@ pub fn spawn_core(
                         ),
                     };
                     let _ = tx.send(AppEvent::Notice { level, text }).await;
+                }
+                Action::ConnectCustom { name, base_url, flavor } => {
+                    builtins::handle_connect_custom(&name, &base_url, &flavor, &orchestrator, &tx)
+                        .await;
                 }
                 Action::SetTheme { preset, colors } => {
                     // The TUI already applied the theme live; persist it so the next

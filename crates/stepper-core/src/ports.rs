@@ -45,6 +45,22 @@ pub trait ProviderResolver: Send + Sync {
             "this session has no provider catalog to connect from".into(),
         ))
     }
+    /// Register a user-defined provider (from the `/connect` custom form) into
+    /// the live config: set its wire `kind` and base URL. Unlike
+    /// [`Self::connect_provider`] this overwrites kind/baseUrl (the user just
+    /// typed them explicitly) while leaving key/model/context overrides alone.
+    /// Defaults to an error for convention/test resolvers with no live config.
+    fn connect_custom(
+        &self,
+        _name: &str,
+        _kind: &str,
+        _base_url: Option<&str>,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::Config(
+            "this session cannot register custom providers".into(),
+        ))
+    }
+
     /// Whether `provider` resolves an explicit/env API key that takes precedence
     /// over the OS keyring (so a key just stored in the keyring would be shadowed).
     /// Advisory only — used to warn after `/login`. Defaults to false.

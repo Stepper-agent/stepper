@@ -10,8 +10,9 @@ use stepper_protocol::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::state::{
-    AgentPicker, ApiKeyOverlay, AppState, FilePicker, HistorySearch, ListPicker, Overlay,
-    ProcStatus, QuestionView, SettingsView, ShellView, ThemeState,
+    AgentPicker, ApiKeyOverlay, AppState, ConnectCustomOverlay, FilePicker, HistorySearch,
+    ListPicker, Overlay, ProcStatus, QuestionView, SettingsView, ShellView, ThemeState,
+    CUSTOM_PROVIDER_FLAVORS,
 };
 use crate::theme::Theme;
 
@@ -73,6 +74,7 @@ fn ui(frame: &mut Frame, state: &AppState, theme: &Theme) {
             }
             Overlay::Picker(picker) => render_list_picker(frame, rows[0], picker, theme),
             Overlay::ApiKey(o) => render_api_key(frame, rows[0], o, theme),
+            Overlay::ConnectCustom(o) => render_connect_custom(frame, rows[0], o, theme),
             Overlay::Shell(s) => render_shell(frame, rows[0], state, s, theme),
             Overlay::Theme(ts) => render_theme(frame, rows[0], ts, theme),
             Overlay::Settings(v) => render_settings(frame, rows[0], v, theme),
@@ -565,6 +567,59 @@ fn render_api_key(frame: &mut Frame, area: Rect, o: &ApiKeyOverlay, theme: &Them
             Style::default().fg(theme.muted),
         )),
         Line::from(Span::styled(format!("  {masked}"), Style::default().fg(theme.accent))),
+    ];
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// The `/connect` custom-provider form: name + base URL text fields and the
+/// wire-type selector, with the focused row marked by a caret and the chosen
+/// type highlighted.
+fn render_connect_custom(frame: &mut Frame, area: Rect, o: &ConnectCustomOverlay, theme: &Theme) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .title(Span::styled(" add custom provider ", Style::default().fg(theme.muted)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let label = |row: usize, text: &str| {
+        let style = if o.field == row {
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        let caret = if o.field == row { '›' } else { ' ' };
+        Span::styled(format!(" {caret} {text:<6}"), style)
+    };
+    let text_value = |value: &str, placeholder: &str| {
+        if value.is_empty() {
+            Span::styled(placeholder.to_string(), Style::default().fg(theme.muted).add_modifier(Modifier::DIM))
+        } else {
+            Span::raw(value.to_string())
+        }
+    };
+    let mut flavor_spans = vec![label(2, "type")];
+    for (i, flavor) in CUSTOM_PROVIDER_FLAVORS.iter().enumerate() {
+        let style = if i == o.flavor_idx {
+            Style::default().fg(theme.accent).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        flavor_spans.push(Span::raw(" "));
+        flavor_spans.push(Span::styled(format!(" {flavor} "), style));
+    }
+    let lines = vec![
+        Line::from(Span::styled(
+            "   Tab/↑↓ field · ←→ type · Enter add · Esc cancel",
+            Style::default().fg(theme.muted),
+        )),
+        Line::from(vec![label(0, "name"), text_value(&o.name, "my-local")]),
+        Line::from(vec![label(1, "host"), text_value(&o.host, "https://localhost:11111/v1")]),
+        Line::from(flavor_spans),
+        Line::from(Span::styled(
+            "   openai = OpenAI-compatible · claude = Anthropic · custom = edit setting.json after",
+            Style::default().fg(theme.muted),
+        )),
     ];
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }

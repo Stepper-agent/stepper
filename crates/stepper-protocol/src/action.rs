@@ -43,6 +43,16 @@ pub enum Action {
         provider: String,
         key: String,
     },
+    /// Register a user-defined provider (submitted from the `/connect` custom
+    /// form). `flavor` is the UI wire-type choice (`openai` | `claude` |
+    /// `custom`); core maps it to a provider kind, injects the provider into the
+    /// live config, persists it to `setting.json`, and (for the API flavors)
+    /// prompts for a key. Plain strings only — the protocol stays UI-agnostic.
+    ConnectCustom {
+        name: String,
+        base_url: String,
+        flavor: String,
+    },
     /// Persist the TUI color theme (chosen in the `/theme` editor). `preset` is a
     /// built-in palette name; `colors` are per-role `(name, color-string)`
     /// overrides. Core writes them to `setting.json`; the TUI applies live. Plain

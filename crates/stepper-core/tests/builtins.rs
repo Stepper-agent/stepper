@@ -1062,3 +1062,214 @@ async fn hash_agent_trigger_routes_the_turn_to_a_named_agent_then_restores() {
         "pipeline restored after #agent (no solo/big leak): {after:?}"
     );
 }
+
+/// A resolver whose `connect_custom` succeeds (the default trait impl errors),
+/// standing in for the live `ConfigProviderResolver` injection.
+struct CustomConnectResolver;
+
+impl ProviderResolver for CustomConnectResolver {
+    fn resolve(&self, model_ref: &str) -> Result<Box<dyn LlmProvider>, CoreError> {
+        Resolver.resolve(model_ref)
+    }
+    fn model_info(&self, model_ref: &str) -> ModelInfo {
+        Resolver.model_info(model_ref)
+    }
+    fn connect_custom(
+        &self,
+        _name: &str,
+        _kind: &str,
+        _base_url: Option<&str>,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+async fn next_provider_list(rx: &mut EventRx) -> Vec<stepper_protocol::ProviderChoiceView> {
+    while let Some(ev) = rx.recv().await {
+        if let AppEvent::ProviderList(providers) = ev {
+            return providers;
+        }
+    }
+    panic!("event stream ended before a ProviderList");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_picker_always_offers_the_custom_provider_row_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator(dir.path().to_path_buf()),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+
+    // The test resolver has no catalog (list_providers is empty), yet the picker
+    // still opens with the custom row — a local endpoint needs no models.dev.
+    action_tx.send(slash("connect", "")).await.unwrap();
+    let providers = next_provider_list(&mut events).await;
+    assert_eq!(providers[0].id, "__custom__", "custom row leads the picker");
+    assert!(providers[0].connectable);
+    assert!(providers[0].label.contains("custom provider"));
+
+    // Selecting it (the picker routes `/connect __custom__`) opens the TUI form.
+    action_tx.send(slash("connect", "__custom__")).await.unwrap();
+    loop {
+        match events.recv().await.expect("event stream stays open") {
+            AppEvent::CustomProviderPrompt => break,
+            AppEvent::TurnStarted { .. } => panic!("/connect must never run a turn"),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_custom_action_persists_the_provider_and_prompts_for_a_key() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".stepper")).unwrap();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator_with(dir.path().to_path_buf(), Arc::new(CustomConnectResolver)),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+
+    action_tx
+        .send(Action::ConnectCustom {
+            name: "my-local".into(),
+            base_url: "https://localhost:11111/v1/".into(),
+            flavor: "openai".into(),
+        })
+        .await
+        .unwrap();
+    let added = next_notice(&mut events).await;
+    assert!(added.contains("added provider 'my-local'"), "got: {added}");
+    loop {
+        match events.recv().await.expect("event stream stays open") {
+            AppEvent::ApiKeyPrompt { provider } => {
+                assert_eq!(provider, "my-local");
+                break;
+            }
+            AppEvent::TurnStarted { .. } => panic!("ConnectCustom must never run a turn"),
+            _ => {}
+        }
+    }
+
+    let body = std::fs::read_to_string(dir.path().join(".stepper/setting.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let entry = &json["providers"]["my-local"];
+    assert_eq!(entry["kind"], "openai-compat");
+    // The trailing slash is normalized away before persisting.
+    assert_eq!(entry["baseUrl"], "https://localhost:11111/v1");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_custom_action_rejects_bad_input_and_guides_the_custom_flavor() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".stepper")).unwrap();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator_with(dir.path().to_path_buf(), Arc::new(CustomConnectResolver)),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+
+    // An unsafe name is refused core-side (the TUI validates too, fail-closed here).
+    action_tx
+        .send(Action::ConnectCustom {
+            name: "../evil".into(),
+            base_url: "https://localhost:1/v1".into(),
+            flavor: "openai".into(),
+        })
+        .await
+        .unwrap();
+    let warn = next_notice(&mut events).await;
+    assert!(warn.contains("letters, digits"), "got: {warn}");
+
+    // A schemeless base URL is refused.
+    action_tx
+        .send(Action::ConnectCustom {
+            name: "ok".into(),
+            base_url: "localhost:11111".into(),
+            flavor: "openai".into(),
+        })
+        .await
+        .unwrap();
+    let warn = next_notice(&mut events).await;
+    assert!(warn.contains("http://"), "got: {warn}");
+
+    // The `custom` flavor persists as openai-compat and points at setting.json
+    // for hand-editing instead of prompting for a key.
+    action_tx
+        .send(Action::ConnectCustom {
+            name: "weird".into(),
+            base_url: "http://localhost:9999".into(),
+            flavor: "custom".into(),
+        })
+        .await
+        .unwrap();
+    let guide = next_notice(&mut events).await;
+    assert!(guide.contains("setting.json"), "got: {guide}");
+    assert!(guide.contains("openai-compat | anthropic | openai-responses"), "got: {guide}");
+    assert!(guide.contains("/login weird"), "got: {guide}");
+
+    // No ApiKeyPrompt was queued for the custom flavor: the very next event after
+    // a follow-up /help must be its notice (the channel is FIFO).
+    action_tx.send(slash("help", "")).await.unwrap();
+    loop {
+        match events.recv().await.expect("event stream stays open") {
+            AppEvent::ApiKeyPrompt { .. } => {
+                panic!("the custom flavor must not prompt for a key")
+            }
+            AppEvent::Notice { text, .. } if text.contains("/help") => break,
+            _ => {}
+        }
+    }
+    let body = std::fs::read_to_string(dir.path().join(".stepper/setting.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["providers"]["weird"]["kind"], "openai-compat");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_layer_with_a_request_runs_a_turn_and_empty_args_warn_instead() {
+    let dir = tempfile::tempdir().unwrap();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator(dir.path().to_path_buf()),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+
+    // No request → a usage warning, never a turn (the channel is FIFO, so a
+    // TurnStarted would have to arrive before the notice).
+    action_tx.send(slash("create-layer", "")).await.unwrap();
+    loop {
+        match events.recv().await.expect("event stream stays open") {
+            AppEvent::TurnStarted { .. } => panic!("empty /create-layer must not run a turn"),
+            AppEvent::Notice { text, .. } => {
+                assert!(text.contains("usage: /create-layer"), "got: {text}");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // With a request, it expands into a model turn (the guide prompt rides the
+    // same expanded-command path as /code-review).
+    action_tx
+        .send(slash("create-layer", "add a security-review layer after implement"))
+        .await
+        .unwrap();
+    let mut turn_started = false;
+    loop {
+        match events.recv().await.expect("event stream stays open") {
+            AppEvent::TurnStarted { .. } => turn_started = true,
+            AppEvent::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(turn_started, "/create-layer <request> runs a model turn");
+}

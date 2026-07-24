@@ -24,6 +24,9 @@ pub use mock::spawn_fake_core;
 
 /// Initial render configuration handed to the TUI.
 pub struct TuiInit {
+    /// Fallback viewport height. The event loop sizes the inline viewport to
+    /// the full terminal height (and tracks resizes); this value is used only
+    /// when the terminal size cannot be queried.
     pub inline_height: u16,
     pub model: ModelView,
     pub mode: Mode,

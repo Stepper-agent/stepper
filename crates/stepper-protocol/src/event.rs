@@ -105,6 +105,10 @@ pub enum AppEvent {
     /// searchable picker whose selection comes back as `Action::SlashCommand`
     /// `/connect <id>` (registers the provider, then prompts for its key).
     ProviderList(Vec<ProviderChoiceView>),
+    /// The "add custom provider" row of the `/connect` picker was chosen — ask
+    /// the TUI to open its custom-provider form (name + base URL + type). The
+    /// submitted form comes back as `Action::ConnectCustom`.
+    CustomProviderPrompt,
     /// `/theme` (no preset arg) — ask the TUI to open its color-theme editor. The
     /// TUI fills the editor from its own current theme (colors live TUI-side); a
     /// save comes back as `Action::SetTheme`.

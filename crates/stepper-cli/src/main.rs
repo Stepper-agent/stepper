@@ -839,6 +839,8 @@ async fn launch(global: GlobalArgs, positional: Vec<String>) -> anyhow::Result<(
 
     // `_mcp` keeps the MCP server connections open for the whole TUI session.
     let init = TuiInit {
+        // Fallback only: the TUI sizes its viewport to the full terminal height
+        // (and tracks resizes); this applies just when the size query fails.
         inline_height: 14,
         model: ModelView { provider, model },
         mode: resolved_mode,

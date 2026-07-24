@@ -96,6 +96,10 @@ pub enum Overlay {
     /// API-key entry for a provider (`/login`, or a keyless model switch). Keys
     /// are typed in masked; Enter sends `Action::SetApiKey`, Esc cancels.
     ApiKey(ApiKeyOverlay),
+    /// The `/connect` "add custom provider" form: name + base URL text fields
+    /// and a wire-type selector. Tab/↑↓ move fields, ←/→ cycle the type, Enter
+    /// submits (`Action::ConnectCustom`), Esc cancels.
+    ConnectCustom(ConnectCustomOverlay),
     /// The background-process "shell view" (Down key): up/down selects a process,
     /// `k` kills it, Esc/q closes.
     Shell(ShellView),
@@ -311,6 +315,35 @@ const PROC_OUTPUT_TAIL: usize = 500;
 pub struct ApiKeyOverlay {
     pub provider: String,
     pub input: String,
+}
+
+/// Wire-type choices of the custom-provider form, in display order: `openai` =
+/// OpenAI-compatible chat/completions, `claude` = Anthropic Messages, `custom`
+/// = start as openai-compat and hand-edit `setting.json` for anything else.
+pub const CUSTOM_PROVIDER_FLAVORS: [&str; 3] = ["openai", "claude", "custom"];
+
+/// Rows of the custom-provider form: name, host, type.
+const CUSTOM_PROVIDER_FIELDS: usize = 3;
+
+/// Cap on the form's text fields — longer than any real name/URL, short enough
+/// that an accidental huge paste cannot thrash the per-tick re-render.
+const CUSTOM_PROVIDER_FIELD_MAX: usize = 2048;
+
+/// Provider-name length cap, mirroring core's `scaffold::is_safe_name` (the TUI
+/// cannot import stepper-config — protocol-only isolation) so a too-long name
+/// is caught while the form is still open instead of by a core warn after it
+/// closed and the typed input was lost.
+const CUSTOM_PROVIDER_NAME_MAX: usize = 64;
+
+/// The `/connect` custom-provider form state: two text fields + a type selector.
+#[derive(Default)]
+pub struct ConnectCustomOverlay {
+    pub name: String,
+    pub host: String,
+    /// Index into [`CUSTOM_PROVIDER_FLAVORS`].
+    pub flavor_idx: usize,
+    /// Focused row: 0 = name, 1 = host, 2 = type.
+    pub field: usize,
 }
 
 /// What a list-picker selection turns into.
@@ -1193,6 +1226,7 @@ impl AppState {
                     | Overlay::Permissions(_)
                     | Overlay::Picker(_)
                     | Overlay::ApiKey(_)
+                    | Overlay::ConnectCustom(_)
                     | Overlay::Shell(_)
                     | Overlay::Theme(_)
                     | Overlay::Settings(_)
@@ -1289,6 +1323,99 @@ impl AppState {
             }
             self.overlay_close();
         }
+        effects
+    }
+
+    /// Move the custom-provider form focus (Tab/↑↓), wrapping across its rows.
+    pub fn connect_custom_move(&mut self, delta: i32) {
+        if let Some(Overlay::ConnectCustom(o)) = &mut self.overlay {
+            let n = CUSTOM_PROVIDER_FIELDS as i32;
+            o.field = (((o.field as i32 + delta) % n + n) % n) as usize;
+        }
+    }
+
+    /// Cycle the wire type (←/→ on the type row; the text rows ignore it).
+    pub fn connect_custom_cycle(&mut self, delta: i32) {
+        if let Some(Overlay::ConnectCustom(o)) = &mut self.overlay
+            && o.field == 2
+        {
+            let n = CUSTOM_PROVIDER_FLAVORS.len() as i32;
+            o.flavor_idx = (((o.flavor_idx as i32 + delta) % n + n) % n) as usize;
+        }
+    }
+
+    /// Type into the focused text field of the custom-provider form.
+    pub fn connect_custom_push(&mut self, c: char) {
+        if let Some(Overlay::ConnectCustom(o)) = &mut self.overlay {
+            let field = match o.field {
+                0 => &mut o.name,
+                1 => &mut o.host,
+                _ => return,
+            };
+            if field.len() < CUSTOM_PROVIDER_FIELD_MAX {
+                field.push(c);
+            }
+        }
+    }
+
+    /// Backspace in the focused text field of the custom-provider form.
+    pub fn connect_custom_backspace(&mut self) {
+        if let Some(Overlay::ConnectCustom(o)) = &mut self.overlay {
+            match o.field {
+                0 => {
+                    o.name.pop();
+                }
+                1 => {
+                    o.host.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Submit the custom-provider form: a valid one closes and sends
+    /// `Action::ConnectCustom`; an invalid one stays open with a notice naming
+    /// what to fix. Core re-validates fail-closed — this is only the fast local
+    /// feedback loop.
+    pub fn connect_custom_submit(&mut self) -> Effects {
+        let mut effects = Effects::new();
+        let Some(Overlay::ConnectCustom(o)) = &self.overlay else {
+            return effects;
+        };
+        let name = o.name.trim().to_string();
+        let host = o.host.trim().to_string();
+        if name.is_empty()
+            || name.len() > CUSTOM_PROVIDER_NAME_MAX
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            self.notice = Some(Notice {
+                level: NoticeLevel::Warn,
+                text: "provider name: letters, digits, - or _ only (max 64 chars)".into(),
+            });
+            return effects;
+        }
+        // Mirror core's normalize-then-check (trailing slashes trimmed first),
+        // and require a non-empty host after the scheme — "https://" alone
+        // would close the form only to be bounced by core with the input lost.
+        let normalized = host.trim_end_matches('/');
+        let host_after_scheme = normalized
+            .strip_prefix("http://")
+            .or_else(|| normalized.strip_prefix("https://"));
+        if !matches!(host_after_scheme, Some(rest) if !rest.is_empty()) {
+            self.notice = Some(Notice {
+                level: NoticeLevel::Warn,
+                text: "host must start with http:// or https:// (e.g. https://localhost:11111/v1)"
+                    .into(),
+            });
+            return effects;
+        }
+        let flavor = CUSTOM_PROVIDER_FLAVORS[o.flavor_idx % CUSTOM_PROVIDER_FLAVORS.len()];
+        effects.push(Effect::Send(Action::ConnectCustom {
+            name,
+            base_url: host,
+            flavor: flavor.to_string(),
+        }));
+        self.overlay_close();
         effects
     }
 
@@ -1407,8 +1534,13 @@ impl AppState {
                 self.turn_active = true;
                 self.errored_this_turn = false;
                 self.notice = None;
-                self.live.clear();
-                self.clear_tool_lines();
+                // The previous turn's block is retained on screen while idle
+                // (the fullscreen viewport would scroll an eager commit out of
+                // sight) — commit it now. `submit`/`dispatch_queued` already
+                // flushed on the prompt-echo paths, so this is the safety net
+                // for turn starts with no echo (slash-command turns), and it
+                // leaves the live buffers clear either way.
+                self.flush_block(&mut effects);
                 self.workers.clear();
                 // Snap back to live output for the new turn (but not on every
                 // token delta — that would fight a user scrolled up to read).
@@ -1477,11 +1609,20 @@ impl AppState {
                     status: LayerStatus::Running,
                 });
             }
-            AppEvent::LayerFinished { status, .. } => {
+            AppEvent::LayerFinished { index, status } => {
+                let total = self.active_layer.as_ref().map(|l| l.total).unwrap_or(0);
                 if let Some(layer) = self.active_layer.as_mut() {
                     layer.status = status;
                 }
-                self.flush_block(&mut effects);
+                // Only INTERMEDIATE layers commit eagerly (progressive
+                // transcript while the pipeline runs). The last layer's block
+                // IS the turn's final block — core follows with TurnComplete —
+                // so it must be retained like TurnComplete retains it, or the
+                // retention never engages at all (the default pipeline is a
+                // single layer, making every reply "the last layer").
+                if index + 1 < total {
+                    self.flush_block(&mut effects);
+                }
             }
             AppEvent::WorkerStarted { index, total, label, model } => {
                 // run_parallel announces a batch in index order, so index 0 marks a
@@ -1589,6 +1730,13 @@ impl AppState {
                     .collect();
                 self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Connect, items)));
             }
+            AppEvent::CustomProviderPrompt => {
+                // Like an API-key prompt: drop the transient @/# pickers so the
+                // form is visible and receives the keys, not hidden behind them.
+                self.picker = None;
+                self.agent_picker = None;
+                self.open_overlay(Overlay::ConnectCustom(ConnectCustomOverlay::default()));
+            }
             AppEvent::OpenThemeEditor => self.open_theme_editor(),
             AppEvent::OpenEffortPicker { current } => {
                 const LEVELS: [&str; 6] = ["off", "low", "medium", "high", "xhigh", "max"];
@@ -1628,8 +1776,10 @@ impl AppState {
                 }
             }
             AppEvent::SessionResumed { id, name, turns } => {
-                self.live.clear();
-                self.clear_tool_lines();
+                // The displayed block belongs to the previous session's view —
+                // preserve it in scrollback before resetting (it clears the
+                // live buffers as a side effect; a no-op when nothing is held).
+                self.flush_block(&mut effects);
                 self.todos.clear();
                 self.workers.clear();
                 self.usage = UsageView::default();
@@ -1641,7 +1791,11 @@ impl AppState {
             AppEvent::TurnComplete { .. } => {
                 self.turn_active = false;
                 self.workers.clear();
-                self.flush_block(&mut effects);
+                // Deliberately NOT flushed here: the viewport spans the whole
+                // terminal, so an eager commit would scroll the final block
+                // straight out of sight and leave an empty screen. It stays in
+                // the live box while idle and commits on the next dispatch /
+                // turn start / exit (`take_final_commit`).
                 // An errored turn already rang (or deliberately stayed silent); the
                 // trailing TurnComplete must not add a "success" beep on top.
                 if self.notify_on_complete && !self.errored_this_turn {
@@ -1757,6 +1911,7 @@ impl AppState {
             | Action::Rewind { .. }
             | Action::Resume { .. }
             | Action::SetApiKey { .. }
+            | Action::ConnectCustom { .. }
             | Action::SetTheme { .. }
             | Action::KillProcess(_)
             | Action::AttachImage { .. }) => {
@@ -1800,8 +1955,10 @@ impl AppState {
             self.queue.push_back(item);
         } else {
             self.turn_active = true;
-            // Echo the prompt into scrollback first, so the transcript reads
-            // chat-style: the user's line, then the assistant's reply below it.
+            // The previous turn's block (retained on screen while idle) commits
+            // first, then the prompt echo, so the transcript keeps its
+            // chat-style order: reply N, prompt N+1, reply N+1.
+            self.flush_block(effects);
             effects.push(Effect::CommitToScrollback(item.echo_md()));
             effects.push(Effect::Send(item.into_action()));
         }
@@ -1810,15 +1967,29 @@ impl AppState {
     fn dispatch_queued(&mut self, effects: &mut Effects) {
         if let Some(next) = self.queue.pop_front() {
             self.turn_active = true;
-            // Echo a queued prompt at dispatch time (not enqueue) so it lands in
-            // chronological order, right above the reply it produces.
+            // Commit the just-finished turn's retained block, then echo the
+            // queued prompt at dispatch time (not enqueue) so both land in
+            // chronological order, right above the reply the prompt produces.
+            self.flush_block(effects);
             effects.push(Effect::CommitToScrollback(next.echo_md()));
             effects.push(Effect::Send(next.into_action()));
         }
     }
 
+    /// Flush the block still displayed in the live box (the final block of a
+    /// turn is retained on screen while idle — see `TurnComplete`) so every
+    /// exit path ends with the full transcript in scrollback. Called by the
+    /// event loop once, right before the terminal is restored.
+    pub fn take_final_commit(&mut self) -> Effects {
+        let mut effects = Effects::new();
+        self.flush_block(&mut effects);
+        effects
+    }
+
     /// Commit the current tool lines + assistant markdown as one scrollback block
-    /// and clear the live buffer. Called when a layer finishes and at turn end.
+    /// and clear the live buffer. Called when a layer finishes mid-turn, and for
+    /// a turn's final block lazily — on the next dispatch / turn start / exit —
+    /// so the finished reply stays visible in the full-screen viewport while idle.
     fn flush_block(&mut self, effects: &mut Effects) {
         if self.live.is_empty() && self.tool_lines.is_empty() {
             return;
@@ -2231,7 +2402,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_then_turn_complete_commits_scrollback() {
+    fn turn_complete_retains_the_block_until_the_next_submit_commits_it_first() {
         let mut s = test_state();
         s.apply_event(AppEvent::TurnStarted { turn_id: 1 });
         s.apply_event(AppEvent::AssistantTokenDelta("hello ".into()));
@@ -2239,14 +2410,64 @@ mod tests {
         assert_eq!(s.live.assistant, "hello world");
         assert!(s.turn_active);
 
+        // TurnComplete retains the final block on screen (the full-height
+        // viewport would scroll an eager commit out of sight) — no commit yet.
         let effects = s.apply_event(AppEvent::TurnComplete { turn_id: 1 });
-        assert_eq!(effects.len(), 1);
-        match &effects[0] {
-            Effect::CommitToScrollback(md) => assert!(md.contains("hello world")),
-            _ => panic!("expected a scrollback commit"),
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::CommitToScrollback(_))),
+            "the final block must stay displayed while idle"
+        );
+        assert_eq!(s.live.assistant, "hello world");
+        assert!(!s.turn_active);
+
+        // The next submit flushes the retained block FIRST, then echoes the new
+        // prompt, so scrollback keeps chat order: reply N, prompt N+1.
+        let effects = s.apply_action(Action::SubmitInput("next".into()));
+        let commits: Vec<&str> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::CommitToScrollback(md) => Some(md.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commits.len(), 2);
+        assert!(commits[0].contains("hello world"));
+        assert!(commits[1].contains("next"));
+        assert!(s.live.assistant.is_empty());
+    }
+
+    #[test]
+    fn turn_started_flushes_a_retained_block_when_no_prompt_echo_ran() {
+        // A slash-command turn (e.g. /code-review) starts with no submit(), so
+        // the retained block must commit at TurnStarted, not be lost.
+        let mut s = test_state();
+        s.apply_event(AppEvent::TurnStarted { turn_id: 1 });
+        s.apply_event(AppEvent::AssistantTokenDelta("first reply".into()));
+        s.apply_event(AppEvent::TurnComplete { turn_id: 1 });
+        assert_eq!(s.live.assistant, "first reply");
+
+        let effects = s.apply_event(AppEvent::TurnStarted { turn_id: 2 });
+        match effects.as_slice() {
+            [Effect::CommitToScrollback(md)] => assert!(md.contains("first reply")),
+            other => panic!("expected exactly the retained-block commit, got {} effects", other.len()),
         }
         assert!(s.live.assistant.is_empty());
-        assert!(!s.turn_active);
+    }
+
+    #[test]
+    fn take_final_commit_flushes_the_retained_block_for_exit() {
+        let mut s = test_state();
+        s.apply_event(AppEvent::TurnStarted { turn_id: 1 });
+        s.apply_event(AppEvent::AssistantTokenDelta("last words".into()));
+        s.apply_event(AppEvent::TurnComplete { turn_id: 1 });
+
+        let effects = s.take_final_commit();
+        match effects.as_slice() {
+            [Effect::CommitToScrollback(md)] => assert!(md.contains("last words")),
+            _ => panic!("exit must commit the retained block"),
+        }
+        // Nothing retained → nothing to commit (no duplicate on exit).
+        assert!(s.take_final_commit().is_empty());
     }
 
     #[test]
@@ -2283,6 +2504,38 @@ mod tests {
         assert_eq!(effects.len(), 1);
         assert!(s.live.assistant.is_empty());
         assert_eq!(s.active_layer.as_ref().unwrap().status, LayerStatus::Done);
+    }
+
+    #[test]
+    fn the_last_layer_is_retained_not_flushed_so_single_layer_turns_keep_the_reply() {
+        // Core emits LayerFinished for EVERY layer (including the last) and then
+        // TurnComplete. The default pipeline is a single layer, so an eager
+        // flush here would defeat the retention on every ordinary chat turn.
+        let mut s = test_state();
+        s.apply_event(AppEvent::TurnStarted { turn_id: 1 });
+        s.apply_event(AppEvent::LayerStarted { index: 0, total: 1, name: "default".into() });
+        s.apply_event(AppEvent::AssistantTokenDelta("the reply".into()));
+        let effects = s.apply_event(AppEvent::LayerFinished { index: 0, status: LayerStatus::Done });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::CommitToScrollback(_))),
+            "the sole (last) layer must be retained"
+        );
+        let effects = s.apply_event(AppEvent::TurnComplete { turn_id: 1 });
+        assert!(!effects.iter().any(|e| matches!(e, Effect::CommitToScrollback(_))));
+        assert_eq!(s.live.assistant, "the reply", "still on screen while idle");
+
+        // Two-layer pipeline: layer 0 commits eagerly, the final layer is retained.
+        let mut s = test_state();
+        s.apply_event(AppEvent::TurnStarted { turn_id: 1 });
+        s.apply_event(AppEvent::LayerStarted { index: 0, total: 2, name: "plan".into() });
+        s.apply_event(AppEvent::AssistantTokenDelta("plan out".into()));
+        let mid = s.apply_event(AppEvent::LayerFinished { index: 0, status: LayerStatus::Done });
+        assert!(mid.iter().any(|e| matches!(e, Effect::CommitToScrollback(_))));
+        s.apply_event(AppEvent::LayerStarted { index: 1, total: 2, name: "implement".into() });
+        s.apply_event(AppEvent::AssistantTokenDelta("impl out".into()));
+        let last = s.apply_event(AppEvent::LayerFinished { index: 1, status: LayerStatus::Done });
+        assert!(!last.iter().any(|e| matches!(e, Effect::CommitToScrollback(_))));
+        assert_eq!(s.live.assistant, "impl out");
     }
 
     #[test]
@@ -2594,7 +2847,9 @@ mod tests {
             summary: "main.rs".into(),
         }));
         s.apply_event(AppEvent::AssistantTokenDelta("body text".into()));
-        let effects = s.apply_event(AppEvent::TurnComplete { turn_id: 7 });
+        s.apply_event(AppEvent::TurnComplete { turn_id: 7 });
+        // The block is retained at TurnComplete; the exit flush carries it.
+        let effects = s.take_final_commit();
         let md = match effects.into_iter().next() {
             Some(Effect::CommitToScrollback(md)) => md,
             _ => panic!("expected a scrollback commit"),
@@ -3194,6 +3449,70 @@ mod tests {
                 assert_eq!(args, "anthropic");
             }
             _ => panic!("expected /connect for the connectable row"),
+        }
+    }
+
+    #[test]
+    fn custom_provider_prompt_opens_the_form_and_submit_sends_connect_custom() {
+        let mut s = test_state();
+        s.apply_event(AppEvent::CustomProviderPrompt);
+        assert!(matches!(s.overlay, Some(Overlay::ConnectCustom(_))), "form opens");
+        assert!(s.overlay_captures_keys(), "the form captures keys");
+
+        for c in "my-local".chars() {
+            s.connect_custom_push(c);
+        }
+        s.connect_custom_move(1);
+        for c in "https://localhost:11111/v1".chars() {
+            s.connect_custom_push(c);
+        }
+        // Move to the type row and cycle openai → claude.
+        s.connect_custom_move(1);
+        s.connect_custom_cycle(1);
+
+        let effects = s.connect_custom_submit();
+        match effects.as_slice() {
+            [Effect::Send(Action::ConnectCustom { name, base_url, flavor })] => {
+                assert_eq!(name, "my-local");
+                assert_eq!(base_url, "https://localhost:11111/v1");
+                assert_eq!(flavor, "claude");
+            }
+            _ => panic!("expected a ConnectCustom send"),
+        }
+        assert!(s.overlay.is_none(), "a valid submit closes the form");
+    }
+
+    #[test]
+    fn custom_provider_form_rejects_bad_input_and_stays_open() {
+        let mut s = test_state();
+        s.apply_event(AppEvent::CustomProviderPrompt);
+        // Empty name → warn, stays open, nothing sent.
+        assert!(s.connect_custom_submit().is_empty());
+        assert!(matches!(s.overlay, Some(Overlay::ConnectCustom(_))));
+        assert!(matches!(&s.notice, Some(n) if n.level == NoticeLevel::Warn));
+
+        // Valid name but a schemeless host → still rejected.
+        for c in "local".chars() {
+            s.connect_custom_push(c);
+        }
+        s.connect_custom_move(1);
+        for c in "localhost:11111".chars() {
+            s.connect_custom_push(c);
+        }
+        assert!(s.connect_custom_submit().is_empty());
+        assert!(matches!(&s.notice, Some(n) if n.text.contains("http")));
+        assert!(matches!(s.overlay, Some(Overlay::ConnectCustom(_))));
+
+        // The type row wraps in both directions and ignores typed chars.
+        s.connect_custom_move(1);
+        s.connect_custom_cycle(-1);
+        s.connect_custom_push('x');
+        match &s.overlay {
+            Some(Overlay::ConnectCustom(o)) => {
+                assert_eq!(CUSTOM_PROVIDER_FLAVORS[o.flavor_idx], "custom");
+                assert_eq!(o.host, "localhost:11111", "typing on the type row is ignored");
+            }
+            _ => panic!("form expected"),
         }
     }
 
