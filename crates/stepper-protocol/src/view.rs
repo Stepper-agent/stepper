@@ -198,6 +198,11 @@ pub struct ModelChoiceView {
     pub model_ref: String,
     /// Rendered row (display name + context/price hint).
     pub label: String,
+    /// Whether the row can be switched to. A configured provider whose model
+    /// listing came back empty (endpoint down / key missing) is shown as a
+    /// dimmed, non-selectable row naming the fix instead of vanishing.
+    #[serde(default = "default_true")]
+    pub selectable: bool,
 }
 
 /// One `/connect` candidate: a provider from the models.dev catalog the picker

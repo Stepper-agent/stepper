@@ -9,7 +9,7 @@
 use crate::compaction::{estimate_tokens, Compactor};
 use crate::error::CoreError;
 use crate::orchestrator::Orchestrator;
-use crate::ports::ConnectedProvider;
+use crate::ports::{ConnectedProvider, FieldUpdate};
 use crate::session::{SessionRecord, SessionStore, TurnRecord};
 use std::path::Path;
 use stepper_permission::{PermissionMode, Rule};
@@ -19,6 +19,7 @@ use stepper_protocol::{
     SettingsRowView, SettingsSnapshotView, SettingsTabView,
 };
 use stepper_provider::Usage;
+use stepper_providers::models::ModelsProbe;
 
 /// The built-in commands as `(name, args, description)` — the single source for
 /// the `/` palette, the `builtin_command_names` export, and `/help`, so the three
@@ -62,9 +63,11 @@ pub fn names() -> Vec<String> {
     COMMANDS.iter().map(|(n, _, _)| n.to_string()).collect()
 }
 
-/// `(name, description)` for the `/` palette — the arg hints stay in `/help`.
-pub fn descriptions() -> Vec<(&'static str, &'static str)> {
-    COMMANDS.iter().map(|(n, _, d)| (*n, *d)).collect()
+/// `(name, arg-hint, description)` for the `/` palette, so a built-in's
+/// expected arguments show up right where the user is typing them (user
+/// commands already do this via their `argument-hint` frontmatter).
+pub fn descriptions() -> Vec<(&'static str, &'static str, &'static str)> {
+    COMMANDS.iter().map(|(n, a, d)| (*n, *a, *d)).collect()
 }
 
 /// Session-level usage accounting for `/cost`, accumulated by `spawn_core` from
@@ -217,21 +220,30 @@ pub async fn handle(
 }
 
 fn help_text() -> String {
-    let parts: Vec<String> = COMMANDS
-        .iter()
-        .map(|(name, args, desc)| {
-            let mut s = format!("/{name}");
-            if !args.is_empty() {
-                s.push(' ');
-                s.push_str(args);
-            }
-            if !desc.is_empty() {
-                s.push_str(&format!(" ({desc})"));
-            }
-            s
-        })
-        .collect();
-    format!("commands: {} · plus any .stepper/commands/*.md", parts.join(" · "))
+    // One command per line: the TUI commits multi-line notices to scrollback
+    // (a single truncated row used to hide everything past ~/compact), so this
+    // renders as a readable cheatsheet.
+    let mut out = String::from("commands\n");
+    for (name, args, desc) in COMMANDS {
+        let mut s = format!("  /{name}");
+        if !args.is_empty() {
+            s.push(' ');
+            s.push_str(args);
+        }
+        if !desc.is_empty() {
+            s.push_str(&format!(" — {desc}"));
+        }
+        s.push('\n');
+        out.push_str(&s);
+    }
+    out.push_str(
+        "  …plus any .stepper/commands/*.md\n\
+         keys\n\
+         \x20 Shift+Tab cycle mode · Esc interrupt (Esc Esc rewind) · Ctrl+R history search\n\
+         \x20 Ctrl+E external editor · Ctrl+V paste image · Ctrl+C quit\n\
+         \x20 @ file picker · # agent picker · !cmd shell · / palette · PgUp/PgDn scroll",
+    );
+    out
 }
 
 /// `/init` — ensure the `.stepper/` directory skeleton exists.
@@ -679,6 +691,37 @@ async fn handle_login(arg: &str, orchestrator: &Orchestrator, tx: &EventTx) {
         notice(tx, NoticeLevel::Warn, "usage: /login <provider>".into()).await;
         return;
     }
+    // Keyring lookups are exact on the config's provider name, so a key saved
+    // under a case-variant ('Anthropic') would silently never be read. Snap to
+    // the configured spelling when the name differs only by case, and warn
+    // when it is not configured at all (the overlay still opens — pre-seeding
+    // a key before /connect stays possible, eyes open).
+    let configured = orchestrator.resolver.configured_providers();
+    // An exact match always wins — with case-variant siblings configured
+    // (e.g. both `OMLX` and `omlx`), snapping an exactly-typed name to the
+    // byte-sorted first sibling would store the key under the wrong entry.
+    let provider = if configured.contains(&provider) {
+        provider
+    } else {
+        match configured.iter().find(|c| c.eq_ignore_ascii_case(&provider)) {
+            Some(canonical) => {
+                notice(tx, NoticeLevel::Info, format!("using configured provider '{canonical}'"))
+                    .await;
+                canonical.clone()
+            }
+            None => {
+                notice(
+                    tx,
+                    NoticeLevel::Warn,
+                    format!(
+                        "'{provider}' is not a configured provider — the key is used only once it exists (/connect {provider})"
+                    ),
+                )
+                .await;
+                provider
+            }
+        }
+    };
     let _ = tx.send(AppEvent::ApiKeyPrompt { provider }).await;
 }
 
@@ -735,30 +778,177 @@ async fn handle_connect(arg: &str, orchestrator: &Orchestrator, tx: &EventTx) {
         let _ = tx.send(AppEvent::ProviderList(providers)).await;
         return;
     }
-    if arg == CUSTOM_PROVIDER_ID {
+    // A configured provider's name is taken verbatim BEFORE any tokenizing:
+    // names are arbitrary `setting.json` keys (a hand-edited one may contain
+    // spaces) and the split parsing below would shred them.
+    let (id, auth_method) = if arg != CUSTOM_PROVIDER_ID
+        && orchestrator.resolver.provider_configured(arg)
+    {
+        (arg, None)
+    } else {
+        // `<id>` or `<id> --auth <method>` (the auth-method picker's selection).
+        let mut parts = arg.split_whitespace();
+        let id = parts.next().unwrap_or_default();
+        match (parts.next(), parts.next(), parts.next()) {
+            (None, _, _) => (id, None),
+            (Some("--auth"), Some(method), None) => (id, Some(method)),
+            _ => {
+                notice(
+                    tx,
+                    NoticeLevel::Warn,
+                    "usage: /connect [<provider> [--auth api-key|chatgpt|access-token]]".into(),
+                )
+                .await;
+                return;
+            }
+        }
+    };
+    if id == CUSTOM_PROVIDER_ID {
         // The picker routes the custom row back through `/connect __custom__`;
         // the actual host/type entry happens in the TUI form, which replies
-        // with `Action::ConnectCustom` (handled in the core action loop).
-        let _ = tx.send(AppEvent::CustomProviderPrompt).await;
+        // with `Action::ConnectCustom` (handled in the core action loop). The
+        // empty prefill opens a fresh form.
+        let _ = tx
+            .send(AppEvent::CustomProviderPrompt {
+                name: String::new(),
+                base_url: String::new(),
+                flavor: String::new(),
+            })
+            .await;
         return;
     }
-    match orchestrator.resolver.connect_provider(arg).await {
+    if let Some(method) = auth_method {
+        handle_connect_auth_method(id, method, orchestrator, tx).await;
+        return;
+    }
+    match orchestrator.resolver.connect_provider(id).await {
         Ok(connected) => {
-            let suffix = match persist_provider(orchestrator, arg, &connected) {
+            let suffix = match persist_provider(orchestrator, id, &connected) {
                 Ok(true) => "",
                 _ => " (not persisted — no .stepper/)",
             };
+            // OpenAI has three auth routes (platform key · ChatGPT-subscription
+            // OAuth · a bearer access token) — let the user pick instead of
+            // assuming the key. Everything else goes straight to the key overlay.
+            if id == OPENAI_PROVIDER_ID {
+                notice(
+                    tx,
+                    NoticeLevel::Info,
+                    format!("added provider '{id}'{suffix} — choose how to authenticate"),
+                )
+                .await;
+                let _ = tx.send(AppEvent::AuthMethodPrompt { provider: id.to_string() }).await;
+                return;
+            }
             notice(
                 tx,
                 NoticeLevel::Info,
-                format!("added provider '{arg}'{suffix} — enter its API key"),
+                format!("added provider '{id}'{suffix} — enter its API key"),
             )
             .await;
             // Reuse the `/login` key overlay; the key lands in the OS keyring and
             // the next resolve picks it up (no restart).
-            let _ = tx.send(AppEvent::ApiKeyPrompt { provider: arg.to_string() }).await;
+            let _ = tx.send(AppEvent::ApiKeyPrompt { provider: id.to_string() }).await;
         }
-        Err(e) => notice(tx, NoticeLevel::Warn, format!("cannot connect '{arg}': {e}")).await,
+        // A configured provider the catalog doesn't know (a custom one, picked
+        // from its `connected` row): connecting again just means updating its
+        // key — route to the same overlay `/login <name>` would open.
+        Err(_) if orchestrator.resolver.provider_configured(id) => {
+            notice(
+                tx,
+                NoticeLevel::Info,
+                format!("'{id}' is already connected — enter/update its API key (Esc keeps the current one)"),
+            )
+            .await;
+            let _ = tx.send(AppEvent::ApiKeyPrompt { provider: id.to_string() }).await;
+        }
+        Err(e) => notice(tx, NoticeLevel::Warn, format!("cannot connect '{id}': {e}")).await,
+    }
+}
+
+/// The one catalog provider with an auth-method menu (see `AuthMethodPrompt`).
+const OPENAI_PROVIDER_ID: &str = "openai";
+
+/// `/connect <provider> --auth <method>` — apply the chosen auth route. The
+/// menu is only offered for OpenAI: `api-key`/`access-token` are the bearer
+/// routes (kind `openai-compat`, any previous OAuth mode cleared, credential
+/// via the key overlay into the keyring), `chatgpt` switches the entry to the
+/// Codex path (kind `openai-responses` + `auth: codex-oauth`, signed in via
+/// `stepper auth login --codex`).
+async fn handle_connect_auth_method(
+    id: &str,
+    method: &str,
+    orchestrator: &Orchestrator,
+    tx: &EventTx,
+) {
+    if id != OPENAI_PROVIDER_ID {
+        notice(
+            tx,
+            NoticeLevel::Warn,
+            format!("--auth is only available for '{OPENAI_PROVIDER_ID}' (got '{id}')"),
+        )
+        .await;
+        return;
+    }
+    let (kind, base, auth) = match method {
+        // Bearer routes: keep an already-bearer-capable dialect (a hand-tuned
+        // `openai-responses` + key setup must survive answering "api key"
+        // truthfully) and never touch a deliberate proxy base — only a
+        // previous OAuth mode is cleared so the pasted credential is used.
+        "api-key" | "access-token" => {
+            let kind = match orchestrator.resolver.provider_kind(id).as_deref() {
+                Some("openai-responses") => "openai-responses",
+                _ => "openai-compat",
+            };
+            (kind, FieldUpdate::Keep, FieldUpdate::Clear)
+        }
+        // The ChatGPT route MUST clear the base: the guided flow may have just
+        // persisted the platform URL (api.openai.com/v1), and the Codex
+        // adapter would then send the subscription token to the wrong host —
+        // base-less entries use the factory's chatgpt.com backend default.
+        "chatgpt" => ("openai-responses", FieldUpdate::Clear, FieldUpdate::Set("codex-oauth")),
+        other => {
+            notice(
+                tx,
+                NoticeLevel::Warn,
+                format!("unknown auth method '{other}' — use api-key, chatgpt, or access-token"),
+            )
+            .await;
+            return;
+        }
+    };
+    if let Err(e) = orchestrator.resolver.connect_custom(id, kind, base, auth) {
+        notice(tx, NoticeLevel::Warn, format!("cannot configure '{id}': {e}")).await;
+        return;
+    }
+    let persisted = persist_custom_provider(orchestrator, id, kind, base, auth);
+    let suffix = if persisted { "" } else { " (this session only — no .stepper/ to persist)" };
+    match method {
+        "chatgpt" => {
+            notice(
+                tx,
+                NoticeLevel::Info,
+                format!(
+                    "'{id}' now uses ChatGPT OAuth{suffix} — sign in once with `stepper auth login --codex` (browser); an existing Codex login is reused"
+                ),
+            )
+            .await;
+        }
+        "access-token" => {
+            notice(
+                tx,
+                NoticeLevel::Info,
+                format!(
+                    "'{id}' set to bearer auth{suffix} — paste your access token (sent as the Authorization header, stored in the OS keyring)"
+                ),
+            )
+            .await;
+            let _ = tx.send(AppEvent::ApiKeyPrompt { provider: id.to_string() }).await;
+        }
+        _ => {
+            notice(tx, NoticeLevel::Info, format!("'{id}' set to API-key auth{suffix} — enter the key")).await;
+            let _ = tx.send(AppEvent::ApiKeyPrompt { provider: id.to_string() }).await;
+        }
     }
 }
 
@@ -801,7 +991,15 @@ fn persist_provider(
                 // dialect (openai-responses/codex) and base, like the live path.
                 obj.entry("kind".to_string())
                     .or_insert_with(|| serde_json::Value::String(connected.kind.clone()));
-                if let Some(base) = &connected.base_url {
+                // And like the live path, only fill the base when the entry
+                // speaks the derived dialect: a base-less codex/responses
+                // entry relies on its factory default, and the catalog's
+                // platform URL would redirect it to the wrong host.
+                let entry_kind =
+                    obj.get("kind").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                if entry_kind == connected.kind
+                    && let Some(base) = &connected.base_url
+                {
                     obj.entry("baseUrl".to_string())
                         .or_insert_with(|| serde_json::Value::String(base.clone()));
                 }
@@ -854,12 +1052,62 @@ pub(crate) async fn handle_connect_custom(
             .await;
         return;
     }
-    if let Err(e) = orchestrator.resolver.connect_custom(name, kind, Some(base)) {
+    // Probe the endpoint BEFORE saving: a typo'd host/port/path should bounce
+    // back into the (prefilled) form now, not surface later as a silently
+    // empty `/models`. 401/403 is a PASS — the server is there; the key comes
+    // right after. Only "no HTTP conversation" and "no models route" block.
+    let models_url = match kind {
+        "anthropic" => format!("{base}/v1/models"),
+        _ => format!("{base}/models"),
+    };
+    let reopen = AppEvent::CustomProviderPrompt {
+        name: name.to_string(),
+        base_url: base.to_string(),
+        flavor: flavor.to_string(),
+    };
+    let probe_note = match stepper_providers::models::probe_models_endpoint(&models_url).await {
+        ModelsProbe::Unreachable(cause) => {
+            notice(
+                tx,
+                NoticeLevel::Warn,
+                format!("cannot reach {base} ({cause}) — not saved; fix the URL or Esc to cancel"),
+            )
+            .await;
+            let _ = tx.send(reopen).await;
+            return;
+        }
+        ModelsProbe::NoModelsRoute => {
+            // The fix differs per dialect: openai-style bases usually MISS a
+            // /v1, while the anthropic probe already appends /v1/models — so a
+            // claude-flavor base must not contain one.
+            let hint = if kind == "anthropic" {
+                format!("a claude-style base must NOT include /v1 (probed {base}/v1/models)")
+            } else {
+                format!("the base usually needs a /v1 suffix (e.g. {base}/v1)")
+            };
+            notice(
+                tx,
+                NoticeLevel::Warn,
+                format!("{models_url} returned 404 — not saved; {hint}"),
+            )
+            .await;
+            let _ = tx.send(reopen).await;
+            return;
+        }
+        ModelsProbe::Ok(count) => format!("endpoint OK, {count} model(s)"),
+        ModelsProbe::NeedsAuth => "endpoint reachable — it requires an API key".to_string(),
+        ModelsProbe::OddStatus(code) => format!("endpoint reachable (HTTP {code})"),
+    };
+    // The form owns kind + base; an `auth` mode a user hand-added to this
+    // entry (per the custom flavor's own guidance) is deliberately preserved.
+    if let Err(e) =
+        orchestrator.resolver.connect_custom(name, kind, FieldUpdate::Set(base), FieldUpdate::Keep)
+    {
         notice(tx, NoticeLevel::Warn, format!("cannot add '{name}': {e}")).await;
         return;
     }
-    let connected = ConnectedProvider { kind: kind.to_string(), base_url: Some(base.to_string()) };
-    let persisted = persist_custom_provider(orchestrator, name, &connected);
+    let persisted =
+        persist_custom_provider(orchestrator, name, kind, FieldUpdate::Set(base), FieldUpdate::Keep);
     let settings_path = settings_dir(orchestrator)
         .map(|d| d.join("setting.json").display().to_string())
         .unwrap_or_else(|| ".stepper/setting.json".to_string());
@@ -867,13 +1115,15 @@ pub(crate) async fn handle_connect_custom(
         // The custom flavor's contract is "edit the spec file yourself": name
         // the exact file and the accepted kinds, and leave the key to /login.
         ("custom", _) => format!(
-            "added '{name}' as openai-compat @ {base} — for another wire format edit \
-             providers.{name}.kind in {settings_path} (openai-compat | anthropic | \
+            "added '{name}' ({probe_note}) as openai-compat @ {base} — for another wire format \
+             edit providers.{name}.kind in {settings_path} (openai-compat | anthropic | \
              openai-responses); /login {name} sets its key"
         ),
-        (_, true) => format!("added provider '{name}' ({kind} @ {base}) — enter its API key (Esc if none)"),
+        (_, true) => {
+            format!("added provider '{name}' ({kind} @ {base}, {probe_note}) — enter its API key (Esc if none)")
+        }
         (_, false) => format!(
-            "added provider '{name}' ({kind} @ {base}) for this session only (no .stepper/ to persist) — enter its API key (Esc if none)"
+            "added provider '{name}' ({kind} @ {base}, {probe_note}) for this session only (no .stepper/ to persist) — enter its API key (Esc if none)"
         ),
     };
     notice(tx, NoticeLevel::Info, text).await;
@@ -882,13 +1132,16 @@ pub(crate) async fn handle_connect_custom(
     }
 }
 
-/// Persist a custom provider, overwriting `kind`/`baseUrl` (the user just typed
-/// them) while preserving any apiKey/defaultModel/auth/contextWindow already in
-/// the entry. Returns whether it was persisted anywhere.
+/// Persist an explicit provider choice, overwriting `kind` and applying the
+/// `baseUrl`/`auth` updates (the user just chose them) while preserving any
+/// apiKey/defaultModel/contextWindow already in the entry. Returns whether it
+/// was persisted.
 fn persist_custom_provider(
     orchestrator: &Orchestrator,
     id: &str,
-    connected: &ConnectedProvider,
+    kind: &str,
+    base_url: FieldUpdate<'_>,
+    auth: FieldUpdate<'_>,
 ) -> bool {
     let Some(dir) = settings_dir(orchestrator) else {
         return false;
@@ -902,9 +1155,24 @@ fn persist_custom_provider(
                 .entry(id.to_string())
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
             if let Some(obj) = entry.as_object_mut() {
-                obj.insert("kind".to_string(), serde_json::Value::String(connected.kind.clone()));
-                if let Some(base) = &connected.base_url {
-                    obj.insert("baseUrl".to_string(), serde_json::Value::String(base.clone()));
+                obj.insert("kind".to_string(), serde_json::Value::String(kind.to_string()));
+                match base_url {
+                    FieldUpdate::Keep => {}
+                    FieldUpdate::Clear => {
+                        obj.remove("baseUrl");
+                    }
+                    FieldUpdate::Set(base) => {
+                        obj.insert("baseUrl".to_string(), serde_json::Value::String(base.to_string()));
+                    }
+                }
+                match auth {
+                    FieldUpdate::Keep => {}
+                    FieldUpdate::Clear => {
+                        obj.remove("auth");
+                    }
+                    FieldUpdate::Set(mode) => {
+                        obj.insert("auth".to_string(), serde_json::Value::String(mode.to_string()));
+                    }
                 }
             }
         }
@@ -1133,7 +1401,9 @@ async fn handle_settings(orchestrator: &Orchestrator, tx: &EventTx) {
                 row(&s.name, format!("{}  ·  effort {eff}", s.model_ref))
             })
             .collect(),
-        jump: Some("model".into()),
+        // `models` (the picker), not `model`: a bare `/model` only PRINTS the
+        // current ref, so Enter on this tab would be a dead end.
+        jump: Some("models".into()),
     };
 
     let (allow, ask, deny) = {
@@ -1296,20 +1566,26 @@ mod tests {
         let names = names();
         let descs = descriptions();
         assert_eq!(descs.len(), names.len(), "one description per command");
-        for (name, desc) in &descs {
+        for (name, args, desc) in &descs {
             assert!(names.contains(&name.to_string()), "{name} is a known command");
             assert!(!desc.is_empty(), "{name} has a description");
+            let known = COMMANDS.iter().any(|(n, a, _)| n == name && a == args);
+            assert!(known, "{name}'s palette arg hint matches its COMMANDS entry");
         }
     }
 
     #[test]
-    fn help_text_lists_every_command_with_its_args() {
+    fn help_text_lists_every_command_with_its_args_one_per_line() {
         let help = help_text();
         assert!(help.contains("/import [claude|codex|cursor|gemini|all] [apply]"), "arg hints kept: {help}");
         assert!(help.contains("/compact [instructions]"));
         for (name, _, _) in COMMANDS {
             assert!(help.contains(&format!("/{name}")), "/{name} listed in help");
         }
+        // Multi-line (the TUI commits it to scrollback) with a keys section —
+        // a single truncated row used to hide everything past a few commands.
+        assert!(help.lines().count() > COMMANDS.len(), "one command per line");
+        assert!(help.contains("Shift+Tab"), "keyboard shortcuts included");
     }
 
     #[tokio::test]

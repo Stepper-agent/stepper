@@ -1,6 +1,7 @@
 use ratatui::style::Style;
 use ratatui_textarea::{TextArea, WrapMode};
 use smallvec::SmallVec;
+use unicode_width::UnicodeWidthStr;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use stepper_protocol::{
@@ -355,6 +356,10 @@ pub enum PickerKind {
     Resume,
     Model,
     Connect,
+    /// The auth-method chooser for a multi-route provider (`/connect openai`):
+    /// api key · ChatGPT OAuth · access token. Item ids are full `/connect`
+    /// argument strings (`openai --auth api-key`).
+    Auth,
     Effort,
 }
 
@@ -399,14 +404,16 @@ impl ListPicker {
             PickerKind::Resume => " resume ",
             PickerKind::Model => " models ",
             PickerKind::Connect => " connect ",
+            PickerKind::Auth => " auth method ",
             PickerKind::Effort => " effort ",
         }
     }
 
-    /// Whether typing filters this picker. The model and provider lists are large,
-    /// so they are type-to-filter; the rewind/resume lists are short and strict.
+    /// Whether typing filters this picker. The model/provider lists are large
+    /// and session labels carry names + digests, so they are type-to-filter;
+    /// rewind rows are just "turn N" and stay strict.
     pub fn searchable(&self) -> bool {
-        matches!(self.kind, PickerKind::Model | PickerKind::Connect)
+        matches!(self.kind, PickerKind::Model | PickerKind::Connect | PickerKind::Resume)
     }
 
     /// Append a char to the filter query and re-filter (searchable kinds only).
@@ -483,6 +490,11 @@ impl ListPicker {
             // Route back through `/connect <id>` (register + prompt for the key);
             // the item id is the catalog provider id.
             PickerKind::Connect => Action::SlashCommand {
+                name: "connect".into(),
+                args: item.id.clone(),
+            },
+            // The item id is the full argument string (`openai --auth chatgpt`).
+            PickerKind::Auth => Action::SlashCommand {
                 name: "connect".into(),
                 args: item.id.clone(),
             },
@@ -642,6 +654,9 @@ pub struct AppState {
     /// A first Esc on empty input arms this; a second Esc (before any other
     /// action/typing) opens the rewind picker (Esc-Esc, Claude-Code-style).
     pub esc_armed: bool,
+    /// A first Ctrl+C with something to lose (turn/queue/draft) arms this; the
+    /// second one quits. Any other key disarms it.
+    ctrl_c_armed: bool,
     pub should_quit: bool,
     /// The live color theme (rendered everywhere) and the preset it derives from.
     /// The `/theme` editor mutates these; persistence rides an `Action::SetTheme`.
@@ -690,6 +705,26 @@ pub struct AppState {
 /// Cap on persisted prompt history (newest kept). Bounds the on-disk file and
 /// the in-memory list.
 const HISTORY_MAX: usize = 500;
+
+/// Longest notice that still reads on one status row; anything longer (or any
+/// multi-line text, e.g. /help) is committed to scrollback in full instead of
+/// being truncated into uselessness.
+const NOTICE_INLINE_MAX: usize = 160;
+
+/// Cap on the API-key overlay input: real keys are far shorter, and the cap
+/// stops an accidental huge paste from thrashing the per-tick masked re-render.
+const API_KEY_INPUT_MAX: usize = 8192;
+
+/// The armed-quit prompt (matched on disarm so it never lingers).
+const QUIT_CONFIRM_NOTICE: &str = "press Ctrl+C again to quit";
+
+/// Markdown-proof a plain-text notice for scrollback: escape `<` (tui-markdown
+/// drops `<arg>` hints as inline HTML) and turn newlines into hard breaks (a
+/// bare newline is a CommonMark soft break — the whole text would collapse
+/// into one space-joined paragraph).
+fn scrollback_notice_md(text: &str) -> String {
+    text.replace('<', "\\<").lines().collect::<Vec<_>>().join("  \n")
+}
 
 /// A blank input textarea configured the way every fresh prompt needs it:
 /// no emulated cursor (the event loop draws the real one for correct CJK / wide
@@ -751,6 +786,7 @@ impl AppState {
             commands: init.commands,
             palette_selected: 0,
             esc_armed: false,
+            ctrl_c_armed: false,
             should_quit: false,
         }
     }
@@ -1251,6 +1287,41 @@ impl AppState {
         }
     }
 
+    /// Drop a stale Info notice ("fetching models…") when the thing it
+    /// announced has arrived; warnings/errors stay until replaced.
+    fn clear_info_notice(&mut self) {
+        if matches!(&self.notice, Some(n) if n.level == NoticeLevel::Info) {
+            self.notice = None;
+        }
+    }
+
+    /// Ctrl+C: quit immediately when nothing would be lost; otherwise arm a
+    /// confirmation (shell habit makes Ctrl+C easy to hit with a queue, a
+    /// draft, or a running turn on screen) and quit on the second press.
+    pub fn request_quit(&mut self) -> Effects {
+        let effects = Effects::new();
+        let at_risk = self.turn_active || !self.queue.is_empty() || !self.input_text().is_empty();
+        if at_risk && !self.ctrl_c_armed {
+            self.ctrl_c_armed = true;
+            self.notice = Some(info_notice(QUIT_CONFIRM_NOTICE));
+            return effects;
+        }
+        self.should_quit = true;
+        effects
+    }
+
+    /// Any input other than Ctrl+C (keys, paste, mouse) breaks the
+    /// quit-confirmation chord — and takes its stale prompt off the screen.
+    pub fn disarm_quit(&mut self) {
+        if !self.ctrl_c_armed {
+            return;
+        }
+        self.ctrl_c_armed = false;
+        if matches!(&self.notice, Some(n) if n.text == QUIT_CONFIRM_NOTICE) {
+            self.notice = None;
+        }
+    }
+
     /// Clear the live tool-call lines and the id→line index together (they must
     /// always reset in lockstep, or a stale index would point past the cleared vec).
     fn clear_tool_lines(&mut self) {
@@ -1292,13 +1363,71 @@ impl AppState {
 
     /// Type into the API-key overlay (a printable char).
     pub fn api_key_push(&mut self, c: char) {
-        if let Some(Overlay::ApiKey(o)) = &mut self.overlay {
-            // Cap length: real provider keys are well under this, and the cap
-            // stops an accidental huge paste from thrashing the per-tick masked
-            // re-render.
-            if o.input.len() < 8192 {
-                o.input.push(c);
+        if let Some(Overlay::ApiKey(o)) = &mut self.overlay
+            && o.input.len() < API_KEY_INPUT_MAX
+        {
+            o.input.push(c);
+        }
+    }
+
+    /// Cancel the API-key overlay (Esc / Ctrl+C): close it and say what
+    /// skipping means, so a keyless-local-server user knows nothing broke.
+    pub fn api_key_cancel(&mut self) {
+        let provider = match &self.overlay {
+            Some(Overlay::ApiKey(o)) => Some(o.provider.clone()),
+            _ => None,
+        };
+        self.overlay_close();
+        if let Some(p) = provider {
+            self.notice = Some(info_notice(format!(
+                "skipped the key for '{p}' — keyless endpoints work as-is; /login {p} any time"
+            )));
+        }
+    }
+
+    /// Route a bracketed paste to whatever owns the keyboard. Overlay text
+    /// fields take a control-char-stripped insert (a newline inside a pasted
+    /// key/URL must not submit the form); the composer takes the text verbatim
+    /// (newlines stay literal — never an early submit).
+    pub fn paste_text(&mut self, text: &str) {
+        // Terminals transmit line breaks inside a bracketed paste as CR (not
+        // LF) — normalize first, or the composer would swallow them and the
+        // pasted "lines" would run together with literal \r bytes.
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let text = normalized.as_str();
+        let single_line: String = text.chars().filter(|c| !c.is_control()).collect();
+        if matches!(self.overlay, Some(Overlay::ApiKey(_))) {
+            for c in single_line.chars() {
+                self.api_key_push(c);
             }
+            return;
+        }
+        if matches!(self.overlay, Some(Overlay::ConnectCustom(_))) {
+            for c in single_line.chars() {
+                self.connect_custom_push(c);
+            }
+            return;
+        }
+        if matches!(self.overlay, Some(Overlay::HistorySearch(_))) {
+            for c in single_line.chars() {
+                self.history_search_push(c);
+            }
+            return;
+        }
+        if matches!(self.overlay, Some(Overlay::Theme(_))) {
+            for c in single_line.chars() {
+                self.theme_editor_edit(Some(c));
+            }
+            return;
+        }
+        if self.overlay_picker_searchable() {
+            for c in single_line.chars() {
+                self.overlay_picker_push(c);
+            }
+            return;
+        }
+        if self.overlay.is_none() && self.picker.is_none() && self.agent_picker.is_none() {
+            self.textarea.insert_str(text);
         }
     }
 
@@ -1507,6 +1636,12 @@ impl AppState {
             if p.is_selected_disabled() {
                 return effects;
             }
+            // An over-narrowed filter (query matches nothing but the list has
+            // rows) keeps the picker open so Backspace can widen it — Enter
+            // closing here would silently discard the whole picker.
+            if p.matches.is_empty() && !p.items.is_empty() && !p.query.is_empty() {
+                return effects;
+            }
             if let Some(action) = p.selection() {
                 effects.push(Effect::Send(action));
             }
@@ -1670,7 +1805,26 @@ impl AppState {
             AppEvent::CompactionDone { freed_tokens } => {
                 self.notice = Some(info_notice(format!("compacted (-{freed_tokens} tok)")));
             }
-            AppEvent::Notice { level, text } => self.notice = Some(Notice { level, text }),
+            AppEvent::Notice { level, text } => {
+                // A multi-line or over-wide notice (e.g. /help, the /connect
+                // guidance) cannot fit the one-row notice line — commit the
+                // full text to scrollback and keep the first line inline.
+                // Display WIDTH, not chars: CJK text is two columns per char.
+                if text.contains('\n') || UnicodeWidthStr::width(text.as_str()) > NOTICE_INLINE_MAX
+                {
+                    // The retained final block (if any) commits first so the
+                    // transcript keeps chronological order; skipped mid-turn,
+                    // where flushing would split the streaming block.
+                    if !self.turn_active {
+                        self.flush_block(&mut effects);
+                    }
+                    effects.push(Effect::CommitToScrollback(scrollback_notice_md(&text)));
+                    let first = text.lines().next().unwrap_or_default().to_string();
+                    self.notice = Some(Notice { level, text: first });
+                } else {
+                    self.notice = Some(Notice { level, text });
+                }
+            }
             AppEvent::ContextBreakdown(breakdown) => {
                 self.open_overlay(Overlay::Context(breakdown));
             }
@@ -1681,6 +1835,7 @@ impl AppState {
                 self.open_overlay(Overlay::Settings(SettingsView { snapshot, tab: 0 }));
             }
             AppEvent::CheckpointList { checkpoints, scope } => {
+                self.clear_info_notice();
                 let items = checkpoints
                     .into_iter()
                     .map(|c: CheckpointView| ListPickerItem {
@@ -1692,6 +1847,7 @@ impl AppState {
                 self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Rewind(scope), items)));
             }
             AppEvent::SessionList(sessions) => {
+                self.clear_info_notice();
                 let items = sessions
                     .into_iter()
                     .map(|s: SessionView| ListPickerItem {
@@ -1709,17 +1865,37 @@ impl AppState {
                 self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Resume, items)));
             }
             AppEvent::ModelList(models) => {
-                let items = models
+                // The list may arrive UNPROMPTED (auto-opened seconds after a
+                // key save) — it may replace a previous picker or fill an empty
+                // slot, but never clobber a TUI-local overlay (Ctrl+R search,
+                // the theme editor, a form) the user opened meanwhile.
+                if !(self.overlay.is_none() || matches!(self.overlay, Some(Overlay::Picker(_)))) {
+                    return effects;
+                }
+                self.clear_info_notice();
+                let current_ref = format!("{}/{}", self.model.provider, self.model.model);
+                let items: Vec<ListPickerItem> = models
                     .into_iter()
                     .map(|m: ModelChoiceView| ListPickerItem {
-                        label: m.label,
+                        label: if m.model_ref == current_ref {
+                            format!("{}  ·  current", m.label)
+                        } else {
+                            m.label
+                        },
                         id: m.model_ref,
-                        connectable: true,
+                        connectable: m.selectable,
                     })
                     .collect();
-                self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Model, items)));
+                let mut picker = ListPicker::new(PickerKind::Model, items);
+                // Open on the model in use (like the effort picker) so "which
+                // one am I on?" needs no scanning.
+                if let Some(idx) = picker.items.iter().position(|i| i.id == current_ref) {
+                    picker.selected = idx;
+                }
+                self.open_overlay(Overlay::Picker(picker));
             }
             AppEvent::ProviderList(providers) => {
+                self.clear_info_notice();
                 let items = providers
                     .into_iter()
                     .map(|p: ProviderChoiceView| ListPickerItem {
@@ -1730,12 +1906,45 @@ impl AppState {
                     .collect();
                 self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Connect, items)));
             }
-            AppEvent::CustomProviderPrompt => {
+            AppEvent::CustomProviderPrompt { name, base_url, flavor } => {
                 // Like an API-key prompt: drop the transient @/# pickers so the
                 // form is visible and receives the keys, not hidden behind them.
                 self.picker = None;
                 self.agent_picker = None;
-                self.open_overlay(Overlay::ConnectCustom(ConnectCustomOverlay::default()));
+                // A non-empty prefill is a bounced submission (core's pre-save
+                // probe failed) — focus the host field, the usual culprit.
+                let flavor_idx =
+                    CUSTOM_PROVIDER_FLAVORS.iter().position(|f| *f == flavor).unwrap_or(0);
+                let field = if base_url.is_empty() { 0 } else { 1 };
+                self.open_overlay(Overlay::ConnectCustom(ConnectCustomOverlay {
+                    name,
+                    host: base_url,
+                    flavor_idx,
+                    field,
+                }));
+            }
+            AppEvent::AuthMethodPrompt { provider } => {
+                self.clear_info_notice();
+                let items = vec![
+                    ListPickerItem {
+                        id: format!("{provider} --auth api-key"),
+                        label: "api key  ·  paste a platform API key".to_string(),
+                        connectable: true,
+                    },
+                    ListPickerItem {
+                        id: format!("{provider} --auth chatgpt"),
+                        label: "ChatGPT OAuth  ·  use your ChatGPT subscription (browser sign-in)"
+                            .to_string(),
+                        connectable: true,
+                    },
+                    ListPickerItem {
+                        id: format!("{provider} --auth access-token"),
+                        label: "access token  ·  paste a bearer/OAuth token (gateways, proxies)"
+                            .to_string(),
+                        connectable: true,
+                    },
+                ];
+                self.open_overlay(Overlay::Picker(ListPicker::new(PickerKind::Auth, items)));
             }
             AppEvent::OpenThemeEditor => self.open_theme_editor(),
             AppEvent::OpenEffortPicker { current } => {
@@ -3275,10 +3484,12 @@ mod tests {
             ModelChoiceView {
                 model_ref: "anthropic/claude-opus-4-8".into(),
                 label: "anthropic/claude-opus-4-8  ·  1M  ·  $5.00/$25.00".into(),
+                selectable: true,
             },
             ModelChoiceView {
                 model_ref: "openai/gpt-5".into(),
                 label: "openai/gpt-5".into(),
+                selectable: true,
             },
         ]));
         match &s.overlay {
@@ -3366,9 +3577,10 @@ mod tests {
             ModelChoiceView {
                 model_ref: "anthropic/claude-opus-4-8".into(),
                 label: "anthropic/claude-opus-4-8".into(),
+                selectable: true,
             },
-            ModelChoiceView { model_ref: "openai/gpt-5".into(), label: "openai/gpt-5".into() },
-            ModelChoiceView { model_ref: "openai/gpt-5-mini".into(), label: "openai/gpt-5-mini".into() },
+            ModelChoiceView { model_ref: "openai/gpt-5".into(), label: "openai/gpt-5".into(), selectable: true },
+            ModelChoiceView { model_ref: "openai/gpt-5-mini".into(), label: "openai/gpt-5-mini".into(), selectable: true },
         ]));
         assert!(s.overlay_picker_searchable(), "the model picker is searchable");
         // Type "gpt" → only the two gpt rows remain.
@@ -3455,7 +3667,11 @@ mod tests {
     #[test]
     fn custom_provider_prompt_opens_the_form_and_submit_sends_connect_custom() {
         let mut s = test_state();
-        s.apply_event(AppEvent::CustomProviderPrompt);
+        s.apply_event(AppEvent::CustomProviderPrompt {
+            name: String::new(),
+            base_url: String::new(),
+            flavor: String::new(),
+        });
         assert!(matches!(s.overlay, Some(Overlay::ConnectCustom(_))), "form opens");
         assert!(s.overlay_captures_keys(), "the form captures keys");
 
@@ -3485,7 +3701,11 @@ mod tests {
     #[test]
     fn custom_provider_form_rejects_bad_input_and_stays_open() {
         let mut s = test_state();
-        s.apply_event(AppEvent::CustomProviderPrompt);
+        s.apply_event(AppEvent::CustomProviderPrompt {
+            name: String::new(),
+            base_url: String::new(),
+            flavor: String::new(),
+        });
         // Empty name → warn, stays open, nothing sent.
         assert!(s.connect_custom_submit().is_empty());
         assert!(matches!(s.overlay, Some(Overlay::ConnectCustom(_))));
@@ -3514,6 +3734,133 @@ mod tests {
             }
             _ => panic!("form expected"),
         }
+    }
+
+    #[test]
+    fn long_or_multiline_notices_commit_to_scrollback_with_the_first_line_inline() {
+        let mut s = test_state();
+        let effects = s.apply_event(AppEvent::Notice {
+            level: NoticeLevel::Info,
+            text: "line one\nline two".into(),
+        });
+        assert!(
+            matches!(effects.as_slice(), [Effect::CommitToScrollback(md)] if md.contains("line two")),
+            "the full text reaches scrollback"
+        );
+        assert_eq!(s.notice.as_ref().unwrap().text, "line one");
+        // Short single-line notices stay inline only (no scrollback noise).
+        let effects = s.apply_event(AppEvent::Notice { level: NoticeLevel::Warn, text: "short".into() });
+        assert!(effects.is_empty());
+        assert_eq!(s.notice.as_ref().unwrap().text, "short");
+    }
+
+    #[test]
+    fn ctrl_c_confirms_before_quitting_when_something_would_be_lost() {
+        // Idle + empty: quit at once (no nagging).
+        let mut s = test_state();
+        s.request_quit();
+        assert!(s.should_quit);
+
+        // A draft arms a confirmation; the second consecutive press quits.
+        let mut s = test_state();
+        s.textarea.insert_str("draft");
+        assert!(s.request_quit().is_empty());
+        assert!(!s.should_quit, "the first Ctrl+C only arms");
+        assert!(s.notice.as_ref().unwrap().text.contains("again"));
+        // Any other key disarms — the next Ctrl+C re-arms instead of quitting.
+        s.disarm_quit();
+        s.request_quit();
+        assert!(!s.should_quit);
+        s.request_quit();
+        assert!(s.should_quit);
+    }
+
+    #[test]
+    fn paste_strips_newlines_in_form_fields_but_keeps_them_in_the_composer() {
+        let mut s = test_state();
+        s.apply_event(AppEvent::ApiKeyPrompt { provider: "p".into() });
+        s.paste_text("sk-abc\ndef");
+        match &s.overlay {
+            Some(Overlay::ApiKey(o)) => assert_eq!(o.input, "sk-abcdef", "newline never submits"),
+            _ => panic!("api-key overlay expected"),
+        }
+        s.overlay_close();
+        // The composer takes the text verbatim — a newline is a literal newline.
+        s.paste_text("line1\nline2");
+        assert_eq!(s.input_text(), "line1\nline2");
+
+        // The custom-provider form's focused field gets the sanitized insert.
+        s.set_input("");
+        s.apply_event(AppEvent::CustomProviderPrompt {
+            name: String::new(),
+            base_url: String::new(),
+            flavor: String::new(),
+        });
+        s.connect_custom_move(1);
+        s.paste_text("https://localhost:11111/v1\n");
+        match &s.overlay {
+            Some(Overlay::ConnectCustom(o)) => assert_eq!(o.host, "https://localhost:11111/v1"),
+            _ => panic!("form expected"),
+        }
+    }
+
+    #[test]
+    fn model_picker_marks_and_preselects_the_current_model_and_clears_the_fetch_notice() {
+        let mut s = test_state();
+        s.set_notice("fetching models…");
+        s.apply_event(AppEvent::ModelList(vec![
+            ModelChoiceView { model_ref: "a/x".into(), label: "a/x".into(), selectable: true },
+            ModelChoiceView { model_ref: "p/m".into(), label: "p/m".into(), selectable: true },
+        ]));
+        assert!(s.notice.is_none(), "the stale fetching notice is cleared");
+        match &s.overlay {
+            Some(Overlay::Picker(p)) => {
+                assert_eq!(p.selected, 1, "opens on the model in use");
+                assert!(p.items[1].label.contains("current"));
+                assert!(!p.items[0].label.contains("current"));
+            }
+            _ => panic!("model picker expected"),
+        }
+    }
+
+    #[test]
+    fn resume_picker_filters_and_an_over_narrow_filter_does_not_close_on_enter() {
+        let mut s = test_state();
+        let session = |id: &str, digest: &str| SessionView {
+            id: id.into(),
+            name: None,
+            digest: digest.into(),
+            turns: 1,
+            age: "1m".into(),
+        };
+        s.apply_event(AppEvent::SessionList(vec![
+            session("s1", "fix the parser"),
+            session("s2", "write docs"),
+        ]));
+        assert!(s.overlay_picker_searchable(), "the resume picker is type-to-filter");
+        for c in "docs".chars() {
+            s.overlay_picker_push(c);
+        }
+        match &s.overlay {
+            Some(Overlay::Picker(p)) => assert_eq!(p.matches.len(), 1),
+            _ => panic!("picker expected"),
+        }
+        // Over-narrow the filter: Enter must keep the picker open (Backspace
+        // can widen it), not silently discard it.
+        for c in "zzz".chars() {
+            s.overlay_picker_push(c);
+        }
+        assert!(s.overlay_picker_select().is_empty());
+        assert!(matches!(s.overlay, Some(Overlay::Picker(_))), "picker stays open");
+    }
+
+    #[test]
+    fn api_key_esc_explains_the_keyless_path() {
+        let mut s = test_state();
+        s.apply_event(AppEvent::ApiKeyPrompt { provider: "omlx".into() });
+        s.api_key_cancel();
+        assert!(s.overlay.is_none());
+        assert!(s.notice.as_ref().unwrap().text.contains("/login omlx"));
     }
 
     #[test]

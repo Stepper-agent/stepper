@@ -346,16 +346,43 @@ fn handle_terminal_event(
     // the user; route it to Quit uniformly. The ApiKey and custom-provider
     // overlays keep their own Ctrl+C = cancel (don't end the whole session over
     // a mistyped form).
-    if let Event::Key(k) = &ev
-        && k.code == KeyCode::Char('c')
-        && k.modifiers.contains(KeyModifiers::CONTROL)
+    let is_quit_chord = matches!(&ev, Event::Key(k)
+        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL));
+    if is_quit_chord
         && !matches!(
             state.overlay,
             Some(crate::state::Overlay::ApiKey(_) | crate::state::Overlay::ConnectCustom(_))
         )
     {
-        let effects = state.apply_action(stepper_protocol::Action::Quit);
-        return run_effects(terminal, action_tx, effects);
+        // With a running turn / queued prompts / a draft on screen, a single
+        // shell-habit Ctrl+C must not nuke them — the first press arms a
+        // confirmation, the second quits (idle empty sessions quit at once).
+        return run_effects(terminal, action_tx, state.request_quit());
+    }
+    // ANY other input (keys, paste, mouse) breaks the quit chord.
+    if !is_quit_chord {
+        state.disarm_quit();
+    }
+
+    // Bracketed paste: route the whole text at once — an overlay text field
+    // must not interpret a newline inside a pasted key/URL as Enter, and the
+    // composer takes newlines as literal newlines, never an early submit. The
+    // transient pickers keep their type-to-filter semantics: pasted text feeds
+    // the query (the @-picker needs the IO relist, so it is handled here).
+    if let Event::Paste(text) = &ev {
+        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+        if state.picker.is_some() {
+            let mut query = state.picker_query().unwrap_or_default().to_string();
+            query.push_str(&clean);
+            open_or_refresh_picker(state, query);
+        } else if state.agent_picker.is_some() {
+            for c in clean.chars() {
+                state.agent_picker_push(c);
+            }
+        } else {
+            state.paste_text(text);
+        }
+        return Ok(false);
     }
 
     // The @-file picker, while open, captures all keys.
@@ -540,9 +567,9 @@ fn handle_overlay_key(state: &mut AppState, action_tx: &ActionTx, ev: &Event) {
                     }
                 }
                 // Esc and Ctrl+C both cancel (Ctrl+C must not be typed into the
-                // key as a literal 'c').
-                KeyCode::Esc => state.overlay_close(),
-                KeyCode::Char('c') if ctrl => state.overlay_close(),
+                // key as a literal 'c'); the cancel says what skipping means.
+                KeyCode::Esc => state.api_key_cancel(),
+                KeyCode::Char('c') if ctrl => state.api_key_cancel(),
                 KeyCode::Backspace => state.api_key_backspace(),
                 // Only insert printable chars typed without ctrl/alt.
                 KeyCode::Char(c) if !ctrl && !k.modifiers.contains(KeyModifiers::ALT) => {

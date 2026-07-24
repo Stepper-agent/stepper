@@ -2,8 +2,8 @@ use std::io::stdout;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{
-    DisableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::supports_keyboard_enhancement;
@@ -53,6 +53,11 @@ fn enter(inline_height: u16) -> DefaultTerminal {
     // native terminal keeps its own scrollback and text selection, and
     // capturing the mouse would steal the wheel (no native scroll) and drag
     // (no select-to-copy). In-app live-region scrolling stays on PgUp/PgDn.
+    //
+    // Bracketed paste, though, IS enabled: without it a paste arrives as a
+    // burst of key events, and any newline inside (a wrapped API key, a URL,
+    // a multi-line prompt) acts as Enter — submitting half the input.
+    let _ = execute!(stdout(), EnableBracketedPaste);
     if supports_keyboard_enhancement().unwrap_or(false)
         && execute!(
             stdout(),
@@ -68,7 +73,7 @@ fn enter(inline_height: u16) -> DefaultTerminal {
 /// Leave the inline viewport + raw mode so another program can own the terminal.
 /// Mirrors `Drop` but keeps the panic hook installed.
 fn leave() {
-    let _ = execute!(stdout(), DisableMouseCapture);
+    let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
     pop_keyboard_enhancement();
     ratatui::restore();
 }

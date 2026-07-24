@@ -107,8 +107,22 @@ pub enum AppEvent {
     ProviderList(Vec<ProviderChoiceView>),
     /// The "add custom provider" row of the `/connect` picker was chosen — ask
     /// the TUI to open its custom-provider form (name + base URL + type). The
-    /// submitted form comes back as `Action::ConnectCustom`.
-    CustomProviderPrompt,
+    /// submitted form comes back as `Action::ConnectCustom`. The fields prefill
+    /// the form: empty for a fresh add, or the rejected submission when core's
+    /// pre-save endpoint probe failed, so the user fixes the typo instead of
+    /// retyping everything.
+    CustomProviderPrompt {
+        name: String,
+        base_url: String,
+        flavor: String,
+    },
+    /// `/connect` registered a provider with more than one auth route (OpenAI:
+    /// platform API key · ChatGPT-subscription OAuth · a bearer access token) —
+    /// ask the TUI to open the method picker. Selections route back as
+    /// `/connect <provider> --auth <method>`.
+    AuthMethodPrompt {
+        provider: String,
+    },
     /// `/theme` (no preset arg) — ask the TUI to open its color-theme editor. The
     /// TUI fills the editor from its own current theme (colors live TUI-side); a
     /// save comes back as `Action::SetTheme`.

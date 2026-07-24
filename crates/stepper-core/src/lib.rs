@@ -585,11 +585,15 @@ pub fn spawn_core(
                             }
                         }
                         None => {
+                            let mut text = format!("unknown command: /{name}");
+                            match closest_command(&name) {
+                                Some(suggestion) => {
+                                    text.push_str(&format!(" — did you mean /{suggestion}?"))
+                                }
+                                None => text.push_str(" — /help lists them"),
+                            }
                             let _ = tx
-                                .send(AppEvent::Notice {
-                                    level: NoticeLevel::Warn,
-                                    text: format!("unknown command: /{name}"),
-                                })
+                                .send(AppEvent::Notice { level: NoticeLevel::Warn, text })
                                 .await;
                         }
                     }
@@ -597,11 +601,11 @@ pub fn spawn_core(
                 Action::SetApiKey { provider, key } => {
                     // Persist to the OS keyring; the next provider resolve picks it
                     // up via the explicit>env>keyring precedence (no restart).
-                    let (level, text) = match stepper_providers::store_key_in_keyring(&provider, &key)
-                    {
+                    let saved = stepper_providers::store_key_in_keyring(&provider, &key);
+                    let (level, text) = match &saved {
                         Ok(()) => {
                             let mut text =
-                                format!("saved API key for '{provider}' — pick the model again");
+                                format!("saved API key for '{provider}' — fetching its models…");
                             // The keyring is the lowest-precedence source; warn if the
                             // config already pins an explicit key that will shadow it.
                             if orchestrator.resolver.provider_has_explicit_key(&provider) {
@@ -620,6 +624,35 @@ pub fn spawn_core(
                         ),
                     };
                     let _ = tx.send(AppEvent::Notice { level, text }).await;
+                    // Close the loop: the key almost always precedes "pick a model
+                    // from this provider", so open the picker instead of telling
+                    // the user to run /models themselves (Esc just dismisses it).
+                    // Hard-bounded: the discovery sweep walks EVERY provider's
+                    // list endpoint and must not wedge the action loop; on a slow
+                    // or empty sweep, fall back to a pointer instead of silence
+                    // (an unresolved "fetching…" notice would lie forever).
+                    if saved.is_ok() {
+                        const MODELS_AFTER_KEY_TIMEOUT: std::time::Duration =
+                            std::time::Duration::from_secs(8);
+                        let models = tokio::time::timeout(
+                            MODELS_AFTER_KEY_TIMEOUT,
+                            orchestrator.resolver.list_models(),
+                        )
+                        .await
+                        .unwrap_or_default();
+                        if models.is_empty() {
+                            let _ = tx
+                                .send(AppEvent::Notice {
+                                    level: NoticeLevel::Info,
+                                    text: format!(
+                                        "no model list yet for '{provider}' — /models to browse, or /model {provider}/<id> directly"
+                                    ),
+                                })
+                                .await;
+                        } else {
+                            let _ = tx.send(AppEvent::ModelList(models)).await;
+                        }
+                    }
                 }
                 Action::ConnectCustom { name, base_url, flavor } => {
                     builtins::handle_connect_custom(&name, &base_url, &flavor, &orchestrator, &tx)
@@ -830,6 +863,36 @@ fn fmt_secs(secs: u64) -> String {
         (m, 0) => format!("{m}m"),
         (m, s) => format!("{m}m {s}s"),
     }
+}
+
+/// The built-in command closest to a typo'd `/name`, when it is close enough
+/// to be a plausible slip (edit distance <= 2, like `/modle` → `/model`).
+/// `None` for genuinely unknown names, where a wrong guess would just confuse.
+fn closest_command(name: &str) -> Option<String> {
+    const MAX_SUGGESTION_DISTANCE: usize = 2;
+    builtins::names()
+        .into_iter()
+        .map(|candidate| (edit_distance(name, &candidate), candidate))
+        .filter(|(d, _)| *d <= MAX_SUGGESTION_DISTANCE)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, candidate)| candidate)
+}
+
+/// Plain Levenshtein distance — command names are short, so the O(n·m) table
+/// is trivial.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut row = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            row.push((prev[j] + cost).min(prev[j + 1] + 1).min(row[j] + 1));
+        }
+        prev = row;
+    }
+    prev[b.len()]
 }
 
 /// Wall-clock unix-epoch seconds for a turn's `ended_at`, or `None` if the system
@@ -1112,5 +1175,23 @@ mod session_meta_tests {
         assert!(matches!(level, NoticeLevel::Info), "export succeeded: {msg}");
         let written = std::fs::read_to_string(root.join("reports/out.md")).unwrap();
         assert!(written.contains("hi"), "transcript body present");
+    }
+}
+
+#[cfg(test)]
+mod command_suggestion_tests {
+    #[test]
+    fn a_close_typo_suggests_the_command_and_garbage_suggests_nothing() {
+        assert_eq!(super::closest_command("modle").as_deref(), Some("model"));
+        assert_eq!(super::closest_command("connct").as_deref(), Some("connect"));
+        assert_eq!(super::closest_command("zzzzzzzz"), None);
+    }
+
+    #[test]
+    fn edit_distance_counts_inserts_deletes_and_substitutions() {
+        assert_eq!(super::edit_distance("model", "model"), 0);
+        assert_eq!(super::edit_distance("modle", "model"), 2);
+        assert_eq!(super::edit_distance("", "abc"), 3);
+        assert_eq!(super::edit_distance("kitten", "sitting"), 3);
     }
 }

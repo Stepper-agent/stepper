@@ -563,7 +563,7 @@ fn render_api_key(frame: &mut Frame, area: Rect, o: &ApiKeyOverlay, theme: &Them
     let masked = "•".repeat(o.input.chars().count());
     let lines = vec![
         Line::from(Span::styled(
-            "   Enter save · Esc cancel · stored in your OS keyring",
+            "   Enter save · Esc skip (keyless server) · stored in your OS keyring",
             Style::default().fg(theme.muted),
         )),
         Line::from(Span::styled(format!("  {masked}"), Style::default().fg(theme.accent))),

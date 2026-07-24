@@ -1078,10 +1078,37 @@ impl ProviderResolver for CustomConnectResolver {
         &self,
         _name: &str,
         _kind: &str,
-        _base_url: Option<&str>,
+        _base_url: stepper_core::ports::FieldUpdate<'_>,
+        _auth: stepper_core::ports::FieldUpdate<'_>,
     ) -> Result<(), CoreError> {
         Ok(())
     }
+}
+
+
+/// Minimal HTTP responder for ConnectCustom's pre-save probe: answers every
+/// connection with the same canned payload, so probe outcomes are driven
+/// deterministically without real network.
+fn spawn_models_server(response: String) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(response.as_bytes());
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn http_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 async fn next_provider_list(rx: &mut EventRx) -> Vec<stepper_protocol::ProviderChoiceView> {
@@ -1116,7 +1143,10 @@ async fn connect_picker_always_offers_the_custom_provider_row_first() {
     action_tx.send(slash("connect", "__custom__")).await.unwrap();
     loop {
         match events.recv().await.expect("event stream stays open") {
-            AppEvent::CustomProviderPrompt => break,
+            AppEvent::CustomProviderPrompt { name, base_url, .. } => {
+                assert!(name.is_empty() && base_url.is_empty(), "fresh form opens empty");
+                break;
+            }
             AppEvent::TurnStarted { .. } => panic!("/connect must never run a turn"),
             _ => {}
         }
@@ -1135,16 +1165,20 @@ async fn connect_custom_action_persists_the_provider_and_prompts_for_a_key() {
         CancellationToken::new(),
     );
 
+    // The endpoint wants a key (401) — that is a PASS for the pre-save probe
+    // (the server is there; the key comes right after via the overlay).
+    let base = spawn_models_server(http_response("401 Unauthorized", "{\"error\":\"key\"}"));
     action_tx
         .send(Action::ConnectCustom {
             name: "my-local".into(),
-            base_url: "https://localhost:11111/v1/".into(),
+            base_url: format!("{base}/"),
             flavor: "openai".into(),
         })
         .await
         .unwrap();
     let added = next_notice(&mut events).await;
     assert!(added.contains("added provider 'my-local'"), "got: {added}");
+    assert!(added.contains("requires an API key"), "probe outcome is surfaced: {added}");
     loop {
         match events.recv().await.expect("event stream stays open") {
             AppEvent::ApiKeyPrompt { provider } => {
@@ -1161,7 +1195,7 @@ async fn connect_custom_action_persists_the_provider_and_prompts_for_a_key() {
     let entry = &json["providers"]["my-local"];
     assert_eq!(entry["kind"], "openai-compat");
     // The trailing slash is normalized away before persisting.
-    assert_eq!(entry["baseUrl"], "https://localhost:11111/v1");
+    assert_eq!(entry["baseUrl"], serde_json::Value::String(base));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1202,10 +1236,11 @@ async fn connect_custom_action_rejects_bad_input_and_guides_the_custom_flavor() 
 
     // The `custom` flavor persists as openai-compat and points at setting.json
     // for hand-editing instead of prompting for a key.
+    let base = spawn_models_server(http_response("200 OK", "{\"data\":[{\"id\":\"m1\"}]}"));
     action_tx
         .send(Action::ConnectCustom {
             name: "weird".into(),
-            base_url: "http://localhost:9999".into(),
+            base_url: base,
             flavor: "custom".into(),
         })
         .await
@@ -1272,4 +1307,243 @@ async fn create_layer_with_a_request_runs_a_turn_and_empty_args_warn_instead() {
         }
     }
     assert!(turn_started, "/create-layer <request> runs a model turn");
+}
+
+/// A resolver for the OpenAI auth-method flow: catalog connect succeeds, and
+/// `myown` plays the already-configured custom provider.
+struct OpenAiConnectResolver;
+
+#[async_trait]
+impl ProviderResolver for OpenAiConnectResolver {
+    fn resolve(&self, model_ref: &str) -> Result<Box<dyn LlmProvider>, CoreError> {
+        Resolver.resolve(model_ref)
+    }
+    fn model_info(&self, model_ref: &str) -> ModelInfo {
+        Resolver.model_info(model_ref)
+    }
+    async fn connect_provider(
+        &self,
+        id: &str,
+    ) -> Result<stepper_core::ports::ConnectedProvider, CoreError> {
+        match id {
+            "openai" => Ok(stepper_core::ports::ConnectedProvider {
+                kind: "openai-compat".into(),
+                base_url: Some("https://api.openai.com/v1".into()),
+            }),
+            other => Err(CoreError::Config(format!("unknown provider '{other}'"))),
+        }
+    }
+    fn connect_custom(
+        &self,
+        _name: &str,
+        _kind: &str,
+        _base_url: stepper_core::ports::FieldUpdate<'_>,
+        _auth: stepper_core::ports::FieldUpdate<'_>,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
+    fn provider_configured(&self, provider: &str) -> bool {
+        provider == "myown"
+    }
+    fn configured_providers(&self) -> Vec<String> {
+        vec!["myown".into()]
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_snaps_to_the_configured_case_and_warns_on_unconfigured_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator_with(dir.path().to_path_buf(), Arc::new(OpenAiConnectResolver)),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+
+    // 'MyOwn' differs from the configured 'myown' only by case — the key would
+    // land under a keyring name no lookup ever reads, so snap to the canonical
+    // spelling (and say so).
+    action_tx.send(slash("login", "MyOwn")).await.unwrap();
+    let text = next_notice(&mut events).await;
+    assert!(text.contains("using configured provider 'myown'"), "got: {text}");
+    loop {
+        if let AppEvent::ApiKeyPrompt { provider } =
+            events.recv().await.expect("event stream stays open")
+        {
+            assert_eq!(provider, "myown");
+            break;
+        }
+    }
+
+    // An unconfigured name still opens the overlay (pre-seeding a key is
+    // legitimate) but warns that the key is orphaned until /connect.
+    action_tx.send(slash("login", "ghost")).await.unwrap();
+    let warn = next_notice(&mut events).await;
+    assert!(warn.contains("not a configured provider"), "got: {warn}");
+    loop {
+        if let AppEvent::ApiKeyPrompt { provider } =
+            events.recv().await.expect("event stream stays open")
+        {
+            assert_eq!(provider, "ghost");
+            break;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_custom_probe_failure_bounces_back_into_the_prefilled_form() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".stepper")).unwrap();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator_with(dir.path().to_path_buf(), Arc::new(CustomConnectResolver)),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+
+    // Nothing listens on port 1 → the probe reports unreachable: nothing is
+    // saved and the form reopens prefilled so the typo can be fixed in place.
+    action_tx
+        .send(Action::ConnectCustom {
+            name: "dead".into(),
+            base_url: "http://127.0.0.1:1".into(),
+            flavor: "openai".into(),
+        })
+        .await
+        .unwrap();
+    let warn = next_notice(&mut events).await;
+    assert!(warn.contains("cannot reach"), "got: {warn}");
+    assert!(warn.contains("not saved"), "got: {warn}");
+    loop {
+        match events.recv().await.expect("event stream stays open") {
+            AppEvent::CustomProviderPrompt { name, base_url, flavor } => {
+                assert_eq!(name, "dead");
+                assert_eq!(base_url, "http://127.0.0.1:1");
+                assert_eq!(flavor, "openai");
+                break;
+            }
+            AppEvent::ApiKeyPrompt { .. } => panic!("an unreachable endpoint must not prompt for a key"),
+            _ => {}
+        }
+    }
+
+    // A reachable endpoint with no /models route (404) also bounces, with the
+    // usual culprit (a missing /v1) named.
+    let base = spawn_models_server(http_response("404 Not Found", "{}"));
+    action_tx
+        .send(Action::ConnectCustom {
+            name: "rootless".into(),
+            base_url: base.clone(),
+            flavor: "openai".into(),
+        })
+        .await
+        .unwrap();
+    let warn = next_notice(&mut events).await;
+    assert!(warn.contains("404"), "got: {warn}");
+    assert!(warn.contains("/v1"), "got: {warn}");
+
+    let body = std::fs::read_to_string(dir.path().join(".stepper/setting.json")).unwrap_or_default();
+    assert!(!body.contains("dead"), "unreachable provider must not persist");
+    assert!(!body.contains("rootless"), "404 provider must not persist");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_openai_offers_the_auth_method_menu_and_switches_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".stepper")).unwrap();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator_with(dir.path().to_path_buf(), Arc::new(OpenAiConnectResolver)),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+
+    // /connect openai → the auth-method picker, not a blind key prompt.
+    action_tx.send(slash("connect", "openai")).await.unwrap();
+    loop {
+        match events.recv().await.expect("event stream stays open") {
+            AppEvent::AuthMethodPrompt { provider } => {
+                assert_eq!(provider, "openai");
+                break;
+            }
+            AppEvent::ApiKeyPrompt { .. } => panic!("openai must offer the method menu first"),
+            _ => {}
+        }
+    }
+
+    // ChatGPT OAuth switches the entry onto the Codex path and points at the
+    // CLI sign-in (no key overlay).
+    action_tx.send(slash("connect", "openai --auth chatgpt")).await.unwrap();
+    let text = next_notice(&mut events).await;
+    assert!(text.contains("stepper auth login --codex"), "got: {text}");
+    let body = std::fs::read_to_string(dir.path().join(".stepper/setting.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["providers"]["openai"]["kind"], "openai-responses");
+    assert_eq!(json["providers"]["openai"]["auth"], "codex-oauth");
+    // The guided flow persisted the platform baseUrl on the catalog connect;
+    // the ChatGPT route MUST remove it, or the Codex adapter would post the
+    // subscription token to api.openai.com instead of the chatgpt.com backend.
+    assert!(
+        json["providers"]["openai"].get("baseUrl").is_none(),
+        "chatgpt route clears the stale platform baseUrl: {}",
+        json["providers"]["openai"]
+    );
+
+    // Switching back to a bearer route clears the OAuth mode (else the pasted
+    // key would be ignored) and opens the key overlay.
+    action_tx.send(slash("connect", "openai --auth api-key")).await.unwrap();
+    loop {
+        if let AppEvent::ApiKeyPrompt { provider } =
+            events.recv().await.expect("event stream stays open")
+        {
+            assert_eq!(provider, "openai");
+            break;
+        }
+    }
+    let body = std::fs::read_to_string(dir.path().join(".stepper/setting.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["providers"]["openai"]["kind"], "openai-compat");
+    assert!(json["providers"]["openai"].get("auth").is_none(), "auth mode cleared");
+
+    // --auth is scoped to openai; malformed args get the usage line.
+    action_tx.send(slash("connect", "groq --auth chatgpt")).await.unwrap();
+    let warn = next_notice(&mut events).await;
+    assert!(warn.contains("only available for 'openai'"), "got: {warn}");
+    action_tx.send(slash("connect", "openai --auth")).await.unwrap();
+    let warn = next_notice(&mut events).await;
+    assert!(warn.contains("usage: /connect"), "got: {warn}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connecting_an_already_configured_custom_provider_reopens_its_key_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (action_tx, action_rx) = mpsc::channel(64);
+    let mut events = spawn_core(
+        orchestrator_with(dir.path().to_path_buf(), Arc::new(OpenAiConnectResolver)),
+        SessionRecord::fresh(),
+        action_rx,
+        CancellationToken::new(),
+    );
+
+    // `myown` is configured but unknown to the catalog: its `connected` picker
+    // row routes here, which means "update the key", not a doomed catalog add.
+    action_tx.send(slash("connect", "myown")).await.unwrap();
+    let text = next_notice(&mut events).await;
+    assert!(text.contains("already connected"), "got: {text}");
+    loop {
+        if let AppEvent::ApiKeyPrompt { provider } =
+            events.recv().await.expect("event stream stays open")
+        {
+            assert_eq!(provider, "myown");
+            break;
+        }
+    }
+
+    // A provider that is neither in the catalog nor configured still warns.
+    action_tx.send(slash("connect", "nope")).await.unwrap();
+    let warn = next_notice(&mut events).await;
+    assert!(warn.contains("cannot connect 'nope'"), "got: {warn}");
 }

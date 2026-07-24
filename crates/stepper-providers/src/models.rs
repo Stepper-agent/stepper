@@ -262,6 +262,68 @@ pub async fn fetch_provider_models(
     Ok(parse_model_list(&root))
 }
 
+/// Outcome of probing a would-be custom provider's models endpoint before the
+/// entry is saved, so a typo'd host/port/path is caught while the form is
+/// still open instead of surfacing later as an empty `/models` picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelsProbe {
+    /// The endpoint answered with a parseable model list of this size.
+    Ok(usize),
+    /// Reachable, but it wants credentials (401/403) — a good sign: the server
+    /// is there and speaking HTTP; the key comes right after via `/login`.
+    NeedsAuth,
+    /// Reachable, but no models route here (404) — almost always a wrong base
+    /// path (e.g. a missing `/v1`).
+    NoModelsRoute,
+    /// Reachable, but the endpoint answered with this unexpected HTTP status.
+    OddStatus(u16),
+    /// No HTTP conversation at all (refused/timeout/DNS) — the transport error.
+    Unreachable(String),
+}
+
+/// How long the pre-save probe waits before calling the endpoint unreachable.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Probe `models_url` (a full `…/models` URL) for the custom-provider form.
+/// Uses its own short-timeout client: the probe targets mostly-local endpoints
+/// and must never stall the action loop behind a proxy or a long default.
+pub async fn probe_models_endpoint(models_url: &str) -> ModelsProbe {
+    let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => return ModelsProbe::Unreachable(e.to_string()),
+    };
+    let resp = match client.get(models_url).send().await {
+        Ok(r) => r,
+        Err(e) => return ModelsProbe::Unreachable(concise_reqwest_error(&e)),
+    };
+    match resp.status().as_u16() {
+        200..=299 => {
+            let count = resp
+                .text()
+                .await
+                .ok()
+                .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                .map(|root| parse_model_list(&root).len())
+                .unwrap_or(0);
+            ModelsProbe::Ok(count)
+        }
+        401 | 403 => ModelsProbe::NeedsAuth,
+        404 => ModelsProbe::NoModelsRoute,
+        other => ModelsProbe::OddStatus(other),
+    }
+}
+
+/// The innermost cause of a reqwest transport error ("Connection refused"
+/// beats the URL-wrapped "error sending request for url (…): …" wall of text
+/// in a one-line TUI notice).
+fn concise_reqwest_error(e: &reqwest::Error) -> String {
+    let mut cause: &dyn std::error::Error = e;
+    while let Some(next) = cause.source() {
+        cause = next;
+    }
+    cause.to_string()
+}
+
 /// Pull model ids out of a `{ "data": [ { "id": "..." }, ... ] }` envelope
 /// (OpenAI + Anthropic both use it); falls back to a bare `[ { "id" } ]` array.
 pub fn parse_model_list(root: &serde_json::Value) -> Vec<String> {
@@ -579,5 +641,46 @@ mod tests {
         .await;
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec!["gpt-5", "o3"], "catalog ids, sorted, when live fails");
+    }
+    #[tokio::test]
+    async fn probe_models_endpoint_classifies_ok_auth_missing_and_unreachable() {
+        let ok = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "id": "a" }, { "id": "b" }]
+            })))
+            .mount(&ok)
+            .await;
+        assert_eq!(
+            probe_models_endpoint(&format!("{}/v1/models", ok.uri())).await,
+            ModelsProbe::Ok(2)
+        );
+
+        let unauth = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(401)).mount(&unauth).await;
+        assert_eq!(
+            probe_models_endpoint(&format!("{}/models", unauth.uri())).await,
+            ModelsProbe::NeedsAuth
+        );
+
+        let missing = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(404)).mount(&missing).await;
+        assert_eq!(
+            probe_models_endpoint(&format!("{}/models", missing.uri())).await,
+            ModelsProbe::NoModelsRoute
+        );
+
+        let odd = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(503)).mount(&odd).await;
+        assert_eq!(
+            probe_models_endpoint(&format!("{}/models", odd.uri())).await,
+            ModelsProbe::OddStatus(503)
+        );
+
+        match probe_models_endpoint("http://127.0.0.1:1/models").await {
+            ModelsProbe::Unreachable(_) => {}
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
     }
 }

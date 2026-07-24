@@ -13,6 +13,18 @@ pub struct ConnectedProvider {
     pub base_url: Option<String>,
 }
 
+/// An explicit update to one optional provider field: leave it alone, clear
+/// it, or set it. The connect flows need all three — e.g. the ChatGPT-OAuth
+/// route must CLEAR a stale platform base URL (or requests go to the wrong
+/// host), while the bearer routes must NOT touch a deliberately configured
+/// proxy base.
+#[derive(Debug, Clone, Copy)]
+pub enum FieldUpdate<'a> {
+    Keep,
+    Clear,
+    Set(&'a str),
+}
+
 /// Turns a `provider/model-id` reference into a live provider + its metadata.
 /// Implemented by `ConfigProviderResolver` (config-driven) or by the CLI's
 /// convention router when there is no `.stepper/`.
@@ -45,26 +57,52 @@ pub trait ProviderResolver: Send + Sync {
             "this session has no provider catalog to connect from".into(),
         ))
     }
-    /// Register a user-defined provider (from the `/connect` custom form) into
-    /// the live config: set its wire `kind` and base URL. Unlike
-    /// [`Self::connect_provider`] this overwrites kind/baseUrl (the user just
-    /// typed them explicitly) while leaving key/model/context overrides alone.
-    /// Defaults to an error for convention/test resolvers with no live config.
+    /// Register a user-defined provider (the `/connect` custom form, or an
+    /// auth-method switch) into the live config: set its wire `kind` and apply
+    /// the base-URL/auth updates. Unlike [`Self::connect_provider`] this
+    /// overwrites what the user just chose explicitly, while leaving
+    /// key/model/context overrides alone. Defaults to an error for
+    /// convention/test resolvers with no live config.
     fn connect_custom(
         &self,
         _name: &str,
         _kind: &str,
-        _base_url: Option<&str>,
+        _base_url: FieldUpdate<'_>,
+        _auth: FieldUpdate<'_>,
     ) -> Result<(), CoreError> {
         Err(CoreError::Config(
             "this session cannot register custom providers".into(),
         ))
     }
 
+    /// The configured wire `kind` of `provider` (may be empty for a bare
+    /// entry), or `None` when it is not configured. Lets the auth-method menu
+    /// keep a bearer-capable kind instead of blindly rewriting it. Defaults to
+    /// `None`.
+    fn provider_kind(&self, _provider: &str) -> Option<String> {
+        None
+    }
+
+    /// The names of every provider registered in the live config, for the
+    /// `/models` picker to surface configured providers whose model listing
+    /// came back empty (unreachable / needs a key) instead of silently hiding
+    /// them. Defaults to none.
+    fn configured_providers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Whether `provider` resolves an explicit/env API key that takes precedence
     /// over the OS keyring (so a key just stored in the keyring would be shadowed).
     /// Advisory only — used to warn after `/login`. Defaults to false.
     fn provider_has_explicit_key(&self, _provider: &str) -> bool {
+        false
+    }
+
+    /// Whether `provider` is already registered in the live config (configured
+    /// or connected this session). Lets `/connect` route an already-configured,
+    /// non-catalog provider (a custom one) to the key prompt instead of failing
+    /// the catalog lookup. Defaults to false.
+    fn provider_configured(&self, _provider: &str) -> bool {
         false
     }
 }

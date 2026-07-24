@@ -793,10 +793,10 @@ async fn launch(global: GlobalArgs, positional: Vec<String>) -> anyhow::Result<(
 
     let mut commands: Vec<CommandInfo> = stepper_core::builtin_command_descriptions()
         .into_iter()
-        .map(|(name, description)| CommandInfo {
+        .map(|(name, args, description)| CommandInfo {
             name: name.to_string(),
             description: description.to_string(),
-            argument_hint: None,
+            argument_hint: (!args.is_empty()).then(|| args.to_string()),
         })
         .collect();
     let mut theme_preset: Option<String> = None;
@@ -809,15 +809,20 @@ async fn launch(global: GlobalArgs, positional: Vec<String>) -> anyhow::Result<(
         // `argument-hint` is keyed by command name; attach it to each user command.
         let hints: std::collections::BTreeMap<String, String> =
             cfg.command_hints().into_iter().collect();
-        commands.extend(
-            cfg.command_descriptions()
-                .into_iter()
-                .map(|(name, description)| CommandInfo {
-                    argument_hint: hints.get(&name).cloned(),
-                    name,
-                    description,
-                }),
-        );
+        let user_commands: Vec<CommandInfo> = cfg
+            .command_descriptions()
+            .into_iter()
+            .map(|(name, description)| CommandInfo {
+                argument_hint: hints.get(&name).cloned(),
+                name,
+                description,
+            })
+            .collect();
+        // A user command file shadows a same-named built-in at dispatch
+        // (lib.rs consults `find_command` first) — the palette must agree,
+        // or it would list two `/model` rows describing different behavior.
+        commands.retain(|c| !user_commands.iter().any(|u| u.name == c.name));
+        commands.extend(user_commands);
         // Load the persisted color theme (preset + per-role overrides).
         if let Some(theme) = &cfg.settings.theme {
             theme_preset = theme.preset.clone();

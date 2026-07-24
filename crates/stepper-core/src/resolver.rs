@@ -1,6 +1,6 @@
 use crate::error::CoreError;
 use crate::model::{ModelInfo, ModelRegistry};
-use crate::ports::{ConnectedProvider, ProviderResolver};
+use crate::ports::{ConnectedProvider, FieldUpdate, ProviderResolver};
 use std::sync::RwLock;
 use stepper_config::Config;
 use stepper_protocol::{ModelChoiceView, ProviderChoiceView};
@@ -60,12 +60,26 @@ impl ProviderResolver for ConfigProviderResolver {
             spec = spec.with_api_key(key.clone());
         }
         if kind == ProviderKind::Codex {
-            let store = self.codex_store.clone().ok_or_else(|| {
-                CoreError::Config(
-                    "codex provider configured but not logged in — run `stepper auth login --codex`"
-                        .into(),
-                )
-            })?;
+            // The startup snapshot misses a login performed DURING the session
+            // (`stepper auth login --codex` in another terminal, right after the
+            // /connect ChatGPT route suggested it) — retry the default store
+            // path before failing, so no restart is needed.
+            let store = self
+                .codex_store
+                .clone()
+                .or_else(|| {
+                    stepper_providers::CodexTokenStore::load(
+                        stepper_providers::CodexTokenStore::default_path(),
+                        self.factory.http_client(),
+                    )
+                    .ok()
+                })
+                .ok_or_else(|| {
+                    CoreError::Config(
+                        "codex provider configured but not logged in — run `stepper auth login --codex`"
+                            .into(),
+                    )
+                })?;
             spec = spec.with_codex_store(store);
         }
 
@@ -134,12 +148,48 @@ impl ProviderResolver for ConfigProviderResolver {
     /// with that catalog. Codex (OAuth) and unknown-kind providers are skipped.
     /// Best-effort — an unreachable endpoint falls back to the catalog list, and
     /// a failed catalog still returns whatever the live endpoints reported.
+    /// A configured provider that contributed NOTHING (endpoint down / needs a
+    /// key, and unknown to the catalog) still gets a disabled row naming the
+    /// fix, instead of silently vanishing from the picker.
     async fn list_models(&self) -> Vec<ModelChoiceView> {
-        self.list_model_entries()
-            .await
+        let entries = self.list_model_entries().await;
+        let mut out: Vec<ModelChoiceView> = entries
             .iter()
-            .map(|e| ModelChoiceView { label: model_label(e), model_ref: e.model_ref.clone() })
-            .collect()
+            .map(|e| ModelChoiceView {
+                label: model_label(e),
+                model_ref: e.model_ref.clone(),
+                selectable: true,
+            })
+            .collect();
+        // Codex is intentionally absent from listings (no usable endpoint), so
+        // it must not be reported as broken.
+        let silent: Vec<String> = {
+            let config = self.config.read().unwrap();
+            let mut names: Vec<String> = config
+                .settings
+                .providers
+                .iter()
+                .filter(|(name, p)| {
+                    !matches!(
+                        parse_kind(name, &p.kind, p.auth.as_deref()),
+                        Ok(ProviderKind::Codex)
+                    ) && !entries.iter().any(|e| {
+                        e.model_ref.strip_prefix(name.as_str()).is_some_and(|r| r.starts_with('/'))
+                    })
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+        out.extend(silent.into_iter().map(|name| ModelChoiceView {
+            label: format!(
+                "{name}  ·  no models listed — endpoint unreachable or needs a key (/login {name})"
+            ),
+            model_ref: name,
+            selectable: false,
+        }));
+        out
     }
 
     async fn list_model_entries(&self) -> Vec<ModelEntry> {
@@ -201,9 +251,11 @@ impl ProviderResolver for ConfigProviderResolver {
         out
     }
 
-    /// The `/connect` seed: every provider in the models.dev catalog (reuse the
-    /// one seeded at construction, else fetch once). Best-effort — empty when the
-    /// catalog is unavailable.
+    /// The `/connect` seed: providers already configured in this session first
+    /// (marked `connected`, including custom ones the catalog doesn't know),
+    /// then the models.dev catalog (reused from construction, else fetched
+    /// once). Best-effort — just the configured rows when the catalog is
+    /// unavailable.
     async fn list_providers(&self) -> Vec<ProviderChoiceView> {
         let client = self.factory.http_client();
         let fetched = if self.catalog.is_none() {
@@ -211,21 +263,51 @@ impl ProviderResolver for ConfigProviderResolver {
         } else {
             None
         };
-        let Some(catalog) = self.catalog.as_ref().or(fetched.as_ref()) else {
-            return Vec::new();
+        let catalog = self.catalog.as_ref().or(fetched.as_ref());
+
+        // Snapshot the configured providers (name → optional base) under the
+        // read guard; they lead the picker so "what am I already connected to"
+        // needs no scrolling through ~145 catalog rows.
+        let configured: Vec<(String, Option<String>)> = {
+            let config = self.config.read().unwrap();
+            let mut names: Vec<(String, Option<String>)> = config
+                .settings
+                .providers
+                .iter()
+                .map(|(name, p)| (name.clone(), p.base_url.clone()))
+                .collect();
+            names.sort_by(|a, b| a.0.cmp(&b.0));
+            names
         };
-        catalog
-            .provider_seeds()
-            .into_iter()
-            .map(|m| {
-                let connectable = provider_connectable(m);
+
+        let mut out: Vec<ProviderChoiceView> = configured
+            .iter()
+            .map(|(name, base)| {
+                let detail = match catalog.and_then(|c| c.provider_meta(name)) {
+                    Some(meta) => meta.name.clone(),
+                    None => base.clone().unwrap_or_else(|| "custom".to_string()),
+                };
                 ProviderChoiceView {
+                    id: name.clone(),
+                    label: format!("{name}  ·  {detail}  ·  connected"),
+                    connectable: true,
+                }
+            })
+            .collect();
+        if let Some(catalog) = catalog {
+            out.extend(catalog.provider_seeds().into_iter().filter_map(|m| {
+                if configured.iter().any(|(name, _)| name == &m.id) {
+                    return None;
+                }
+                let connectable = provider_connectable(m);
+                Some(ProviderChoiceView {
                     id: m.id.clone(),
                     label: provider_label(m, connectable),
                     connectable,
-                }
-            })
-            .collect()
+                })
+            }));
+        }
+        out
     }
 
     /// Register catalog provider `id` into the live config so this session can use
@@ -283,28 +365,55 @@ impl ProviderResolver for ConfigProviderResolver {
             if entry.kind.is_empty() {
                 entry.kind = kind.clone();
             }
-            if entry.base_url.is_none() {
+            // Fill the base only when the entry speaks the derived dialect: a
+            // base-less `codex`/`openai-responses` entry deliberately relies on
+            // its factory default (chatgpt.com backend) — writing the catalog's
+            // platform URL onto it would silently redirect an OAuth setup.
+            if entry.base_url.is_none() && entry.kind == kind {
                 entry.base_url = base_url.clone();
             }
         }
         Ok(ConnectedProvider { kind, base_url })
     }
 
-    /// Register a user-typed provider into the live config. The kind and base
-    /// come straight from the custom form, so they overwrite stale values —
-    /// but an existing entry's key / model / context overrides are preserved
-    /// (only the two fields the form owns are touched).
+    fn provider_configured(&self, provider: &str) -> bool {
+        self.config.read().unwrap().settings.providers.contains_key(provider)
+    }
+
+    fn configured_providers(&self) -> Vec<String> {
+        let config = self.config.read().unwrap();
+        let mut names: Vec<String> = config.settings.providers.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    fn provider_kind(&self, provider: &str) -> Option<String> {
+        self.config.read().unwrap().settings.providers.get(provider).map(|p| p.kind.clone())
+    }
+
+    /// Register a user-typed provider into the live config. The kind and the
+    /// base/auth updates come straight from an explicit user choice, so they
+    /// overwrite stale values — but an existing entry's key / model / context
+    /// overrides are preserved.
     fn connect_custom(
         &self,
         name: &str,
         kind: &str,
-        base_url: Option<&str>,
+        base_url: FieldUpdate<'_>,
+        auth: FieldUpdate<'_>,
     ) -> Result<(), CoreError> {
         let mut config = self.config.write().unwrap();
         let entry = config.settings.providers.entry(name.to_string()).or_default();
         entry.kind = kind.to_string();
-        if let Some(base) = base_url {
-            entry.base_url = Some(base.to_string());
+        match base_url {
+            FieldUpdate::Keep => {}
+            FieldUpdate::Clear => entry.base_url = None,
+            FieldUpdate::Set(base) => entry.base_url = Some(base.to_string()),
+        }
+        match auth {
+            FieldUpdate::Keep => {}
+            FieldUpdate::Clear => entry.auth = None,
+            FieldUpdate::Set(mode) => entry.auth = Some(mode.to_string()),
         }
         Ok(())
     }
@@ -757,7 +866,12 @@ mod tests {
             None,
         );
         resolver
-            .connect_custom("local", "openai-compat", Some("https://localhost:11111/v1"))
+            .connect_custom(
+                "local",
+                "openai-compat",
+                FieldUpdate::Set("https://localhost:11111/v1"),
+                FieldUpdate::Keep,
+            )
             .unwrap();
         {
             let config = resolver.config.read().unwrap();
@@ -770,7 +884,9 @@ mod tests {
         }
         // A brand-new name registers from scratch and resolves live (keyless is
         // fine for a localhost openai-compat endpoint).
-        resolver.connect_custom("fresh", "openai-compat", Some("http://localhost:8080/v1")).unwrap();
+        resolver
+            .connect_custom("fresh", "openai-compat", FieldUpdate::Set("http://localhost:8080/v1"), FieldUpdate::Keep)
+            .unwrap();
         let rp = resolver.config.read().unwrap().resolve_provider("fresh/some-model").unwrap();
         assert_eq!(rp.kind, "openai-compat");
         assert_eq!(rp.base_url.as_deref(), Some("http://localhost:8080/v1"));
@@ -935,6 +1051,75 @@ mod tests {
             p.base_url.as_deref(),
             Some("https://my-proxy.internal/v1"),
             "an existing base override is preserved, not overwritten by the catalog"
+        );
+    }
+    #[tokio::test]
+    async fn list_providers_leads_with_configured_rows_marked_connected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::load(dir.path()).unwrap();
+        let entry = |base: &str| ProviderConfig {
+            kind: "openai-compat".into(),
+            base_url: Some(base.into()),
+            api_key: None,
+            auth: None,
+            default_model: None,
+            context_window: None,
+            models: Default::default(),
+        };
+        config.settings.providers.insert("local".into(), entry("http://127.0.0.1:11111/v1"));
+        config.settings.providers.insert("acme".into(), entry("https://api.acme.ai/v1"));
+        let resolver = ConfigProviderResolver::new(
+            config,
+            ProviderFactory::new().unwrap(),
+            ModelRegistry::builtin(),
+            None,
+            Some(connect_catalog()),
+        );
+        let providers = resolver.list_providers().await;
+        let ids: Vec<&str> = providers.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(&ids[..2], &["acme", "local"], "configured rows lead, sorted: {ids:?}");
+        assert!(providers[0].label.contains("connected"));
+        assert!(providers[0].label.contains("Acme AI"), "catalog display name: {}", providers[0].label);
+        assert!(providers[1].label.contains("connected"));
+        assert!(
+            providers[1].label.contains("http://127.0.0.1:11111/v1"),
+            "a non-catalog custom shows its base: {}",
+            providers[1].label
+        );
+        assert_eq!(ids.iter().filter(|i| **i == "acme").count(), 1, "no duplicate catalog row");
+        assert!(ids.contains(&"anthropic"), "the rest of the catalog follows");
+    }
+
+    #[tokio::test]
+    async fn list_models_surfaces_a_silent_configured_provider_as_a_disabled_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::load(dir.path()).unwrap();
+        config.settings.providers.insert(
+            "ghost".into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("http://127.0.0.1:1/v1".into()),
+                api_key: None,
+                auth: None,
+                default_model: None,
+                context_window: None,
+                models: Default::default(),
+            },
+        );
+        let resolver = ConfigProviderResolver::new(
+            config,
+            ProviderFactory::new().unwrap(),
+            ModelRegistry::builtin(),
+            None,
+            Some(connect_catalog()),
+        );
+        let models = resolver.list_models().await;
+        let ghost = models.iter().find(|m| m.model_ref == "ghost").expect("disabled row present");
+        assert!(!ghost.selectable, "an empty listing must not vanish silently");
+        assert!(ghost.label.contains("/login ghost"), "the fix is named: {}", ghost.label);
+        assert!(
+            models.iter().all(|m| m.selectable || m.model_ref == "ghost"),
+            "only the silent provider is disabled"
         );
     }
 }
